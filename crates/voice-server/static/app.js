@@ -464,5 +464,67 @@
   };
 
   // ====== 启动 ======
-  addMessage('system', '页面已加载。点"开始对话"启动。');
+  // 页面加载时立即请求麦克风权限（不连 WS，只拿权限）
+  async function requestMicOnLoad() {
+    setStatus(micStatus, '麦克风：请求权限...', 'badge-busy');
+    addMessage('system', '正在请求麦克风权限...');
+    try {
+      await startMic();
+      addMessage('system', '麦克风权限已获得。点"开始对话"连接服务。');
+    } catch (e) {
+      setStatus(micStatus, '麦克风：拒绝', 'badge-offline');
+      addMessage('error', '麦克风权限被拒绝：' + e.message + '。请在浏览器地址栏左侧允许后刷新页面。');
+    }
+  }
+
+  // ====== 按钮 ======
+  // ====== 按钮 ======
+  btnStart.onclick = async () => {
+    btnStart.disabled = true;
+    try {
+      await connect();
+      // mic 已经在 onload 启动；若用户拒绝则重试一次
+      if (!isRecording) {
+        addMessage('system', '麦克风未就绪，重新请求...');
+        await startMic();
+      }
+      btnStop.disabled = false;
+      btnInterrupt.disabled = false;
+      addMessage('system', '准备就绪。说一句试试。');
+    } catch (e) {
+      btnStart.disabled = false;
+      addMessage('error', '启动失败：' + e.message);
+    }
+  };
+
+  btnInterrupt.onclick = () => {
+    sendInterrupt();
+  };
+
+  btnStop.onclick = () => {
+    sendSessionEnd('user stopped');
+    stopMic();
+    if (ws) ws.close();
+    btnStart.disabled = false;
+    btnStop.disabled = true;
+    btnInterrupt.disabled = true;
+    addMessage('system', '已结束');
+  };
+
+  // ====== 启动 ======
+  // 页面加载时立即请求麦克风权限（不连 WS，只拿权限）
+  async function requestMicOnLoad() {
+    setStatus(micStatus, '麦克风：请求权限...', 'badge-busy');
+    addMessage('system', '正在请求麦克风权限...');
+    try {
+      await startMic();
+      addMessage('system', '麦克风权限已获得。点"开始对话"连接服务。');
+    } catch (e) {
+      setStatus(micStatus, '麦克风：拒绝', 'badge-offline');
+      addMessage('error', '麦克风权限被拒绝：' + e.message + '。请在浏览器地址栏左侧允许后刷新页面。');
+    }
+  }
+
+  // 立即请求麦克风
+  requestMicOnLoad();
 })();
