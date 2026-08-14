@@ -1,0 +1,35 @@
+[package]
+name = "voice-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Voice server using webhttp framework"
+
+[dependencies]
+voice-proto = { workspace = true }
+voice-config = { workspace = true }
+webproto = { workspace = true }
+webhttp = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+async-stream = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+futures = { workspace = true }
+futures-util = { workspace = true }
+tracing = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+uuid = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+dashmap = "6.0"
+base64 = "0.22"
+actix = "0.13"
+actix-web = "4"
+actix-files = "0.6"

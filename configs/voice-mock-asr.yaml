@@ -1,0 +1,8 @@
+# mock-asr 配置
+log:
+  level: info
+  file: ../logs/mock-asr.log    # 空字符串=stdout
+  format: pretty                # pretty | json
+
+server:
+  port: 7001

@@ -1,0 +1,10 @@
+# voice_terminal 配置
+log:
+  level: info
+  file: ../logs/voice-terminal.log
+  format: pretty
+
+terminal:
+  url: ws://127.0.0.1:8080/ws/voice/cli/demo
+  # file: ./test.wav              # 不填 = 用麦克风（stub）
+  interrupt: true

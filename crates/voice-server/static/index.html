@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>voice-app 实时对话 demo</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<header>
+  <h1>🎙️ voice-app 实时对话</h1>
+  <div class="status-bar">
+    <span id="conn-status" class="badge badge-offline">未连接</span>
+    <span id="mic-status" class="badge badge-offline">麦克风：关</span>
+    <span id="speaker-status" class="badge badge-offline">扬声器：空闲</span>
+    <span id="latency" class="badge">延迟：--</span>
+  </div>
+</header>
+
+<main>
+  <section class="controls">
+    <button id="btn-start">开始对话</button>
+    <button id="btn-interrupt" disabled>打断</button>
+    <button id="btn-stop" disabled>结束</button>
+    <div class="hint">
+      浏览器需授权麦克风；点"开始对话"后会持续收音并自动检测句尾。
+      说完一句稍作停顿即可（VAD 静音约 600ms）。
+    </div>
+  </section>
+
+  <section class="conversation">
+    <div class="conversation-title">对话日志</div>
+    <div id="conv-log" class="conv-log">
+      <div class="empty-hint">（还没开始说话）</div>
+    </div>
+  </section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/msgpack-lite@0.1.26/dist.msgpack.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

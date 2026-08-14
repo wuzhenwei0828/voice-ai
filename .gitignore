@@ -1,0 +1,7 @@
+/target/
+/logs/
+**/*.log
+**/*.tmp
+**/*.wav
+**/*.raw
+.DS_Store

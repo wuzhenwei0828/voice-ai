@@ -1,0 +1,8 @@
+# mock-tts 配置
+log:
+  level: info
+  file: ../logs/mock-tts.log
+  format: pretty
+
+server:
+  port: 7003
