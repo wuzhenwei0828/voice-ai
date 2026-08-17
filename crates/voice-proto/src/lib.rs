@@ -43,10 +43,13 @@ pub enum VoicePayload {
     },
 
     // ---- 上行：客户端 → 服务端（音频流）----
+    // data 用 serde_bytes 走 msgpack bin8/16/32，比 Vec<u8> 默认的 "array of u8s" 节省 ~2x 体积。
+    // 通过 #[serde(with = "serde_bytes")] 包裹即可，无须改字段类型，调用方仍可用 Vec<u8>。
     AudioChunk {
         session_id: String,
         seq: u32,
         timestamp_ms: u64,
+        #[serde(with = "serde_bytes")]
         data: Vec<u8>,
         is_last: bool,
     },
@@ -65,6 +68,7 @@ pub enum VoicePayload {
     TtsAudio {
         session_id: String,
         seq: u32,
+        #[serde(with = "serde_bytes")]
         data: Vec<u8>,
         is_last: bool,
     },

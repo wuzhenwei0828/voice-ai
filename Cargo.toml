@@ -2,12 +2,8 @@
 resolver = "2"
 members = [
     "crates/voice-proto",
-    "crates/voice-config",
     "crates/voice-server",
     "crates/voice-client",
-    "crates/mock-asr",
-    "crates/mock-llm",
-    "crates/mock-tts",
     "crates/ws-payload-helper",
 ]
 
@@ -18,7 +14,6 @@ authors = ["wuzhenwei"]
 
 [workspace.dependencies]
 voice-proto = { path = "crates/voice-proto" }
-voice-config = { path = "crates/voice-config" }
 webproto = { path = "/Users/wuzhenwei/Code/github/webproto" }
 webhttp = { path = "/Users/wuzhenwei/Code/github/webhttp" }
 webclient = { path = "/Users/wuzhenwei/Code/github/webclient" }

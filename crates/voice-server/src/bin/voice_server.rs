@@ -2,21 +2,21 @@
 //!
 //! 配置来源（优先级从高到低）：
 //!   1. CLI 参数（--config、--port、--log-level）
-//!   2. 环境变量（VOICE_LOG_LEVEL / VOICE_PORT / VOICE_*_URL 等）
-//!   3. 配置文件（默认 ./voice-voice_server.yaml，可用 --config 指定）
+//!   2. 环境变量（VOICE_CONFIG / VOICE_LOG_LEVEL / VOICE_PORT / VOICE_*_URL 等）
+//!   3. 配置文件：默认 `<crate>/src/config/config.yaml`（in-crate），可用 --config / VOICE_CONFIG 覆盖
 //!   4. 内置默认值
 //!
 //! 启动日志会打印"最终生效的配置项"，便于确认。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
 use tracing::info;
 
-use voice_config::{init_logging, load_yaml, resolve_config_path};
 use voice_server::{
-    build_asr_client, build_llm_client, build_tts_client, VoiceConfig, VoiceService,
+    build_asr_client, build_llm_client, build_tts_client, init_logging, load_yaml,
+    resolve_config_path, resolve_web_static_dir, VoiceConfig, VoiceService,
 };
 
 #[derive(Parser, Debug)]
@@ -43,12 +43,28 @@ struct Cli {
     web_static_dir: Option<String>,
 }
 
+/// 默认配置文件路径：`<voice-server crate 根>/src/config/config.yaml`
+/// 编译期由 CARGO_MANIFEST_DIR 锚定，不依赖 CWD
+fn default_config_path() -> &'static Path {
+    static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("config")
+            .join("config.yaml")
+    })
+}
+
 #[actix_web::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // 1. 解析配置文件路径（CLI > VOICE_CONFIG > 标准搜索）
-    let cfg_path = resolve_config_path("voice_server", cli.config.as_deref());
+    let cfg_path = resolve_config_path(
+        "voice_server",
+        cli.config.as_deref(),
+        Some(default_config_path()),
+    );
     if !cfg_path.exists() {
         tracing::warn!(
             target: "voice_server",
@@ -88,22 +104,23 @@ async fn main() -> anyhow::Result<()> {
         log_level = %cfg.log.level,
         log_file = %cfg.log.file,
         log_format = %cfg.log.format,
-        asr_kind = %cfg.asr.kind,
-        asr_endpoint = %cfg.asr.endpoint,
-        llm_kind = %cfg.llm.kind,
-        llm_endpoint = %cfg.llm.endpoint,
-        tts_kind = %cfg.tts.kind,
-        tts_endpoint = %cfg.tts.endpoint,
+        asr_kind = "http",
+        asr_endpoint = %cfg.asr.resolved(cfg.provider.as_ref()).api_base,
+        llm_kind = "http",
+        llm_endpoint = %cfg.llm.resolved(cfg.provider.as_ref()).api_base,
+        tts_kind = "http",
+        tts_endpoint = %cfg.tts.resolved(cfg.provider.as_ref()).0.api_base,
         "voice_server 配置加载完成"
     );
 
     // 5. 构造客户端
-    let asr = build_asr_client(&cfg.asr)?;
-    let llm = build_llm_client(&cfg.llm)?;
-    let tts = build_tts_client(&cfg.tts)?;
+    let provider = cfg.provider.as_ref();
+    let asr = build_asr_client(&cfg.asr, provider)?;
+    let llm = build_llm_client(&cfg.llm, provider)?;
+    let tts = build_tts_client(&cfg.tts, provider)?;
 
-    let static_dir = voice_config::resolve_web_static_dir(cli.web_static_dir.as_deref())
-        .unwrap_or_else(|| std::path::PathBuf::from("./static"));
+    let static_dir =
+        resolve_web_static_dir(cli.web_static_dir.as_deref()).unwrap_or_else(|| std::path::PathBuf::from("./static"));
     info!(target: "voice_server.web", static_dir = %static_dir.display(), "web demo 静态目录解析结果");
 
     let service = Arc::new(
@@ -137,9 +154,9 @@ async fn main() -> anyhow::Result<()> {
     );
     info!(
         target: "voice_server",
-        asr = format!("{} ({})", cfg.asr.endpoint, cfg.asr.kind),
-        llm = format!("{} ({})", cfg.llm.endpoint, cfg.llm.kind),
-        tts = format!("{} ({})", cfg.tts.endpoint, cfg.tts.kind),
+        asr = format!("{} (http)", cfg.asr.resolved(cfg.provider.as_ref()).api_base),
+        llm = format!("{} (http)", cfg.llm.resolved(cfg.provider.as_ref()).api_base),
+        tts = format!("{} (http)", cfg.tts.resolved(cfg.provider.as_ref()).0.api_base),
         "后端服务"
     );
     info!(

@@ -18,26 +18,147 @@
   </div>
 </header>
 
+<nav class="tabs">
+  <button class="tab-btn active" data-tab="pipeline">💬 全流程对话</button>
+  <button class="tab-btn" data-tab="asr">🎤 ASR</button>
+  <button class="tab-btn" data-tab="llm">🧠 LLM</button>
+  <button class="tab-btn" data-tab="tts">🔊 TTS</button>
+  <button class="tab-btn" data-tab="llm_tts">🧠+🔊 LLM→TTS</button>
+  <button class="tab-btn" data-tab="asr_llm_tts">📁 ASR→LLM→TTS</button>
+</nav>
+
 <main>
-  <section class="controls">
-    <button id="btn-start">开始对话</button>
-    <button id="btn-interrupt" disabled>打断</button>
-    <button id="btn-stop" disabled>结束</button>
-    <div class="hint">
-      浏览器需授权麦克风；点"开始对话"后会持续收音并自动检测句尾。
-      说完一句稍作停顿即可（VAD 静音约 600ms）。
+  <!-- ========== 全流程对话（现有 WS pipeline）========== -->
+  <section id="tab-pipeline" class="tab-pane">
+    <div class="pane-grid">
+      <section class="controls">
+        <button id="btn-start">开始对话</button>
+        <button id="btn-interrupt" disabled>打断</button>
+        <button id="btn-stop" disabled>结束</button>
+        <div class="hint">
+          浏览器需授权麦克风；点"开始对话"后会持续收音并自动检测句尾。
+          说完一句稍作停顿即可（VAD 静音约 600ms）。
+          上传录音文件走「📁 ASR→LLM→TTS」tab。
+        </div>
+      </section>
+
+      <section class="conversation">
+        <div class="conversation-title">对话日志</div>
+        <div id="conv-log" class="conv-log">
+          <div class="empty-hint">（还没开始说话）</div>
+        </div>
+      </section>
     </div>
   </section>
 
-  <section class="conversation">
-    <div class="conversation-title">对话日志</div>
-    <div id="conv-log" class="conv-log">
-      <div class="empty-hint">（还没开始说话）</div>
+  <!-- ========== ASR 单能力 ========== -->
+  <section id="tab-asr" class="tab-pane" hidden>
+    <div class="test-panel">
+      <h2>🎤 ASR 单能力验证</h2>
+      <div class="hint">上传 WAV 文件 → POST /test/asr（前端先解析 WAV 为 PCM s16le 16kHz mono）→ 流式识别</div>
+      <div class="test-controls">
+        <input id="asr-file-input" type="file" accept=".wav,.raw,.pcm,audio/*" />
+        <button id="asr-run" disabled>▶ 跑 ASR</button>
+        <span id="asr-status" class="status-text">等待选择文件...</span>
+      </div>
+      <div class="test-output">
+        <div class="output-label">识别结果：</div>
+        <div id="asr-output" class="output-box"><span class="empty-hint">（无）</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========== LLM 单能力 ========== -->
+  <section id="tab-llm" class="tab-pane" hidden>
+    <div class="test-panel">
+      <h2>🧠 LLM 单能力验证</h2>
+      <div class="hint">输入 prompt → POST /test/llm → 流式文本回复</div>
+      <div class="test-controls">
+        <textarea id="llm-prompt" rows="2" placeholder="输入 prompt，例如：讲个笑话"></textarea>
+        <button id="llm-run">▶ 跑 LLM</button>
+        <span id="llm-status" class="status-text">空闲</span>
+      </div>
+      <div class="test-output">
+        <div class="output-label">回复：</div>
+        <div id="llm-output" class="output-box"><span class="empty-hint">（无）</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========== TTS 单能力 ========== -->
+  <section id="tab-tts" class="tab-pane" hidden>
+    <div class="test-panel">
+      <h2>🔊 TTS 单能力验证</h2>
+      <div class="hint">输入文本 → POST /test/tts → 流式音频 chunk → 拼成 WAV 后播放</div>
+      <div class="test-controls">
+        <textarea id="tts-text" rows="2" placeholder="输入要合成的文本，例如：你好世界"></textarea>
+        <button id="tts-run">▶ 跑 TTS</button>
+        <span id="tts-status" class="status-text">空闲</span>
+      </div>
+      <div class="test-output">
+        <div class="output-label">合成音频：</div>
+        <div class="audio-controls">
+          <audio id="tts-audio" controls></audio>
+          <a id="tts-download" class="btn-download" hidden>下载 wav</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========== LLM+TTS 单能力 ========== -->
+  <section id="tab-llm_tts" class="tab-pane" hidden>
+    <div class="test-panel">
+      <h2>🧠+🔊 LLM→TTS 单能力验证</h2>
+      <div class="hint">输入文本 → POST /test/llm_tts → LLM 流式 + 切句 + TTS 流式 → 拼成 WAV 后播放</div>
+      <div class="test-controls">
+        <textarea id="llm_tts-text" rows="2" placeholder="输入文本，例如：讲个笑话"></textarea>
+        <button id="llm_tts-run">▶ 跑 LLM→TTS</button>
+        <span id="llm_tts-status" class="status-text">空闲</span>
+      </div>
+      <div class="test-output">
+        <div class="output-label">合成音频：</div>
+        <div class="audio-controls">
+          <audio id="llm_tts-audio" controls></audio>
+          <a id="llm_tts-download" class="btn-download" hidden>下载 wav</a>
+        </div>
+      </div>
+    </div>
+  </section>
+  <!-- ========== ASR→LLM→TTS 上传文件全链路 ========== -->
+  <section id="tab-asr_llm_tts" class="tab-pane" hidden>
+    <div class="test-panel">
+      <h2>📁 ASR→LLM→TTS 全链路验证</h2>
+      <div class="hint">上传 WAV/裸 PCM 文件 → POST /test/asr_llm_tts → ASR 识别 → LLM 流式 → 切句 TTS，分阶段 NDJSON 事件</div>
+      <div class="test-controls">
+        <input id="asr_llm_tts-file-input" type="file" accept=".wav,.raw,.pcm,audio/*" />
+        <button id="asr_llm_tts-run" disabled>▶ 跑全链路</button>
+        <span id="asr_llm_tts-status" class="status-text">等待选择文件...</span>
+      </div>
+      <div class="test-output">
+        <div class="output-label">识别结果（ASR）：</div>
+        <div id="asr_llm_tts-asr-output" class="output-box"><span class="empty-hint">（无）</span></div>
+      </div>
+      <div class="test-output">
+        <div class="output-label">LLM 回复：</div>
+        <div id="asr_llm_tts-llm-output" class="output-box"><span class="empty-hint">（无）</span></div>
+      </div>
+      <div class="test-output">
+        <div class="output-label">合成音频：</div>
+        <div class="audio-controls">
+          <audio id="asr_llm_tts-audio" controls></audio>
+          <a id="asr_llm_tts-download" class="btn-download" hidden>下载 wav</a>
+        </div>
+      </div>
     </div>
   </section>
 </main>
 
-<script src="https://cdn.jsdelivr.net/npm/msgpack-lite@0.1.26/dist.msgpack.min.js"></script>
+<script src="ndjson.js"></script>
+<script src="tab-asr.js"></script>
+<script src="tab-llm.js"></script>
+<script src="tab-tts.js"></script>
+<script src="tab-llm_tts.js"></script>
+<script src="tab-asr_llm_tts.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

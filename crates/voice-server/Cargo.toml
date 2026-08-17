@@ -8,13 +8,13 @@ description = "Voice server using webhttp framework"
 
 [dependencies]
 voice-proto = { workspace = true }
-voice-config = { workspace = true }
 webproto = { workspace = true }
 webhttp = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
 async-stream = "0.3"
+async-openai = { version = "=0.29.0", features = ["rustls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
@@ -23,6 +23,8 @@ thiserror = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+time = { version = "0.3", features = ["macros", "formatting", "local-offset"] }
 clap = { version = "4", features = ["derive"] }
 uuid = { workspace = true }
 axum = { workspace = true }

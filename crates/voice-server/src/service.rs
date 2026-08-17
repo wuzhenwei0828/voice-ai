@@ -7,7 +7,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use actix::prelude::Recipient;
-use actix_web::web::ServiceConfig;
+use actix_web::web::{self, ServiceConfig};
 use dashmap::DashMap;
 use tracing::{debug, info, warn};
 use voice_proto::decode_payload;
@@ -15,9 +15,9 @@ use voice_proto::decode_payload;
 use webhttp::websocket::{ActorMsg, OutMessage};
 use webhttp::{ServiceCallback, WsData};
 
-use crate::clients::ArcAsr;
-use crate::clients::ArcLlm;
-use crate::clients::ArcTts;
+use crate::client::ArcAsr;
+use crate::client::ArcLlm;
+use crate::client::ArcTts;
 use crate::session::VoiceSession;
 
 pub struct VoiceService {
@@ -50,6 +50,11 @@ impl VoiceService {
     pub fn session_count(&self) -> usize {
         self.sessions.len()
     }
+
+    /// 把内部的 Arc 客户端借出来，供给 test_api handlers 用（通过 web::Data 注入）
+    pub fn arcs(&self) -> (ArcAsr, ArcLlm, ArcTts) {
+        (self.asr.clone(), self.llm.clone(), self.tts.clone())
+    }
 }
 
 impl ServiceCallback for VoiceService {
@@ -58,6 +63,21 @@ impl ServiceCallback for VoiceService {
     }
 
     fn api_init(&self, web_app: &mut ServiceConfig) {
+        // 单能力验证接口 /test/* （HTTP REST + NDJSON 流）
+        // 注意：必须先于 static files 注册，否则 Files 服务会优先匹配 /test/* 路径
+        let (asr, llm, tts) = self.arcs();
+        web_app.app_data(web::Data::new(asr))
+                .app_data(web::Data::new(llm))
+                .app_data(web::Data::new(tts))
+                .service(
+                    web::scope("/test")
+                        .route("/asr", web::post().to(crate::test_api::asr))
+                        .route("/llm", web::post().to(crate::test_api::llm))
+                        .route("/tts", web::post().to(crate::test_api::tts))
+                        .route("/llm_tts", web::post().to(crate::test_api::llm_tts))
+                        .route("/asr_llm_tts", web::post().to(crate::test_api::asr_llm_tts))
+                );
+
         if let Some(path) = &self.web_static_dir {
             if path.exists() {
                 tracing::info!(target: "voice_server.web", static_dir = %path.display(), "挂载 web demo 静态文件");

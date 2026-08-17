@@ -19,6 +19,7 @@ voice-app/
     │       ├── clients.rs                # ASR / LLM / TTS trait + HTTP 实现
     │       ├── session.rs                # VoiceSession 状态机 + pipeline
     │       ├── service.rs                # VoiceService 实现 webhttp::ServiceCallback
+    │       ├── test_api.rs               # 单能力验证 HTTP 接口（/test/*）
     │       └── bin/voice_server.rs       # 启动入口
     ├── voice-client/                     # Rust 终端 SDK + CLI
     │   ├── Cargo.toml
@@ -26,38 +27,24 @@ voice-app/
     │       ├── lib.rs
     │       ├── callback.rs               # VoiceCallback trait + 默认实现
     │       └── bin/voice_terminal.rs     # CLI demo（wav 文件推流 + 接收回放）
-    ├── mock-asr/                         # Mock ASR 服务
-    │   ├── Cargo.toml
-    │   └── src/main.rs
-    ├── mock-llm/                         # Mock LLM 服务
-    │   ├── Cargo.toml
-    │   └── src/main.rs
-    └── mock-tts/                         # Mock TTS 服务
-        ├── Cargo.toml
-        └── src/main.rs
+    └── ws-payload-helper/                # （辅助工具）
 ```
 
 ## 端到端跑通
 
-### 1. 启动 4 个进程
+### 1. 启动 voice_server
 
 ```bash
-# 终端 1
-RUST_LOG=info cargo run -p mock-asr -- --port 7001
+# 直接用 voice-voice_server.yaml 里配置的 ASR/LLM/TTS 服务
+RUST_LOG=info cargo run --release -p voice-server
 
-# 终端 2
-RUST_LOG=info cargo run -p mock-llm -- --port 7002
-
-# 终端 3
-RUST_LOG=info cargo run -p mock-tts -- --port 7003
-
-# 终端 4
-RUST_LOG=info cargo run -p voice-server
 # 默认端口 8080；可用环境变量覆盖：
 # VOICE_PORT=9000
 # VOICE_ASR_URL=http://...
 # VOICE_LLM_URL=http://...
 # VOICE_TTS_URL=http://...
+# VOICE_<ASR|LLM|TTS>_AUTHORIZATION=Bearer sk-xxx
+# VOICE_<ASR|LLM|TTS>_MODEL=model-name
 ```
 
 ### 2. 准备测试 wav
@@ -87,7 +74,7 @@ RUST_LOG=info cargo run -p voice-client --bin voice_terminal -- \
 
 ### 4. 观察日志（每个关键节点都有）
 
-服务端日志（节选）：
+服务端日志（节选，siliconflow 真实服务示例）：
 ```
 INFO voice_server.service: WS 连接建立
 INFO voice_server.service: 新建 VoiceSession session_id=voice-cli-demo
@@ -96,19 +83,16 @@ INFO voice_server.session: 收到 SessionStart session_id=voice-cli-demo
 INFO voice_server.session: 状态转换 from=Idle to=Listening
 INFO voice_server.session: VAD 句尾，触发 pipeline bytes=48000 elapsed_ms=1659
 INFO voice_server.session: 状态转换 from=Listening to=Processing
-INFO voice_server.session: 状态转换 from=Processing to=Listening
 INFO voice_server.session: pipeline 开始 session_id=voice-cli-demo
-INFO voice_server.asr: POST http://127.0.0.1:7001/recognize (48000 bytes)
-INFO voice_server.asr: 收到 ASR partial/final text=[mock-asr 识别中... 已收 48000 字节] is_final=false
-INFO voice_server.asr: 收到 ASR partial/final text=你好世界... is_final=true
+INFO voice_server.asr: ASR POST 请求 (48000 bytes)
+INFO voice_server.asr: 收到 ASR partial/final text=你好世界 is_final=true
 INFO voice_server.session: ASR final 完成，进入 LLM
-INFO voice_server.llm: POST http://127.0.0.1:7002/chat (prompt_len=49)
-INFO voice_server.llm: 收到 LLM delta delta_len=4 delta=你好！。
-INFO voice_server.session: LLM 切出完整句子，送 TTS sentence=你好！
-INFO voice_server.tts: POST http://127.0.0.1:7003/synthesize (text_len=3)
-INFO voice_server.tts: 收到 TTS chunk seq=0 bytes=320 is_last=false
+INFO voice_server.llm: LLM POST 请求 prompt_len=4
+INFO voice_server.llm: 收到 LLM delta delta_len=6 is_final=false delta=你好世界。
+INFO voice_server.session: LLM 切出完整句子，送 TTS sentence=你好世界。
+INFO voice_server.tts: TTS POST 请求 text_len=4
+INFO voice_server.tts: 收到 TTS chunk seq=0 bytes=32000 is_last=false
 INFO voice_server.tts: 收到 TTS chunk seq=1 bytes=0 is_last=true
-... (后续 6 句同样流程)
 INFO voice_server.session: pipeline 全部完成
 INFO voice_server.session: 收到 SessionEnd session_id=voice-cli-demo reason=normal exit
 INFO voice_server.service: WS 断开，移除 session
@@ -118,20 +102,34 @@ INFO voice_server.service: WS 断开，移除 session
 
 | 阶段 | 状态 | 说明 |
 |------|------|------|
-| Phase 1 MVP | ✅ | VoicePayload + ASR 文本 echo |
+| Phase 1 MVP | ✅ | VoicePayload + ASR 文本 |
 | Phase 2 半双工对话 | ✅ | LLM 流式 + TTS 流式 + 按句切分 |
-| Phase 3 全双工 | ⏳ 部分 | 打断机制（服务端支持 Interrupt），但客户端 VAD 还没接 |
+| Phase 3 全双工 | ⏳ 部分 | 打断机制（服务端支持 Interrupt），客户端 VAD 还在浏览器侧做 |
 | Phase 4 生产化 | ❌ | 限流、监控、审核、多租户未做 |
 
-## 替换真实服务
+## 单能力验证接口
 
-`voice-server/src/clients.rs` 里实现了 `AsrClient` / `LlmClient` / `TtsClient` 三个 trait，
-要接阿里云/腾讯/OpenAI 等真实服务只需：
+`voice-server` 暴露了 4 个 HTTP REST + NDJSON 流接口，方便单点验证 ASR / LLM / TTS：
 
-1. 新建一个 `XxxClient` struct，实现对应 trait
-2. 在 `voice-server/src/bin/voice_server.rs` 里替换 `HttpAsrClient::new(...)` 为 `XxxClient::new(api_key, ...)`
+| 路径 | 输入 | 输出 |
+|------|------|------|
+| `POST /test/asr` | raw PCM body | NDJSON `{text, is_final}` |
+| `POST /test/llm` | JSON `{prompt}` | NDJSON `{delta, is_final}` |
+| `POST /test/tts` | JSON `{text}` | NDJSON `{seq, audio(base64), is_last}` |
+| `POST /test/llm_tts` | JSON `{text}` | NDJSON TTS chunks（LLM 切句后串 TTS） |
 
-mock 服务本身可以继续留作本地开发/CI 用。
+前端页面默认 5 个 tab：全流程对话 / ASR / LLM / TTS / LLM→TTS，可以分别跑每个能力。
+
+```bash
+# curl 示例
+curl -sN -X POST http://localhost:8080/test/llm \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"讲个笑话"}'
+
+curl -sN -X POST http://localhost:8080/test/tts \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"你好世界"}' | jq -c '{seq, is_last, len:(.audio|length)}'
+```
 
 ## 关键设计决策
 
@@ -158,8 +156,7 @@ mock 服务本身可以继续留作本地开发/CI 用。
 | webclient | WebSocket 客户端（基于 tokio-tungstenite） |
 | webproto | 二进制消息协议（MessagePack + 信封） |
 | tokio + tokio-util | async runtime + CancellationToken |
-| reqwest | HTTP client（连 mock-* 服务） |
-| axum | mock 服务的 HTTP server |
+| reqwest | HTTP client（连 ASR/LLM/TTS 真实服务） |
 | tracing | 日志 |
 | clap | CLI 参数解析 |
 | hound | wav 文件读取 |

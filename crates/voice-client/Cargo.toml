@@ -8,7 +8,6 @@ description = "Rust voice client SDK + terminal CLI demo"
 
 [dependencies]
 voice-proto = { workspace = true }
-voice-config = { workspace = true }
 webproto = { workspace = true }
 webclient = { workspace = true }
 tokio = { workspace = true }

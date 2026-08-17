@@ -36,6 +36,30 @@
   const speakerStatus = $('speaker-status');
   const latency = $('latency');
 
+  // ====== Tab 切换 ======
+  // 不影响现有 WS pipeline 状态；切换 tab 只显示/隐藏对应 section
+  const TABS = ['pipeline', 'asr', 'llm', 'tts', 'llm_tts', 'asr_llm_tts'];
+  function activateTab(name) {
+    if (!TABS.includes(name)) name = 'pipeline';
+    document.querySelectorAll('.tab-btn').forEach((b) => {
+      b.classList.toggle('active', b.dataset.tab === name);
+    });
+    TABS.forEach((t) => {
+      const el = document.getElementById('tab-' + t);
+      if (el) el.hidden = (t !== name);
+    });
+    try { localStorage.setItem('voice-app.activeTab', name); } catch (_) {}
+  }
+  document.querySelectorAll('.tab-btn').forEach((b) => {
+    b.onclick = () => activateTab(b.dataset.tab);
+  });
+  let initialTab = 'pipeline';
+  try {
+    const saved = localStorage.getItem('voice-app.activeTab');
+    if (saved && TABS.includes(saved)) initialTab = saved;
+  } catch (_) {}
+  activateTab(initialTab);
+
   // ====== 状态 ======
   let ws = null;
   let audioCtx = null;
@@ -61,34 +85,217 @@
   let lastAsrStartMs = null;
   let lastTtsFirstByteMs = null;
 
-  // ====== MessagePack 编解码（用 msgpack-lite CDN）======
-  // voice-proto 的 wire format 是 webproto 信封：
-  //   Message<F> 枚举：Indication(Indication<F>) | ClientCommand(ClientCommand<F>) | ServerCommand(ServerCommand<F>)
-  // 但浏览器这边简单点：服务端 99% 收到的都是 AudioChunk（上行）和 SessionStart（上行），
-  // 收到的是 Indication<VoicePayload>。下行也是 Indication<VoicePayload>。
-  // msgpack-lite 的 api：msgpack.encode(obj) → Uint8Array；msgpack.decode(Uint8Array) → obj
-  //
-  // Indication<VoicePayload> 的结构（简化版）：
-  //   { data: <VoicePayload> }
-  // VoicePayload 用 serde tag 序列化：{ type: "session_start", session_id: "...", ... }
-  //
-  // 注意：webproto 用 rmp_serde (Rust MessagePack)，跟 msgpack-lite 的 ext-type 略有差异
-  // —— 我们这里只处理业务字段，序列化策略在两边要一致。
-  // 这里采用纯 JSON-like 结构 + 简单 msgpack。
-  // 但 Rust 端用的是 serde 的 tagged enum + rmp。
-  // 幸运的是 rmp_serde 默认就是 serde 兼容的 compact 模式，跟 msgpack-lite 的 basic 模式兼容。
-  const MP = window.msgpack;
+  // ====== MessagePack 编解码（native，不用 msgpack-lite）======
+  // 浏览器版 msgpack-lite（Buffer polyfill）行为不一致，干脆自己写 ~110 行 encoder/decoder
+  // 支持 map / string / int / bool / null / array / float64 / bin (0xc4/0xc5/0xc6)，零依赖
+  // wire format：{ "Indication": { "data": <payload> } }（与 rmp_serde externally tagged 一致）
+  // Uint8Array 走 msgpack bin8/16/32（voice-proto 对 AudioChunk.data / TtsAudio.data 用
+  // #[serde(with = "serde_bytes")]，rmp_serde 编出来就是 bin）
+
+  const _encoder = new TextEncoder();
+  const _decoder = new TextDecoder();
+
+  function msgpackEncode(value) {
+    const chunks = [];
+    _write(value);
+    let total = 0;
+    for (const c of chunks) total += c.byteLength;
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+    return out;
+
+    function _write(v) {
+      if (v === null || v === undefined) {
+        chunks.push(new Uint8Array([0xc0]));
+      } else if (typeof v === 'boolean') {
+        chunks.push(new Uint8Array([v ? 0xc3 : 0xc2]));
+      } else if (typeof v === 'number') {
+        if (Number.isInteger(v)) {
+          if (v >= 0 && v <= 0x7f) chunks.push(new Uint8Array([v]));
+          else if (v >= -32 && v < 0) chunks.push(new Uint8Array([0xe0 + (v + 32)]));
+          else if (v >= 0 && v <= 0xff) chunks.push(new Uint8Array([0xcc, v]));
+          else if (v >= -128 && v < 0) chunks.push(new Uint8Array([0xd0, v + 256]));
+          else if (v >= 0 && v <= 0xffff) {
+            const u = new Uint8Array(3); u[0] = 0xcd;
+            new DataView(u.buffer).setUint16(1, v, false);
+            chunks.push(u);
+          } else if (v >= -32768 && v < 0) {
+            const u = new Uint8Array(3); u[0] = 0xd1;
+            new DataView(u.buffer).setUint16(1, v + 65536, false);
+            chunks.push(u);
+          } else {
+            const u = new Uint8Array(5); u[0] = 0xd2;
+            new DataView(u.buffer).setInt32(1, v, false);
+            chunks.push(u);
+          }
+        } else {
+          const u = new Uint8Array(9); u[0] = 0xcb;
+          new DataView(u.buffer).setFloat64(1, v, false);
+          chunks.push(u);
+        }
+      } else if (typeof v === 'string') {
+        const bytes = _encoder.encode(v);
+        if (bytes.length < 32) chunks.push(new Uint8Array([0xa0 + bytes.length]));
+        else if (bytes.length < 256) chunks.push(new Uint8Array([0xd9, bytes.length]));
+        else if (bytes.length < 0xffff) {
+          const u = new Uint8Array(3); u[0] = 0xda;
+          new DataView(u.buffer).setUint16(1, bytes.length, false);
+          chunks.push(u);
+        } else {
+          const u = new Uint8Array(5); u[0] = 0xdb;
+          new DataView(u.buffer).setUint32(1, bytes.length, false);
+          chunks.push(u);
+        }
+        chunks.push(bytes);
+      } else if (Array.isArray(v)) {
+        if (v.length < 16) chunks.push(new Uint8Array([0x90 + v.length]));
+        else {
+          const u = new Uint8Array(3); u[0] = 0xdc;
+          new DataView(u.buffer).setUint16(1, v.length, false);
+          chunks.push(u);
+        }
+        for (const item of v) _write(item);
+      } else if (v instanceof Uint8Array) {
+        // msgpack bin（服务端 voice-proto 用 #[serde(with="serde_bytes")] 走 bin 编码）
+        const len = v.length;
+        if (len < 256) {
+          const u = new Uint8Array(2 + len);
+          u[0] = 0xc4; u[1] = len;
+          u.set(v, 2);
+          chunks.push(u);
+        } else if (len < 0x10000) {
+          const u = new Uint8Array(3 + len);
+          u[0] = 0xc5;
+          new DataView(u.buffer).setUint16(1, len, false);
+          u.set(v, 3);
+          chunks.push(u);
+        } else {
+          const u = new Uint8Array(5 + len);
+          u[0] = 0xc6;
+          new DataView(u.buffer).setUint32(1, len, false);
+          u.set(v, 5);
+          chunks.push(u);
+        }
+      } else if (typeof v === 'object') {
+        const keys = Object.keys(v);
+        if (keys.length < 16) chunks.push(new Uint8Array([0x80 + keys.length]));
+        else {
+          const u = new Uint8Array(3); u[0] = 0xde;
+          new DataView(u.buffer).setUint16(1, keys.length, false);
+          chunks.push(u);
+        }
+        for (const k of keys) {
+          _write(k);
+          _write(v[k]);
+        }
+      } else {
+        throw new Error('msgpack: unsupported type ' + typeof v);
+      }
+    }
+  }
+
+  function msgpackDecode(bytes) {
+    let pos = 0;
+    function _read() {
+      const b = bytes[pos++];
+      if (b <= 0x7f) return b;
+      if (b >= 0xe0) return b - 0x100;
+      if (b >= 0xa0 && b <= 0xbf) {
+        const len = b - 0xa0;
+        const s = _decoder.decode(bytes.slice(pos, pos + len));
+        pos += len;
+        return s;
+      }
+      if (b >= 0x90 && b <= 0x9f) {
+        const len = b - 0x90;
+        const arr = [];
+        for (let i = 0; i < len; i++) arr.push(_read());
+        return arr;
+      }
+      if (b >= 0x80 && b <= 0x8f) {
+        const len = b - 0x80;
+        const obj = {};
+        for (let i = 0; i < len; i++) {
+          const key = _read();
+          obj[key] = _read();
+        }
+        return obj;
+      }
+      if (b === 0xc0) return null;
+      if (b === 0xc2) return false;
+      if (b === 0xc3) return true;
+      if (b === 0xcc) return bytes[pos++];
+      if (b === 0xd0) return bytes[pos++] - 256;
+      if (b === 0xcd) {
+        const v = (bytes[pos] << 8) | bytes[pos + 1];
+        pos += 2;
+        return v;
+      }
+      if (b === 0xd1) {
+        const v = (bytes[pos] << 8) | bytes[pos + 1];
+        pos += 2;
+        return v - 65536;
+      }
+      if (b === 0xd2) {
+        const v = new DataView(bytes.buffer, bytes.byteOffset + pos, 4).getInt32(0, false);
+        pos += 4;
+        return v;
+      }
+      if (b === 0xd9) {
+        const len = bytes[pos++];
+        const s = _decoder.decode(bytes.slice(pos, pos + len));
+        pos += len;
+        return s;
+      }
+      if (b === 0xda) {
+        const len = (bytes[pos] << 8) | bytes[pos + 1];
+        pos += 2;
+        const s = _decoder.decode(bytes.slice(pos, pos + len));
+        pos += len;
+        return s;
+      }
+      if (b === 0xc4) {
+        const len = bytes[pos++];
+        const out = bytes.slice(pos, pos + len);
+        pos += len;
+        return out;
+      }
+      if (b === 0xc5) {
+        const len = (bytes[pos] << 8) | bytes[pos + 1];
+        pos += 2;
+        const out = bytes.slice(pos, pos + len);
+        pos += len;
+        return out;
+      }
+      if (b === 0xc6) {
+        const len = new DataView(bytes.buffer, bytes.byteOffset + pos, 4).getUint32(0, false);
+        pos += 4;
+        const out = bytes.slice(pos, pos + len);
+        pos += len;
+        return out;
+      }
+      throw new Error('msgpack: unsupported byte 0x' + b.toString(16));
+    }
+    return _read();
+  }
 
   function encodeIndication(payload) {
-    return MP.encode({ data: payload });
+    return msgpackEncode({ Indication: { data: payload } });
   }
 
   function decodeMessage(bytes) {
-    const obj = MP.decode(bytes);
-    // webproto Message<F> 是一个 enum：可能返回 { data: ... } (Indication) 或 { event_id, command } (ClientCommand/ServerCommand)
-    // 我们的 VoicePayload 都用 Indication 包装（除了 SessionStart），所以这里主要处理 { data: ... }
-    if (obj && typeof obj === 'object' && 'data' in obj) return obj.data;
-    if (obj && typeof obj === 'object' && 'command' in obj) return obj.command;
+    const u8 = bytes instanceof ArrayBuffer ? new Uint8Array(bytes) : bytes;
+    const obj = msgpackDecode(u8);
+    if (!obj || typeof obj !== 'object') return null;
+    if ('Indication' in obj && obj.Indication && 'data' in obj.Indication) {
+      return obj.Indication.data;
+    }
+    if (('ClientCommand' in obj || 'ServerCommand' in obj) &&
+        (obj.ClientCommand || obj.ServerCommand) &&
+        'command' in (obj.ClientCommand || obj.ServerCommand)) {
+      return (obj.ClientCommand || obj.ServerCommand).command;
+    }
     return null;
   }
 
@@ -238,11 +445,8 @@
               break;
             case 'tts_audio':
               if (payload.data && payload.data.length > 0) {
-                // 后端用 base64 编码 PCM bytes (因为 rmp serde Vec<u8> 是 bin 类型；
-                // 但浏览器 msgpack-lite 不一定能直接 decode Vec<u8>，所以服务端 base64 了一下)
-                // 这里 data 是 base64 字符串
-                const raw = base64ToBytes(payload.data);
-                playTtsAudio(raw, payload.is_last);
+                // 下行：服务端用 #[serde(with="serde_bytes")] 走 msgpack bin，JS 解码后已是 Uint8Array
+                playTtsAudio(payload.data, payload.is_last);
                 if (!lastTtsFirstByteMs) lastTtsFirstByteMs = performance.now();
               }
               if (payload.is_last) {
@@ -264,13 +468,6 @@
         }
       };
     });
-  }
-
-  function base64ToBytes(b64) {
-    const bin = atob(b64);
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    return bytes;
   }
 
   function sendInterrupt() {
@@ -381,7 +578,7 @@
           session_id: sessionId,
           seq: seq,
           timestamp_ms: Date.now() - (startedAtMs || Date.now()),
-          data: bytesToBase64(bytes),
+          data: bytes,
           is_last: isLast,
         };
         ws.send(encodeIndication(payload));
@@ -425,59 +622,6 @@
     setStatus(micStatus, '麦克风：关', 'badge-offline');
   }
 
-  function bytesToBase64(bytes) {
-    let bin = '';
-    const chunk = 0x8000;
-    for (let i = 0; i < bytes.length; i += chunk) {
-      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
-    }
-    return btoa(bin);
-  }
-
-  // ====== 按钮 ======
-  btnStart.onclick = async () => {
-    btnStart.disabled = true;
-    try {
-      await connect();
-      await startMic();
-      btnStop.disabled = false;
-      btnInterrupt.disabled = false;
-      addMessage('system', '准备就绪。说一句试试。');
-    } catch (e) {
-      btnStart.disabled = false;
-      addMessage('error', '启动失败：' + e.message);
-    }
-  };
-
-  btnInterrupt.onclick = () => {
-    sendInterrupt();
-  };
-
-  btnStop.onclick = () => {
-    sendSessionEnd('user stopped');
-    stopMic();
-    if (ws) ws.close();
-    btnStart.disabled = false;
-    btnStop.disabled = true;
-    btnInterrupt.disabled = true;
-    addMessage('system', '已结束');
-  };
-
-  // ====== 启动 ======
-  // 页面加载时立即请求麦克风权限（不连 WS，只拿权限）
-  async function requestMicOnLoad() {
-    setStatus(micStatus, '麦克风：请求权限...', 'badge-busy');
-    addMessage('system', '正在请求麦克风权限...');
-    try {
-      await startMic();
-      addMessage('system', '麦克风权限已获得。点"开始对话"连接服务。');
-    } catch (e) {
-      setStatus(micStatus, '麦克风：拒绝', 'badge-offline');
-      addMessage('error', '麦克风权限被拒绝：' + e.message + '。请在浏览器地址栏左侧允许后刷新页面。');
-    }
-  }
-
-  // ====== 按钮 ======
   // ====== 按钮 ======
   btnStart.onclick = async () => {
     btnStart.disabled = true;
@@ -496,6 +640,22 @@
       addMessage('error', '启动失败：' + e.message);
     }
   };
+
+  // ====== 调试：诊断 ws.send 行为 ======
+  // 测试 1：发送 native msgpack 编码结果
+  function testWsSendBinary() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      addMessage('error', 'WS 未连接');
+      return;
+    }
+    const obj = {Indication: {data: {type: 'session_start', session_id: 'web-demo', sample_rate: 16000, channels: 1, codec: 'pcm_s16le', language: 'zh-CN'}}};
+    const bytes = msgpackEncode(obj);
+    console.log('[DBG] sending bytes, length=', bytes.length, 'ctor=', bytes.constructor.name);
+    ws.send(bytes);
+    addMessage('system', '测试：发送 native msgpack 字节');
+  }
+  window.__testWs = { testWsSendBinary };
+  addMessage('system', '调试：控制台运行 __testWs.testWsSendBinary()');
 
   btnInterrupt.onclick = () => {
     sendInterrupt();

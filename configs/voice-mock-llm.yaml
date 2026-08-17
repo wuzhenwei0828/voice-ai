@@ -1,8 +1,0 @@
-# mock-llm 配置
-log:
-  level: info
-  file: ../logs/mock-llm.log
-  format: pretty
-
-server:
-  port: 7002

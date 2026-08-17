@@ -56,16 +56,194 @@ header h1 {
 }
 
 main {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 16px;
+  display: block;
   padding: 16px 24px;
   max-width: 1100px;
   margin: 0 auto;
 }
 
+/* ====== Tab 导航 ====== */
+.tabs {
+  display: flex;
+  gap: 4px;
+  padding: 0 24px;
+  background: #161b22;
+  border-bottom: 1px solid #2a2f3a;
+  overflow-x: auto;
+}
+
+.tab-btn {
+  padding: 10px 18px;
+  font-size: 13px;
+  font-weight: 500;
+  border: none;
+  background: transparent;
+  color: #8b949e;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.tab-btn:hover {
+  color: #c9d1d9;
+}
+
+.tab-btn.active {
+  color: #79b8ff;
+  border-bottom-color: #4a8ed8;
+}
+
+.tab-pane {
+  display: block;
+}
+
+.tab-pane[hidden] {
+  display: none;
+}
+
+/* ====== Test panel（单能力验证页通用） ====== */
+.test-panel {
+  background: #161b22;
+  padding: 20px;
+  border-radius: 8px;
+  border: 1px solid #2a2f3a;
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.test-panel h2 {
+  margin: 0 0 8px 0;
+  font-size: 18px;
+  color: #c9d1d9;
+}
+
+.test-controls {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin: 16px 0;
+  flex-wrap: wrap;
+}
+
+.test-controls textarea,
+.test-controls input[type="file"] {
+  flex: 1;
+  min-width: 240px;
+  padding: 8px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  background: #0e1117;
+  color: #e6e6e6;
+  border: 1px solid #3a4150;
+  border-radius: 6px;
+  resize: vertical;
+}
+
+.test-controls button {
+  padding: 10px 18px;
+  font-size: 13px;
+  font-weight: 500;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  background: #2da14a;
+  color: #fff;
+}
+
+.test-controls button:hover:not(:disabled) {
+  background: #3bc15a;
+}
+
+.test-controls button:disabled {
+  background: #3a4150;
+  color: #8b949e;
+  cursor: not-allowed;
+}
+
+.status-text {
+  font-size: 12px;
+  color: #8b949e;
+  align-self: center;
+}
+
+.test-output {
+  margin-top: 16px;
+}
+
+.output-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #8b949e;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 8px;
+}
+
+.output-box {
+  background: #0e1117;
+  border: 1px solid #2a2f3a;
+  border-radius: 6px;
+  padding: 12px 16px;
+  font-size: 14px;
+  line-height: 1.7;
+  min-height: 80px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #c9d1d9;
+  font-family: -apple-system, "SF Mono", Menlo, monospace;
+}
+
+.output-box .empty-hint {
+  color: #4a5260;
+  font-style: italic;
+}
+
+.output-box .partial {
+  opacity: 0.7;
+}
+
+.output-box .final {
+  color: #79e89a;
+  border-left: 3px solid #4ade80;
+  padding-left: 8px;
+  margin-top: 8px;
+  display: block;
+}
+
+.audio-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.audio-controls audio {
+  flex: 1;
+  max-width: 480px;
+}
+
+.btn-download {
+  padding: 8px 14px;
+  background: #2a2f3a;
+  color: #c9d1d9;
+  border-radius: 6px;
+  text-decoration: none;
+  font-size: 13px;
+  border: 1px solid #3a4150;
+}
+
+.btn-download:hover {
+  background: #3a4150;
+  color: #e6e6e6;
+}
+
+.pane-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
+}
+
 @media (min-width: 900px) {
-  main { grid-template-columns: 1fr 1fr; }
+  .pane-grid { grid-template-columns: 1fr 1fr; }
 }
 
 .controls {
@@ -113,6 +291,58 @@ main {
   font-size: 12px;
   color: #8b949e;
   line-height: 1.6;
+}
+
+.file-upload {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px dashed #2a2f3a;
+}
+
+.file-upload label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  color: #c9d1d9;
+  margin-bottom: 8px;
+  cursor: pointer;
+}
+
+#file-input {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: #c9d1d9;
+}
+
+#file-input::file-selector-button {
+  background: #3a4150;
+  color: #e6e6e6;
+  border: none;
+  padding: 6px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  margin-right: 8px;
+}
+
+#file-input::file-selector-button:hover {
+  background: #4a5260;
+}
+
+#btn-upload {
+  background: #1f6f3a;
+  margin: 0;
+}
+
+#btn-upload:hover:not(:disabled) {
+  background: #2da14a;
+}
+
+#btn-upload:disabled {
+  background: #3a4150;
+  color: #8b949e;
+  cursor: not-allowed;
 }
 
 .conversation {
