@@ -21,14 +21,13 @@ voice-app/
     │       ├── service.rs                # VoiceService 实现 webhttp::ServiceCallback
     │       ├── test_api.rs               # 单能力验证 HTTP 接口（/test/*）
     │       └── bin/voice_server.rs       # 启动入口
-    ├── voice-client/                     # Rust 终端 SDK + CLI
+    ├── voice-vad/                        # VAD trait + 能量阈值实现（独立 crate，原 voice-client/vad.rs 抽出）
     │   ├── Cargo.toml
-    │   └── src/
-    │       ├── lib.rs
-    │       ├── callback.rs               # VoiceCallback trait + 默认实现
-    │       └── bin/voice_terminal.rs     # CLI demo（wav 文件推流 + 接收回放）
+    │   └── src/lib.rs
     └── ws-payload-helper/                # （辅助工具）
 ```
+
+> 注：原 `voice-client/`（终端 SDK + CLI demo）已停用——`bin/voice_terminal.rs` 不在 tree 里，无调用方。要恢复 Rust 终端 CLI 时可以重建该 crate。
 
 ## 端到端跑通
 
@@ -64,13 +63,9 @@ with wave.open('test.wav','wb') as w:
 
 ### 3. 跑终端 demo
 
-```bash
-RUST_LOG=info cargo run -p voice-client --bin voice_terminal -- \
-  --url ws://127.0.0.1:8080/ws/voice/cli/demo \
-  --file test.wav
-```
+终端 CLI 已停用（`voice-client` crate 已从 workspace 移除，见项目结构说明）。当前主线是浏览器前端，访问 `http://127.0.0.1:8080` 即可。
 
-打断：在终端 demo 运行时按 `q` + Enter 触发 Interrupt；浏览器前端「打断」按钮 = 同一逻辑（发 WS Interrupt + 清本地 TTS 队列）。浏览器侧的**跨句打断**走自动路径：新问句 ASR `is_final` + 非空文本 → 前端只清本地 TTS 队列 + 停止播放，**不发** WS Interrupt（服务端自有 pipeline cancel 逻辑：非空 ASR → cancel 上一个 LLM/TTS pipeline，见 `session.rs::run_pipeline`）。
+打断：浏览器前端「打断」按钮 = 显式 Interrupt（发 WS Interrupt + 清本地 TTS 队列）。**跨句打断**走自动路径：新问句 ASR `is_final` + 非空文本 → 前端只清本地 TTS 队列 + 停止播放，**不发** WS Interrupt（服务端自有 pipeline cancel 逻辑：非空 ASR → cancel 上一个 LLM/TTS pipeline，见 `session.rs::run_pipeline`）。
 
 ### 4. 观察日志（每个关键节点都有）
 
@@ -184,10 +179,9 @@ curl -sN -X POST http://localhost:8080/test/tts \
 ## 已知 bug 与改进点
 
 1. **空句 TTS**：当 LLM delta 末尾出现孤立标点（如 "。"）会触发空字符串 TTS 请求——生产里应该跳过 text.trim().is_empty()
-2. **VAD 简化**：终端 CLI 用 wav 文件整段作为 is_last=true，没有真正做能量/静音 VAD
-3. **麦克风采集**：`push_from_mic` 当前是 stub，需要接 cpal 实时流
-4. **Opus 编码**：当前直接传 PCM s16le，要上生产应该前端 Opus 编码
-5. **音频重采样**：wav 假设已经是 16kHz mono，实际终端可能有 44.1kHz / 立体声，需要重采样
+2. **VAD 在浏览器侧**：浏览器前端用的是简化能量 VAD（`vadCountdown` 帧计数），不是 `voice-vad::EnergyVad`。完整能量阈值实现见 `crates/voice-vad/`，待接入
+3. **Opus 编码**：当前直接传 PCM s16le，要上生产应该前端 Opus 编码
+4. **音频重采样**：wav 假设已经是 16kHz mono，实际终端可能有 44.1kHz / 立体声，需要重采样
 
 ## 关键依赖
 
@@ -199,5 +193,3 @@ curl -sN -X POST http://localhost:8080/test/tts \
 | tokio + tokio-util | async runtime + CancellationToken |
 | reqwest | HTTP client（连 ASR/LLM/TTS 真实服务） |
 | tracing | 日志 |
-| clap | CLI 参数解析 |
-| hound | wav 文件读取 |

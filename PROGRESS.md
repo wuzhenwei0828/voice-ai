@@ -22,9 +22,9 @@ Phase 4 生产化 ░░░░░░░░░░░░░░░░░░░░  
 
 **下一步优先级**（按依赖关系）：
 1. **TTS 存盘验证**（Phase 2 第 6 项，1 小时）：客户端把 TTS bytes 写 wav 文件，肉眼/播放器验证音质
-2. **客户端 VAD 接线**（Phase 3 第 8 项收尾）：能量阈值 MVP 已实现（`voice-client/src/vad.rs::EnergyVad`，8 个单测）；剩接入采集端（voice_terminal / cpal 麦克风），Silero 作后续增强
-3. **麦克风实时采集**（Phase 3 配套，半天）：cpal 接音频输入
-4. **TTS 真实播放**（Phase 2 第 7 项，半天）：cpal 接音频输出
+2. **客户端 VAD 接线**（Phase 3 第 8 项收尾）：能量阈值 MVP 已实现（`voice-vad/src/lib.rs::EnergyVad`，8 个单测）；待接入（暂无 Rust 客户端），浏览器侧用简化版本
+3. **麦克风实时采集**（Phase 3 配套，半天）：浏览器侧已 OK；Rust 侧待 voice_terminal 复活后再接 cpal
+4. **TTS 真实播放**（Phase 2 第 7 项，半天）：浏览器侧已 OK（`<audio>` + blob URL 队列）
 5. **限流**（Phase 4 第 12 项，1 天）：每会话 max 1 路 in-flight
 6. **监控埋点**（Phase 4 第 14 项，1 天）：Prometheus 指标（首字延迟、TTS 成功率、ASR 准确率）
 
@@ -48,11 +48,8 @@ voice-app/
 │   │   │   ├── service.rs               VoiceService: webhttp::ServiceCallback 实现
 │   │   │   ├── test_api.rs              单能力验证 HTTP 接口（/test/*）
 │   │   │   └── bin/voice_server.rs      启动入口
-│   ├── voice-client/                    终端 SDK
-│   │   ├── src/
-│   │   │   ├── lib.rs                   VoiceClient 封装 webclient
-│   │   │   ├── callback.rs              VoiceCallback trait + 默认实现
-│   │   │   └── bin/voice_terminal.rs    CLI demo
+│   ├── voice-vad/                       VAD trait + 能量阈值实现（原 voice-client/vad.rs 抽出）
+│   │   └── src/lib.rs                   VoiceActivityDetector + EnergyVad + 8 单测
 │   └── ws-payload-helper/               辅助工具
 ├── configs/                             默认 YAML 配置
 │   ├── voice-voice_server.yaml          生产配置（指向 siliconflow 等真实服务）
@@ -67,9 +64,9 @@ voice-app/
 | 步骤 | 状态 | 文件 | 备注 |
 |------|------|------|------|
 | 1. VoicePayload 协议 | ✅ | `voice-proto/src/lib.rs` | `enum VoicePayload`，2 个单测 |
-| 2. wav 流式上传 | ✅ | `voice_terminal.rs::push_from_wav` | 20ms 一帧，模拟采集节奏 |
+| 2. wav 流式上传 | ✅（CLI 已停用） | 历史上 `voice_terminal.rs::push_from_wav` | 20ms 一帧，模拟采集节奏；当前由浏览器前端 AudioWorklet 采集替代 |
 | 3. ASR HTTP 客户端 + 文本流 | ✅ | `clients.rs::HttpAsrClient` | POST /recognize，NDJSON 流 |
-| 4. 客户端打印 ASR | ✅ | `voice_client/src/callback.rs` | `DefaultVoiceCallback.on_payload` |
+| 4. 客户端打印 ASR | ✅（CLI 已停用） | 历史上 `voice_client/src/callback.rs` | `DefaultVoiceCallback.on_payload`；浏览器侧由 `app.js` 替代 |
 
 ---
 
@@ -78,8 +75,8 @@ voice-app/
 | 步骤 | 状态 | 文件 | 备注 |
 |------|------|------|------|
 | 5. LLM 流式接入 | ✅ | `clients.rs::HttpLlmClient` | POST /chat/completions，NDJSON 流 |
-| **6. TTS 流式 + 存盘验证** | ❌ | `voice_terminal.rs` 待改 | 客户端收 TtsAudio 后**写 wav 文件**（不只是缓存到 Vec） |
-| 7. 终端 TTS 本地播放 | ❌ | `voice_terminal.rs::push_from_mic` 旁边加 `play_audio` | cpal 接 default output stream |
+| **6. TTS 流式 + 存盘验证** | ❌ | （无 Rust 客户端） | 当前浏览器前端「TTS」tab 已能下载 WAV 验证音质；CLI 路径随 voice-client 移除而停用 |
+| 7. 终端 TTS 本地播放 | ✅（前端） | `crates/voice-server/static/app.js` `playTtsAudio` | 浏览器 `<audio>` + blob URL 队列；CLI 端随 voice-client 移除而停用 |
 
 ---
 
@@ -87,8 +84,8 @@ voice-app/
 
 | 步骤 | 状态 | 文件 | 备注 |
 |------|------|------|------|
-| 8. 客户端 VAD | ⚠️ | `voice-client/src/vad.rs`（`VoiceActivityDetector` trait + `EnergyVad`） | 能量阈值 MVP 已实现 + 单测；待接入采集端；Silero VAD（ONNX）作后续增强 |
-| 9. 打断机制 | ✅ | 服务端 `session.rs::CancellationToken`（含「新 ASR 拿到非空文本 → 自动 cancel 旧 LLM/TTS pipeline」）+ 客户端 `voice_terminal.rs::Interrupt` | CLI 输入 `q` 触发；浏览器前端「打断」按钮 = 同 WS Interrupt + 清本地 TTS 队列；**跨句自动打断**：ASR `is_final` + 非空文本 → 只清本地 TTS 队列，**不**发 WS Interrupt（由服务端 cancel 链路兜底） |
+| 8. 客户端 VAD | ⚠️ | `voice-vad/src/lib.rs`（`VoiceActivityDetector` trait + `EnergyVad`） | 能量阈值 MVP 已实现 + 8 单测；浏览器侧用简化版（`vadCountdown`）；待 Rust 客户端复活后接入；Silero VAD（ONNX）作后续增强 |
+| 9. 打断机制 | ✅ | 服务端 `session.rs::CancellationToken`（含「新 ASR 拿到非空文本 → 自动 cancel 旧 LLM/TTS pipeline」） | CLI `q` 触发路径随 voice-client 移除而停用；浏览器前端「打断」按钮 = WS Interrupt + 清本地 TTS 队列；**跨句自动打断**：ASR `is_final` + 非空文本 → 只清本地 TTS 队列，**不**发 WS Interrupt（由服务端 cancel 链路兜底） |
 | 10. LLM 按句切分送 TTS | ✅ | `session.rs::next_sentence_end` | 按 `。！？.? !` 切，**中文句号也要切** |
 | 11. ASR partial 实时上屏 | ✅ | 服务端流式 `AsrPartial { is_final: false }` + 客户端 `on_payload` 区分 |
 
@@ -216,18 +213,18 @@ VOICE_<ASR|LLM|TTS>_MODEL             # model
 1. **读本文档**（5 分钟）
 2. **跑一遍启动命令验证环境没坏**：
    ```bash
-   cd /Users/wuzhenwei/Code/github/voice-app/configs
-   ../target/debug/voice_server &
-   ../target/debug/voice_terminal --config voice-voice_terminal.yaml --file /tmp/test.wav
+   cd /Users/wuzhenwei/Code/github/voice-app
+   cargo run --release -p voice-server
+   # 浏览器访问 http://127.0.0.1:8080
    ```
 3. **看 logs/*.log 验证 pipeline 完整跑通**
 4. **从"下一步优先级"挑一项继续**
 
-**如果想推 Phase 2 第 6 项（TTS 存盘）**：在 `voice_terminal.rs` 的 `TtsAudio` 回调里加：
+**Phase 2 第 6 项（TTS 存盘）当前由浏览器侧覆盖**：「TTS」tab 已能下载合成 WAV 文件，肉眼/播放器可验证音质；Rust CLI 路径随 voice-client 移除而停用。
 ```rust
 // 累计够 N 字节或 is_last=true 时写 wav 文件
 let mut file = std::fs::OpenOptions::new()
     .create(true).append(true).open("tts_output.wav")?;
 file.write_all(&pcm_bytes)?;
 ```
-注意：当前 TTS 服务返回的是 s16le 16kHz PCM 字节流（OpenAI-compat wav/pcm 格式），客户端需要手动拼 WAV header（44 字节）才能播放。
+注意：当前 TTS 服务返回的是 s16le 16kHz PCM 字节流（OpenAI-compat wav/pcm 格式），浏览器侧 `window.wrapPcmAsWav`（`static/app.js`）拼 44 字节 WAV header 后用 blob URL 播放。

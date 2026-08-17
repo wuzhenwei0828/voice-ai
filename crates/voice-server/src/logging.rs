@@ -362,7 +362,6 @@ pub fn resolve_web_static_dir(explicit: Option<&str>) -> Option<PathBuf> {
         "./web",
         "./crates/voice-server/static",
         "./target/debug/web",
-        "./crates/voice-client/static",
         "../static",
         "../web",
         "../../crates/voice-server/static",

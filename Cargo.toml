@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/voice-proto",
     "crates/voice-server",
-    "crates/voice-client",
+    "crates/voice-vad",
     "crates/ws-payload-helper",
 ]
 
