@@ -1,0 +1,12 @@
+[package]
+name = "voice-vad"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "VAD（Voice Activity Detection）trait + 能量阈值 MVP 实现；从 voice-client 抽出"
+
+[dependencies]
+
+[lints.rust]
+unused_must_use = "deny"
