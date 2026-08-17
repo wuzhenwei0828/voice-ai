@@ -93,13 +93,9 @@ async fn main() -> anyhow::Result<()> {
     init_logging(&cfg.log)?;
 
     // 4. 打印最终生效的配置
-    let provider_kind = cfg.provider.as_ref()
-        .and_then(|p| p.kind)
-        .unwrap_or_default();
     info!(
         target: "voice_server",
         config_file = %cfg_path.display(),
-        provider_kind = ?provider_kind,
         server_port = cfg.server.port,
         worker_num = cfg.server.worker_num,
         log_level = %cfg.log.level,
@@ -115,7 +111,10 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // 5. 构造客户端
-    let (asr, llm, tts) = voice_server::build_all_for_kind(&cfg)?;
+    let provider_cfg = cfg.provider.as_ref();
+    let asr = voice_server::build_asr_client(&cfg.asr, provider_cfg)?;
+    let llm = voice_server::build_llm_client(&cfg.llm, provider_cfg)?;
+    let tts = voice_server::build_tts_client(&cfg.tts, provider_cfg)?;
 
     let static_dir =
         resolve_web_static_dir(cli.web_static_dir.as_deref()).unwrap_or_else(|| std::path::PathBuf::from("./static"));

@@ -4,7 +4,6 @@ members = [
     "crates/voice-proto",
     "crates/voice-vad",
     "crates/voice_server",
-    "crates/voice-providers",
     "crates/ws_payload_helper",
 ]
 
@@ -15,7 +14,6 @@ authors = ["wuzhenwei"]
 
 [workspace.dependencies]
 voice-proto = { path = "crates/voice-proto" }
-voice-providers = { path = "crates/voice-providers" }
 webproto = "0.1.0"
 webhttp = "0.1.12"
 webclient = "0.1.1"
@@ -40,9 +38,3 @@ tower = "0.5"
 uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
 parking_lot = "0.12"
-
-# voice-providers (Bailian GAX + WS) 依赖
-prost = "0.13"
-prost-build = "0.13"
-async-tungstenite = { version = "0.28", features = ["tokio-rustls-native-certs"] }
-bytes = "1"
