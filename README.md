@@ -269,3 +269,67 @@ pool / codec / wire / session 都不用动。
 - **健康检查增强**：当前仅 lazy + on-error；生产应加心跳（每 30s 发 noop 帧，超时关掉）
 - **限流分 lane**：`pool.max_connections` 当前每 lane 共享；可能需要拆 `asr_max_connections` / `tts_max_connections`
 - **错误分类细化**：`PoolError::Handshake` 应区分 401/403/429 等
+
+---
+
+## 实时流式 ASR（qwen3-asr-flash-realtime）
+
+新增的浏览器实时麦克风识别通道，与上面的 ASR→LLM→TTS 全流程互不干扰：
+
+### 入口
+
+- 页面：`http://127.0.0.1:8080/asr_realtime.html`
+- WebSocket：`ws://127.0.0.1:8080/stream/asr`（与 `/ws/voice/*` 独立的新路由）
+
+### 协议
+
+**上行**（浏览器 → 服务端）：
+| 消息 | 说明 |
+|---|---|
+| text `{"type":"start"}` | 建连 DashScope、发 session.update |
+| binary（raw PCM s16le 16k mono） | 转发给 Realtime 会话（内部按 3200B 切片） |
+| text `{"type":"finish"}` | 发 session.finish，等剩余事件 + `session.finished` |
+| text `{"type":"stop"}` | 放弃当前会话（drop 句柄，连接归还池） |
+
+**下行**（服务端 → 浏览器，JSON text）：
+| type | 含义 |
+|---|---|
+| `started` | 会话建立（含 `session_id`） |
+| `partial` | 增量识别（text+stash 拼接） |
+| `final` | 句终识别（VAD 断句） |
+| `speech_started` / `speech_stopped` | 服务端 VAD 边沿 |
+| `finished` | 会话终态（`session.finished` 或事件流收尾） |
+| `error` | 任何阶段错误（详见 `message`） |
+
+### 配置
+
+```yaml
+# voice-voice_server.yaml —— 可选段（不配则端点注册但 start 会报明确错误）
+asr_stream:
+  model: "qwen3-asr-flash-realtime"     # 或快照版 2026-02-10 / 2025-10-27
+  api_key: "sk-..."                    # 或 env DASHSCOPE_API_KEY / VOICE_ASR_STREAM_API_KEY
+  workspace_id: "llm-xxxxxx"           # 必填（除非显式给 endpoint）—— ASR realtime 专属域名
+  region: "cn-beijing"                 # cn-beijing | ap-southeast-1
+  # endpoint: "wss://..."              # 显式覆盖（缺 ?model= 自动追加）
+```
+
+**端点规则**：业务空间专属域名 `wss://{WorkspaceId}.{region}.maas.aliyuncs.com/api-ws/v1/realtime?model=qwen3-asr-flash-realtime`（与 TTS 的 `dashscope.aliyuncs.com` 不同——见 `docs/qwen-asr-docs/real-asr-code.md`）。
+
+环境变量：`DASHSCOPE_API_KEY`、`VOICE_ASR_STREAM_{API_KEY,MODEL,WORKSPACE_ID,REGION,ENDPOINT}`（env > YAML > 默认）。
+
+### 实现位置
+
+| 文件 | 内容 |
+|---|---|
+| `crates/voice-providers/src/asr/qwen3_realtime.rs` | adapter + RealtimeEvent + make_realtime_dialer（带 OpenAI-Beta 头）+ start_realtime_session |
+| `crates/voice-providers/tests/qwen3_asr_realtime_test.rs` | 集成测试（5 个：无网络多句听写、帧序列、VAD、abandon、error 终止） |
+| `crates/voice_server/src/asr_stream_api.rs` | 配置加载 + 事件映射 + WS handler |
+| `crates/voice_server/static/asr_realtime.html` + `.js` | 实时识别页面（独立页面，零 index.html 改动） |
+
+### 与公共协议 session.rs 的差异
+
+公共协议的 `StreamingAsrSession` 在首个 `is_final=true` 即断流；Realtime 协议的 VAD 断句每句产生一次 final，多句连续听写需要收完所有句子、以 `session.finished` 为终态。`start_realtime_session` 单独实现了多句不间断的事件循环，事件流到 `session.finished` 才结束。
+
+### 验证
+
+无 key/workspace 启动时，点开始会收到明确错误事件（已有单测 + 真实 WS 协议级冒烟）。需要真实 DashScope 联调（Authorization + workspace_id 正确），按 docs 抓包示例对照 event 字段。

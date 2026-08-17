@@ -13,6 +13,7 @@ pub mod logging;
 pub mod service;
 pub mod session;
 pub mod admin_api;
+pub mod asr_stream_api;
 
 pub use client::{
     build_asr_client, build_llm_client, build_tts_client, AsrClient, HttpAsrClient,

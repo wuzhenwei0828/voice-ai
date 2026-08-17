@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/voice-proto",
+    "crates/voice-providers",
     "crates/voice-vad",
     "crates/voice_server",
     "crates/ws_payload_helper",
@@ -14,9 +15,11 @@ authors = ["wuzhenwei"]
 
 [workspace.dependencies]
 voice-proto = { path = "crates/voice-proto" }
+voice-providers = { path = "crates/voice-providers" }
 webproto = "0.1.0"
 webhttp = "0.1.12"
 webclient = "0.1.1"
+async-tungstenite = { version = "0.28", features = ["tokio-runtime", "tokio-rustls-webpki-roots"] }
 
 tokio = { version = "1.33", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -38,3 +41,6 @@ tower = "0.5"
 uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
 parking_lot = "0.12"
+bytes = "1"
+prost = "0.13"
+prost-build = "0.13"

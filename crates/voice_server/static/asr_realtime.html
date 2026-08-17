@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>实时流式 ASR · qwen3-asr-flash-realtime</title>
+<link rel="stylesheet" href="style.css" />
+<style>
+  /* 页面私有样式（复用 style.css 主体，仅少量补充） */
+  .back-link {
+    font-size: 12px;
+    color: #8b949e;
+    text-decoration: none;
+    margin-left: 12px;
+  }
+  .back-link:hover { color: #79b8ff; }
+
+  .vad-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #4a5260;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+  .vad-speaking .vad-dot {
+    background: #4ade80;
+    animation: blink 1s infinite;
+  }
+
+  #partial-line {
+    min-height: 24px;
+    color: #c9d1d9;
+    opacity: 0.75;
+  }
+  #final-list .final { margin-top: 6px; }
+
+  #event-log {
+    font-size: 12px;
+    color: #8b949e;
+    max-height: 160px;
+    overflow-y: auto;
+    line-height: 1.5;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>⚡ 实时流式 ASR <span style="font-size:13px;color:#8b949e;">qwen3-asr-flash-realtime（Realtime API）</span><a class="back-link" href="/">← 返回主页面</a></h1>
+  <div class="status-bar">
+    <span id="ws-status" class="badge badge-offline">WS：未连接</span>
+    <span id="mic-status" class="badge badge-offline">麦克风：关</span>
+    <span id="vad-status" class="badge">服务端 VAD：--</span>
+    <span id="stream-status" class="badge">会话：空闲</span>
+  </div>
+</header>
+
+<main>
+  <section class="test-panel">
+    <h2>🎤 麦克风实时识别</h2>
+    <div class="hint">
+      点「开始识别」后持续收音：音频流式送到服务端 <code>/stream/asr</code>（WebSocket），
+      由 <code>voice-providers</code> 的 Realtime 会话转发给 DashScope，识别结果实时回显。
+      断句由<b>服务端 VAD</b> 完成（静音约 400ms 出句终）；说多句会逐句给出最终结果。
+      「结束」= 发 session.finish 收尾；「放弃」= 直接丢弃当前会话。
+    </div>
+
+    <div class="test-controls">
+      <button id="btn-start">▶ 开始识别</button>
+      <button id="btn-finish" disabled>⏹ 结束</button>
+      <button id="btn-abandon" disabled>✖ 放弃</button>
+      <span id="status-text" class="status-text">空闲</span>
+    </div>
+
+    <div class="test-output">
+      <div class="output-label">转写结果</div>
+      <div id="transcript" class="output-box">
+        <div id="partial-line"><span class="empty-hint">（还没开始说话）</span></div>
+        <div id="final-list"></div>
+      </div>
+    </div>
+
+    <div class="test-output">
+      <div class="output-label">事件日志</div>
+      <div id="event-log" class="output-box"><span class="empty-hint">（无）</span></div>
+    </div>
+  </section>
+</main>
+
+<script src="asr_realtime.js"></script>
+</body>
+</html>

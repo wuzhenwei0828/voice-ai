@@ -1,7 +1,7 @@
 # voice-app 实施进度
 
 > 用于跨会话继续工作时快速恢复上下文。每完成一项 / 改一个决策就在这里追加。
-> **最近更新**：2026-08-17（并发与线程安全 review + 修复 round 1）
+> **最近更新**：2026-08-17（并发与线程安全 review + 修复 round 1 + 新增 qwen3-asr-flash-realtime 流式 ASR 接入）
 
 ---
 
@@ -247,3 +247,14 @@ let mut file = std::fs::OpenOptions::new()
 file.write_all(&pcm_bytes)?;
 ```
 注意：当前 TTS 服务返回的是 s16le 16kHz PCM 字节流（OpenAI-compat wav/pcm 格式），浏览器侧 `window.wrapPcmAsWav`（`static/app.js`）拼 44 字节 WAV header 后用 blob URL 播放。
+
+### 2026-08-17 新增 qwen3-asr-flash-realtime 流式 ASR 接入
+
+- 新增 `crates/voice-providers/src/asr/qwen3_realtime.rs` + 集成测试 5 个：多句不断流（不复用公共协议 session.rs 的首个 final 断流行为）、帧序列切片、VAD 透出、abandon 归还连接、error 终止
+- voice-providers 新接入 workspace；修复原本的 staging 不完整（`async-tungstenite` / `bytes` / `prost[-build]` 未在根 workspace.dependencies 定义）
+- `crates/voice_server/src/asr_stream_api.rs` + `static/asr_realtime.{html,js}`：独立 WS 端点 `/stream/asr`（不影响既有 `/ws/voice/*` pipeline）+ 独立页面（零 index.html 改动）
+- `asr/mod.rs::select_asr_adapter` 增加 3 个 qwen3-asr 分支（稳定 + 2 快照版本）；其它既有 arm 不动
+- ASR realtime 端点用业务空间专属域名 `{WorkspaceId}.cn-beijing.maas.aliyuncs.com`（不是 TTS 的 `dashscope.aliyuncs.com`）—— 端点解析放新文件里，不动 provider.rs
+- 全 workspace 测试 162 / 0 失败；既有页面/接口冒烟全 200/400 语义不变
+- 全部「不改动已有功能」：diff 审计通过，已有文件只新增 pub mod / match arm / route / 依赖行
+- 真实 DashScope 联调待拿 API key + workspace_id 验证（与项目现状一致，voice-providers 一直未做真实联调）

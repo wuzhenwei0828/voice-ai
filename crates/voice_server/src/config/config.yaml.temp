@@ -35,3 +35,13 @@ tts:
   response_format: "pcm"
   stream: true
 
+# 实时流式 ASR（qwen3-asr-flash-realtime，Realtime API）—— /stream/asr WS 端点 + /asr_realtime.html 页面
+# 可选段：不配置时端点仍在，但 start 会返回明确配置错误
+# 环境变量等价覆盖：DASHSCOPE_API_KEY / VOICE_ASR_STREAM_{API_KEY,MODEL,WORKSPACE_ID,REGION,ENDPOINT}
+asr_stream:
+  model: "qwen3-asr-flash-realtime"
+  api_key: "sk-*******"                       # DashScope API key
+  workspace_id: "llm-xxxxxx"                  # 业务空间 ID（ASR realtime 专属域名必需，除非给 endpoint）
+  region: "cn-beijing"                        # cn-beijing | ap-southeast-1
+  # endpoint: "wss://自定义域名/api-ws/v1/realtime"   # 显式覆盖（缺 ?model= 自动追加）
+

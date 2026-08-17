@@ -125,6 +125,12 @@ impl ServiceCallback for VoiceService {
                         .route("/tts", web::post().to(crate::admin_api::tts))
                         .route("/llm_tts", web::post().to(crate::admin_api::llm_tts))
                         .route("/asr_llm_tts", web::post().to(crate::admin_api::asr_llm_tts))
+                )
+                // 实时流式 ASR（qwen3-asr-flash-realtime）独立 WS 端点，
+                // 与 /ws/voice/* 的 VoicePayload pipeline 互不影响；必须先于 Files 注册
+                .service(
+                    web::scope("/stream")
+                        .route("/asr", web::to(crate::asr_stream_api::ws_asr_stream))
                 );
 
         if let Some(path) = &self.web_static_dir {
