@@ -6,3 +6,4 @@
 **/*.raw
 .DS_Store
 **/*.yaml
+**/voice-server/src/config/
