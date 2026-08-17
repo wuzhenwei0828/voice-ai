@@ -1,7 +1,7 @@
 # voice-app 实施进度
 
 > 用于跨会话继续工作时快速恢复上下文。每完成一项 / 改一个决策就在这里追加。
-> **最近更新**：2026-08-13
+> **最近更新**：2026-08-17
 
 ---
 
@@ -12,7 +12,7 @@
 ```
 Phase 1 MVP ████████████████████ 100% (4/4)   ✅ 完成
 Phase 2 半双工 ██████████████░░░░░░  66% (2/3)  ⚠️ 还差 TTS 存盘
-Phase 3 全双工 ████████████░░░░░░░░  75% (3/4)  ⚠️ 还差客户端 VAD
+Phase 3 全双工 ████████████░░░░░░░░  75% (3/4)  ⚠️ 客户端 VAD：能量 MVP 已就绪，待接采集端
 Phase 4 生产化 ░░░░░░░░░░░░░░░░░░░░   0% (0/4)  ❌ 未开始
 ```
 
@@ -22,7 +22,7 @@ Phase 4 生产化 ░░░░░░░░░░░░░░░░░░░░  
 
 **下一步优先级**（按依赖关系）：
 1. **TTS 存盘验证**（Phase 2 第 6 项，1 小时）：客户端把 TTS bytes 写 wav 文件，肉眼/播放器验证音质
-2. **客户端 VAD**（Phase 3 第 8 项，半天）：接 Silero VAD，自动切句
+2. **客户端 VAD 接线**（Phase 3 第 8 项收尾）：能量阈值 MVP 已实现（`voice-client/src/vad.rs::EnergyVad`，8 个单测）；剩接入采集端（voice_terminal / cpal 麦克风），Silero 作后续增强
 3. **麦克风实时采集**（Phase 3 配套，半天）：cpal 接音频输入
 4. **TTS 真实播放**（Phase 2 第 7 项，半天）：cpal 接音频输出
 5. **限流**（Phase 4 第 12 项，1 天）：每会话 max 1 路 in-flight
@@ -46,20 +46,16 @@ voice-app/
 │   │   │   ├── clients.rs               AsrClient/LlmClient/TtsClient trait + HTTP impl
 │   │   │   ├── session.rs               VoiceSession 状态机 + pipeline + CancellationToken
 │   │   │   ├── service.rs               VoiceService: webhttp::ServiceCallback 实现
+│   │   │   ├── test_api.rs              单能力验证 HTTP 接口（/test/*）
 │   │   │   └── bin/voice_server.rs      启动入口
 │   ├── voice-client/                    终端 SDK
 │   │   ├── src/
 │   │   │   ├── lib.rs                   VoiceClient 封装 webclient
 │   │   │   ├── callback.rs              VoiceCallback trait + 默认实现
 │   │   │   └── bin/voice_terminal.rs    CLI demo
-│   ├── mock-asr/                        mock ASR 服务
-│   ├── mock-llm/                        mock LLM 服务
-│   └── mock-tts/                        mock TTS 服务
+│   └── ws-payload-helper/               辅助工具
 ├── configs/                             默认 YAML 配置
-│   ├── voice-mock-asr.yaml
-│   ├── voice-mock-llm.yaml
-│   ├── voice-mock-tts.yaml
-│   ├── voice-voice_server.yaml
+│   ├── voice-voice_server.yaml          生产配置（指向 siliconflow 等真实服务）
 │   └── voice-voice_terminal.yaml
 └── logs/                                启动后自动生成 *.log
 ```
@@ -72,7 +68,7 @@ voice-app/
 |------|------|------|------|
 | 1. VoicePayload 协议 | ✅ | `voice-proto/src/lib.rs` | `enum VoicePayload`，2 个单测 |
 | 2. wav 流式上传 | ✅ | `voice_terminal.rs::push_from_wav` | 20ms 一帧，模拟采集节奏 |
-| 3. ASR mock + 文本 echo | ✅ | `mock-asr/src/main.rs` + `clients.rs::HttpAsrClient` | POST /recognize，NDJSON 流 |
+| 3. ASR HTTP 客户端 + 文本流 | ✅ | `clients.rs::HttpAsrClient` | POST /recognize，NDJSON 流 |
 | 4. 客户端打印 ASR | ✅ | `voice_client/src/callback.rs` | `DefaultVoiceCallback.on_payload` |
 
 ---
@@ -81,7 +77,7 @@ voice-app/
 
 | 步骤 | 状态 | 文件 | 备注 |
 |------|------|------|------|
-| 5. LLM 流式接入 | ✅ | `mock-llm/src/main.rs` + `clients.rs::HttpLlmClient` | POST /chat，NDJSON 流，固定模板 |
+| 5. LLM 流式接入 | ✅ | `clients.rs::HttpLlmClient` | POST /chat/completions，NDJSON 流 |
 | **6. TTS 流式 + 存盘验证** | ❌ | `voice_terminal.rs` 待改 | 客户端收 TtsAudio 后**写 wav 文件**（不只是缓存到 Vec） |
 | 7. 终端 TTS 本地播放 | ❌ | `voice_terminal.rs::push_from_mic` 旁边加 `play_audio` | cpal 接 default output stream |
 
@@ -91,7 +87,7 @@ voice-app/
 
 | 步骤 | 状态 | 文件 | 备注 |
 |------|------|------|------|
-| 8. 客户端 VAD | ❌ | `voice_terminal.rs` 待加 `VoiceActivityDetector` | 推荐 Silero VAD（ONNX）；能量阈值法可作 MVP |
+| 8. 客户端 VAD | ⚠️ | `voice-client/src/vad.rs`（`VoiceActivityDetector` trait + `EnergyVad`） | 能量阈值 MVP 已实现 + 单测；待接入采集端；Silero VAD（ONNX）作后续增强 |
 | 9. 打断机制 | ✅ | 服务端 `session.rs::CancellationToken` + 客户端 `voice_terminal.rs::Interrupt` | CLI 输入 `q` 触发 |
 | 10. LLM 按句切分送 TTS | ✅ | `session.rs::next_sentence_end` | 按 `。！？.? !` 切，**中文句号也要切** |
 | 11. ASR partial 实时上屏 | ✅ | 服务端流式 `AsrPartial { is_final: false }` + 客户端 `on_payload` 区分 |
@@ -165,12 +161,15 @@ VOICE_<ASR|LLM|TTS>_MODEL             # model
 - **VoiceSession 简化状态机**：Idle/Listening/Processing/Speaking；并发允许 Listening + 后台 pipeline
 - **CancellationToken 打断**：任何阶段被 Interrupt 即停；下一段 LLM 不再生成即可
 - **Sentence splitter 用 `next_sentence_end` 函数**：遍历 char_indices 找标点，返回标点**之后**的字节索引（避免 `drain` 切 UTF-8 中间字节）
+- **Pipeline 并发：打断旧的**：新一条 `AudioChunk{is_last:true}` 触发时先 cancel 在飞 pipeline 再启新的（不排队、不并发跑）；见 `session.rs` 模块头
+- **句尾判定：客户端权威 + 服务端兜底**：服务端不做 VAD，但单句时长（`MAX_UTTERANCE_MS`=30s）/ 缓冲字节（`MAX_AUDIO_BYTES`=2MB）超限时强制触发，防客户端不发 `is_last` 导致音频无限累积
+- **会话终止要真终止**：`SessionEnd` 置 `closed`（此后上行一律忽略）；`VoiceSession::Drop` cancel pipeline token（WsDisconnect 移除 session 时不让 pipeline 白跑完 LLM/TTS）；取消覆盖 ASR 建连阶段（`recognize` 也进 `tokio::select!`）
 - **logs/ 在 cwd 下**：不是相对 binary 路径；启动脚本 cd 到 configs/
 
 ### 客户端
 
 - **复用 webclient 框架**：自动重连、JWT、心跳都现成的
-- **降级方案**：MVP 用 wav 整段做 is_last=true；真实 VAD 待 Phase 3 接入
+- **降级方案**：wav 整段做 is_last=true；实时切句用 `vad::EnergyVad`（能量阈值 MVP），Silero 待评估
 
 ### 错误修复历史
 
@@ -189,7 +188,7 @@ VOICE_<ASR|LLM|TTS>_MODEL             # model
 1. **空字符串 TTS**：LLM delta 末尾孤立标点（如 "。"）触发 `text="。"` 的 TTS 请求 → 生产里应 `if text.trim().is_empty() { continue; }`
 2. **VoiceSession 的 DashMap 持有**：当前 `on_payload` 是同步的，但每个 session 只处理一条消息就丢（Spawn 出 Actor 之后 session 就没被持久持有）。需要改成 session 在 DashMap 里跨消息调用 `on_payload` —— 影响多轮上下文。
 3. **log guard leak**：`voice-config::init_logging` 里 `Box::leak` 了 writer guard（避免 stdout guard 提前 drop）；无害但不优雅
-4. **mock 服务 graceful shutdown**：Ctrl-C 时正在处理的请求会被砍掉；生产里要等 in-flight 结束
+4. **服务端 graceful shutdown**：Ctrl-C 时正在处理的请求会被砍掉；生产里要等 in-flight 结束
 
 ### 性能
 
@@ -199,8 +198,8 @@ VOICE_<ASR|LLM|TTS>_MODEL             # model
 ### 测试
 
 - 缺单元测试：除了 voice-proto 的 2 个测试，session/clients/service 都没测
-- 缺集成测试：没有跑完整 wav → mock-asr → mock-llm → mock-tts → 字节数校验的自动化
-- mock 服务没有 CI 自检
+- 缺集成测试：没有跑完整 wav → asr → llm → tts → 字节数校验的自动化
+- ASR/LLM/TTS 服务集成测试没有 CI 自检
 
 ### 文档
 
@@ -217,9 +216,6 @@ VOICE_<ASR|LLM|TTS>_MODEL             # model
 2. **跑一遍启动命令验证环境没坏**：
    ```bash
    cd /Users/wuzhenwei/Code/github/voice-app/configs
-   ../target/debug/mock-asr &
-   ../target/debug/mock-llm &
-   ../target/debug/mock-tts &
    ../target/debug/voice_server &
    ../target/debug/voice_terminal --config voice-voice_terminal.yaml --file /tmp/test.wav
    ```
@@ -233,4 +229,4 @@ let mut file = std::fs::OpenOptions::new()
     .create(true).append(true).open("tts_output.wav")?;
 file.write_all(&pcm_bytes)?;
 ```
-注意：当前 mock-tts 生成的是 s16le 16kHz 正弦波 PCM，wav header 需要手动加（44 字节）。
+注意：当前 TTS 服务返回的是 s16le 16kHz PCM 字节流（OpenAI-compat wav/pcm 格式），客户端需要手动拼 WAV header（44 字节）才能播放。

@@ -8,6 +8,7 @@
 //! CLI demo 见 bin/voice_terminal.rs
 
 pub mod callback;
+pub mod vad;
 
 use std::sync::Arc;
 
@@ -17,6 +18,7 @@ use voice_proto::{encode_indication, VoicePayload};
 use webclient::{ws::wsclient::WsClient, ClientCallback, DataEntity};
 
 pub use callback::{DefaultVoiceCallback, VoiceCallback};
+pub use vad::{EnergyVad, EnergyVadConfig, VadEvent, VoiceActivityDetector};
 
 /// VoiceClient：包装 webclient::WsClient
 #[derive(Clone)]
@@ -65,18 +67,23 @@ impl VoiceClient {
     }
 
     pub async fn start_session(&self) -> anyhow::Result<()> {
+        let sample_rate = 16000u32;
+        let channels = 1u8;
+        let codec = "pcm_s16le";
+        let language = "zh-CN";
         let p = VoicePayload::SessionStart {
             session_id: self.session_id.clone(),
-            sample_rate: 16000,
-            channels: 1,
-            codec: "pcm_s16le".into(),
-            language: "zh-CN".into(),
+            sample_rate,
+            channels,
+            codec: codec.into(),
+            language: language.into(),
         };
         let bytes = encode_indication(&p)?;
         self.ws
             .send_binary(bytes)
             .map_err(|e| anyhow::anyhow!("send_binary failed: {:?}", e))?;
-        info!(target: "voice_client", session_id = %self.session_id, "发送 SessionStart");
+        // 与服务端"收到 SessionStart"日志逐字段对齐，便于两端对比
+        info!(target: "voice_client", session_id = %self.session_id, sample_rate, channels, codec, language, "发送 SessionStart");
         Ok(())
     }
 
@@ -87,6 +94,7 @@ impl VoiceClient {
         data: Vec<u8>,
         is_last: bool,
     ) -> anyhow::Result<()> {
+        let bytes_len = data.len();
         let p = VoicePayload::AudioChunk {
             session_id: self.session_id.clone(),
             seq,
@@ -98,7 +106,8 @@ impl VoiceClient {
         self.ws
             .send_binary(bytes)
             .map_err(|e| anyhow::anyhow!("send_binary failed: {:?}", e))?;
-        debug!(target: "voice_client", session_id = %self.session_id, seq, is_last, "发送 AudioChunk");
+        // 与服务端"收到 AudioChunk"日志逐字段对齐，便于两端对比
+        info!(target: "voice_client", session_id = %self.session_id, seq, bytes = bytes_len, timestamp_ms, is_last, "发送 AudioChunk");
         Ok(())
     }
 
