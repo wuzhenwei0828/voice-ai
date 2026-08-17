@@ -1,11 +1,11 @@
 //! 单能力验证 HTTP 接口
 //!
 //! 5 个独立 REST endpoint，方便 curl / Postman / 前端 tab 单点验证：
-//!   POST /test/asr         raw PCM body → NDJSON {text, is_final}
-//!   POST /test/llm         JSON {prompt}  → NDJSON {delta, is_final}
-//!   POST /test/tts         JSON {text}    → NDJSON {seq, audio(base64), is_last}
-//!   POST /test/llm_tts     JSON {text}    → NDJSON {seq, audio(base64), is_last}（复用切句逻辑）
-//!   POST /test/asr_llm_tts raw PCM body   → NDJSON 分阶段事件（前端按 stage 分发）：
+//!   POST /admin/asr         raw PCM body → NDJSON {text, is_final}
+//!   POST /admin/llm         JSON {prompt}  → NDJSON {delta, is_final}
+//!   POST /admin/tts         JSON {text}    → NDJSON {seq, audio(base64), is_last}
+//!   POST /admin/llm_tts     JSON {text}    → NDJSON {seq, audio(base64), is_last}（复用切句逻辑）
+//!   POST /admin/asr_llm_tts raw PCM body   → NDJSON 分阶段事件（前端按 stage 分发）：
 //!       {"stage":"asr","text":..,"is_final":..}
 //!       {"stage":"llm","delta":..,"is_final":..}
 //!       {"stage":"tts","seq":..,"audio":base64,"is_last":..}（末尾补 audio 空、is_last:true 结束标记）
@@ -13,7 +13,7 @@
 //! 设计要点：
 //!   - 复用现有 AsrClient / LlmClient / TtsClient trait，不重新实现
 //!   - 切句复用 session::next_sentence_end（已从 fn 提升为 pub）
-//!   - LLM→TTS 管线抽成 llm_tts_items()，/test/llm_tts、/test/asr_llm_tts 与
+//!   - LLM→TTS 管线抽成 llm_tts_items()，/admin/llm_tts、/admin/asr_llm_tts 与
 //!     session.rs 的 WS pipeline 共用（句间 crossfade / 全局 seq / 结束标记）
 //!   - 流中途出错：插一行 {error, code} 然后断流（HTTP 200 已发，不能改 status）
 //!     错误码约定：1001 asr / 1002 llm 调用 / 1003 llm 流 / 1004 tts 调用 / 1005 tts 流
@@ -27,7 +27,7 @@ use std::fmt::Display;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
-use crate::client::{ArcAsr, ArcLlm, ArcTts, ClientError};
+use crate::client::{asr::wrap_pcm_as_wav, ArcAsr, ArcLlm, ArcTts, ClientError};
 use crate::session::{next_sentence_end, AsrEvent, LlmEvent};
 
 // ====== 请求 / 响应结构 ======
@@ -72,7 +72,7 @@ pub struct ErrorLine {
     pub code: u16,
 }
 
-// ====== /test/asr_llm_tts 分阶段事件行 ======
+// ====== /admin/asr_llm_tts 分阶段事件行 ======
 // 用扁平的 stage 字段（而非 serde tag），前端按 evt.stage 分发即可
 
 #[derive(Debug, Serialize)]
@@ -103,7 +103,7 @@ struct StageTtsLine {
 /// （NDJSON 行 / WS VoicePayload）。`Failed` 是终端事件（产出后流即结束）。
 /// pub：session.rs 的 WS pipeline 也要消费。
 pub enum LlmTtsItem {
-    /// LLM 文本 delta（/test/llm_tts 不透出，/test/asr_llm_tts 与 WS 侧透出）
+    /// LLM 文本 delta（/admin/llm_tts 不透出，/admin/asr_llm_tts 与 WS 侧透出）
     Llm { delta: String, is_final: bool },
     /// TTS 音频 chunk（audio 为 base64）；最后一条 audio 为空、is_last=true，是结束标记
     Tts { seq: u32, audio: String, is_last: bool },
@@ -133,33 +133,6 @@ fn find_wav_data(bytes: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
-/// 把裸 PCM 字节流包成 44 字节 WAV 头 + PCM（s16le 16kHz mono）。
-fn wrap_pcm_as_wav(pcm: &[u8]) -> Vec<u8> {
-    const SAMPLE_RATE: u32 = 16000;
-    const CHANNELS: u16 = 1;
-    const BITS: u16 = 16;
-    const BYTE_RATE: u32 = SAMPLE_RATE * CHANNELS as u32 * BITS as u32 / 8;
-    const BLOCK_ALIGN: u16 = CHANNELS * BITS / 8;
-
-    let data_len = pcm.len() as u32;
-    let mut out = Vec::with_capacity(44 + pcm.len());
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&(36 + data_len).to_le_bytes());
-    out.extend_from_slice(b"WAVE");
-    out.extend_from_slice(b"fmt ");
-    out.extend_from_slice(&16u32.to_le_bytes());
-    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    out.extend_from_slice(&CHANNELS.to_le_bytes());
-    out.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
-    out.extend_from_slice(&BYTE_RATE.to_le_bytes());
-    out.extend_from_slice(&BLOCK_ALIGN.to_le_bytes());
-    out.extend_from_slice(&BITS.to_le_bytes());
-    out.extend_from_slice(b"data");
-    out.extend_from_slice(&data_len.to_le_bytes());
-    out.extend_from_slice(pcm);
-    out
-}
-
 /// 把上传音频统一转成"16kHz mono s16le WAV 字节流"给 ASR。
 /// - 如果上传的就是 WAV：找 data chunk 取出 PCM（要求原文件已是 16kHz mono s16le）
 /// - 否则：按裸 PCM 处理（前端约定 16kHz mono s16le）
@@ -171,7 +144,7 @@ fn prepare_audio_for_asr(bytes: Vec<u8>) -> Option<Vec<u8>> {
         &bytes[..]
     };
     if pcm.is_empty() { return None; }
-    Some(wrap_pcm_as_wav(pcm))
+    Some(wrap_pcm_as_wav(pcm, 16000, 1))
 }
 
 // ====== NDJSON 流序列化 helper ======
@@ -339,7 +312,7 @@ fn gen_sid(prefix: &str) -> String {
 
 // ====== Handlers ======
 
-/// POST /test/asr
+/// POST /admin/asr
 /// body: 整段音频字节（前端直接转发，服务端统一包成 16kHz mono s16le WAV 喂给 ASR）
 ///   - 输入是 WAV：自动 strip header，取 data chunk 的 PCM 包回标准 WAV 头
 ///   - 输入是裸 PCM（约定 s16le 16kHz mono）：直接包 WAV 头
@@ -350,7 +323,7 @@ pub async fn asr(
 ) -> Result<HttpResponse, actix_web::Error> {
     let sid = gen_sid("asr");
     let bytes_len = body.len();
-    info!(target: "voice_server.test_api", endpoint = "asr", session_id = %sid, bytes = bytes_len, "/test/asr 收到请求");
+    info!(target: "voice_server.admin_api", endpoint = "asr", session_id = %sid, bytes = bytes_len, "/admin/asr 收到请求");
 
     let prepared = match prepare_audio_for_asr(body.to_vec()) {
         Some(b) => b,
@@ -377,7 +350,7 @@ pub async fn asr(
         .streaming(ndjson_stream::<AsrLine, ClientError, _>(line_stream)))
 }
 
-/// POST /test/llm
+/// POST /admin/llm
 /// body: `{"prompt":"...","session_id":"可选"}`
 /// response: NDJSON `{"delta":"...","is_final":false|true}`
 pub async fn llm(
@@ -385,7 +358,7 @@ pub async fn llm(
     llm: Data<ArcLlm>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let sid = req.session_id.clone().unwrap_or_else(|| gen_sid("llm"));
-    info!(target: "voice_server.test_api", endpoint = "llm", session_id = %sid, prompt_len = req.prompt.chars().count(), "/test/llm 收到请求");
+    info!(target: "voice_server.admin_api", endpoint = "llm", session_id = %sid, prompt_len = req.prompt.chars().count(), "/admin/llm 收到请求");
 
     let stream = llm
         .chat(&sid, &req.prompt)
@@ -402,7 +375,7 @@ pub async fn llm(
         .streaming(ndjson_stream::<LlmLine, ClientError, _>(line_stream)))
 }
 
-/// POST /test/tts
+/// POST /admin/tts
 /// body: `{"text":"...","session_id":"可选"}`
 /// 内部：用 next_sentence_end 按句子切分，逐句调 tts.synthesize，
 ///       句间过 crossfade 消除波形拼接尖刺。
@@ -413,7 +386,7 @@ pub async fn tts(
     tts: Data<ArcTts>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let sid = req.session_id.clone().unwrap_or_else(|| gen_sid("tts"));
-    info!(target: "voice_server.test_api", endpoint = "tts", session_id = %sid, text_len = req.text.chars().count(), "/test/tts 收到请求");
+    info!(target: "voice_server.admin_api", endpoint = "tts", session_id = %sid, text_len = req.text.chars().count(), "/admin/tts 收到请求");
 
     let text = req.text.clone();
     let sid_inner = sid.clone();
@@ -439,12 +412,12 @@ fn build_tts_sentence_stream(
         while let Some(end) = next_sentence_end(&buf) {
             let sent: String = buf[..end].to_string();
             buf = buf[end..].to_string();
-            info!(target: "voice_server.test_api", endpoint = "tts", session_id = %sid, sentence = %sent, "切出句子送 TTS");
+            info!(target: "voice_server.admin_api", endpoint = "tts", session_id = %sid, sentence = %sent, "切出句子送 TTS");
 
             let mut stream = match tts.synthesize(&sid, &sent).await {
                 Ok(s) => s,
                 Err(e) => {
-                    warn!(target: "voice_server.test_api", endpoint = "tts", session_id = %sid, "TTS 调用失败: {}", e);
+                    warn!(target: "voice_server.admin_api", endpoint = "tts", session_id = %sid, "TTS 调用失败: {}", e);
                     let err_line = ErrorLine { error: format!("tts error: {}", e), code: 1102 };
                     let mut line = serde_json::to_vec(&err_line)
                         .map_err(|e2| actix_web::error::ErrorInternalServerError(e2.to_string()))?;
@@ -459,7 +432,7 @@ fn build_tts_sentence_stream(
                 let e = match item {
                     Ok(e) => e,
                     Err(e) => {
-                        warn!(target: "voice_server.test_api", endpoint = "tts", session_id = %sid, "TTS 流错误: {}", e);
+                        warn!(target: "voice_server.admin_api", endpoint = "tts", session_id = %sid, "TTS 流错误: {}", e);
                         let err_line = ErrorLine { error: format!("tts stream: {}", e), code: 1103 };
                         let mut line = serde_json::to_vec(&err_line)
                             .map_err(|e2| actix_web::error::ErrorInternalServerError(e2.to_string()))?;
@@ -485,7 +458,7 @@ fn build_tts_sentence_stream(
         // 阶段 2：残余（末尾没有句末标点的部分）送一次 TTS
         let tail = buf.trim().to_string();
         if !tail.is_empty() {
-            info!(target: "voice_server.test_api", endpoint = "tts", session_id = %sid, sentence = %tail, "TTS 末尾残余句子送 TTS");
+            info!(target: "voice_server.admin_api", endpoint = "tts", session_id = %sid, sentence = %tail, "TTS 末尾残余句子送 TTS");
             if let Ok(mut stream) = tts.synthesize(&sid, &tail).await {
                 fader.begin_sentence();
                 while let Some(item) = stream.next().await {
@@ -523,23 +496,23 @@ fn build_tts_sentence_stream(
         json.push(b'\n');
         yield Bytes::from(json);
 
-        debug!(target: "voice_server.test_api", endpoint = "tts", session_id = %sid, "/test/tts 全部完成");
+        debug!(target: "voice_server.admin_api", endpoint = "tts", session_id = %sid, "/admin/tts 全部完成");
     }
 }
 
-/// POST /test/llm_tts
+/// POST /admin/llm_tts
 /// body: `{"text":"...","session_id":"可选"}`
 /// 内部：LLM 流式 → 切句 → 逐句 TTS 流式 → 拼接成统一 seq
 /// response: NDJSON `{"seq":N,"audio":"<base64>","is_last":false|true}`
 ///           最后补一条 `{"seq":N+1,"audio":"","is_last":true}` 作为结束标记
-/// （LLM 文本 delta 不透出、服务端日志可见；/test/asr_llm_tts 会透出）
+/// （LLM 文本 delta 不透出、服务端日志可见；/admin/asr_llm_tts 会透出）
 pub async fn llm_tts(
     req: Json<TtsReq>,
     llm: Data<ArcLlm>,
     tts: Data<ArcTts>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let sid = req.session_id.clone().unwrap_or_else(|| gen_sid("llm_tts"));
-    info!(target: "voice_server.test_api", endpoint = "llm_tts", session_id = %sid, text_len = req.text.chars().count(), "/test/llm_tts 收到请求");
+    info!(target: "voice_server.admin_api", endpoint = "llm_tts", session_id = %sid, text_len = req.text.chars().count(), "/admin/llm_tts 收到请求");
 
     let prompt = req.text.clone();
     let sid_inner = sid.clone();
@@ -551,7 +524,7 @@ pub async fn llm_tts(
         .streaming(llm_tts_lines(items)))
 }
 
-/// 把 LlmTtsItem 流映射成 /test/llm_tts 的 wire 格式（Llm 事件不透出）。
+/// 把 LlmTtsItem 流映射成 /admin/llm_tts 的 wire 格式（Llm 事件不透出）。
 /// 抽成独立函数（而不是 let binding）是为了让 try_stream! 的 error type 能从返回类型推断。
 fn llm_tts_lines(
     items: impl Stream<Item = LlmTtsItem> + 'static,
@@ -573,7 +546,7 @@ fn llm_tts_lines(
 }
 
 /// 把 llm + sentence-split + tts 三个阶段串成一条事件流，
-/// 供 /test/llm_tts、/test/asr_llm_tts 与 session.rs 的 WS pipeline 共用
+/// 供 /admin/llm_tts、/admin/asr_llm_tts 与 session.rs 的 WS pipeline 共用
 /// （后两者额外透出 Llm 文本事件）。
 /// 接受 Arc 而非 &Arc 是因为 actix-web 的 streaming() 要求 `Stream + 'static`，Arc 便宜 clone。
 pub fn llm_tts_items(
@@ -587,7 +560,7 @@ pub fn llm_tts_items(
         let mut llm_stream = match llm.chat(&sid, &prompt).await {
             Ok(s) => s,
             Err(e) => {
-                warn!(target: "voice_server.test_api", endpoint = "llm_tts", session_id = %sid, "LLM 调用失败: {}", e);
+                warn!(target: "voice_server.admin_api", endpoint = "llm_tts", session_id = %sid, "LLM 调用失败: {}", e);
                 yield LlmTtsItem::Failed { error: format!("llm error: {}", e), code: 1002 };
                 return;
             }
@@ -617,7 +590,7 @@ pub fn llm_tts_items(
             let evt = match item {
                 Ok(e) => e,
                 Err(e) => {
-                    warn!(target: "voice_server.test_api", endpoint = "llm_tts", session_id = %sid, "LLM 流错误: {}", e);
+                    warn!(target: "voice_server.admin_api", endpoint = "llm_tts", session_id = %sid, "LLM 流错误: {}", e);
                     yield LlmTtsItem::Failed { error: format!("llm stream: {}", e), code: 1003 };
                     return;
                 }
@@ -629,12 +602,12 @@ pub fn llm_tts_items(
             while let Some(end) = next_sentence_end(&sentence_buf) {
                 let sent: String = sentence_buf[..end].to_string();
                 sentence_buf = sentence_buf[end..].to_string();
-                info!(target: "voice_server.test_api", endpoint = "llm_tts", session_id = %sid, sentence = %sent, "切出句子送 TTS");
+                info!(target: "voice_server.admin_api", endpoint = "llm_tts", session_id = %sid, sentence = %sent, "切出句子送 TTS");
 
                 let mut tts_stream = match tts.synthesize(&sid, &sent).await {
                     Ok(s) => s,
                     Err(e) => {
-                        warn!(target: "voice_server.test_api", endpoint = "llm_tts", session_id = %sid, "TTS 调用失败: {}", e);
+                        warn!(target: "voice_server.admin_api", endpoint = "llm_tts", session_id = %sid, "TTS 调用失败: {}", e);
                         yield LlmTtsItem::Failed { error: format!("tts error: {}", e), code: 1004 };
                         return;
                     }
@@ -646,7 +619,7 @@ pub fn llm_tts_items(
                     let t = match tts_item {
                         Ok(t) => t,
                         Err(e) => {
-                            warn!(target: "voice_server.test_api", endpoint = "llm_tts", session_id = %sid, "TTS 流错误: {}", e);
+                            warn!(target: "voice_server.admin_api", endpoint = "llm_tts", session_id = %sid, "TTS 流错误: {}", e);
                             yield LlmTtsItem::Failed { error: format!("tts stream: {}", e), code: 1005 };
                             return;
                         }
@@ -668,7 +641,7 @@ pub fn llm_tts_items(
         // 收尾：剩余 sentence_buf
         let tail = sentence_buf.trim().to_string();
         if !tail.is_empty() {
-            info!(target: "voice_server.test_api", endpoint = "llm_tts", session_id = %sid, sentence = %tail, "LLM 末尾残余句子送 TTS");
+            info!(target: "voice_server.admin_api", endpoint = "llm_tts", session_id = %sid, sentence = %tail, "LLM 末尾残余句子送 TTS");
             if let Ok(mut tts_stream) = tts.synthesize(&sid, &tail).await {
                 fader.begin_sentence();
                 while let Some(tts_item) = tts_stream.next().await {
@@ -690,11 +663,11 @@ pub fn llm_tts_items(
         global_seq += 1;
         yield LlmTtsItem::Tts { seq: global_seq, audio: String::new(), is_last: true };
 
-        debug!(target: "voice_server.test_api", endpoint = "llm_tts", session_id = %sid, "LLM→TTS 管线全部完成");
+        debug!(target: "voice_server.admin_api", endpoint = "llm_tts", session_id = %sid, "LLM→TTS 管线全部完成");
     }
 }
 
-/// POST /test/asr_llm_tts
+/// POST /admin/asr_llm_tts
 /// body: 整段音频字节（前端直接转发，服务端统一包成 16kHz mono s16le WAV 喂给 ASR）
 /// 内部：ASR → LLM 流式 → 切句 → 逐句 TTS 流式，全链路串成一条 NDJSON 流
 /// response: NDJSON 分阶段事件（stage 字段区分）：
@@ -710,7 +683,7 @@ pub async fn asr_llm_tts(
 ) -> Result<HttpResponse, actix_web::Error> {
     let sid = gen_sid("asr_llm_tts");
     let bytes_len = body.len();
-    info!(target: "voice_server.test_api", endpoint = "asr_llm_tts", session_id = %sid, bytes = bytes_len, "/test/asr_llm_tts 收到请求");
+    info!(target: "voice_server.admin_api", endpoint = "asr_llm_tts", session_id = %sid, bytes = bytes_len, "/admin/asr_llm_tts 收到请求");
 
     // 统一预处理：WAV/裸 PCM 都包成 16kHz mono s16le WAV。失败 → 400 短文本。
     let prepared = match prepare_audio_for_asr(body.to_vec()) {
@@ -747,7 +720,7 @@ fn build_asr_llm_tts_stream(
         let mut asr_stream = match asr.recognize(&sid, None, pcm).await {
             Ok(s) => s,
             Err(e) => {
-                warn!(target: "voice_server.test_api", endpoint = "asr_llm_tts", session_id = %sid, "ASR 调用失败: {}", e);
+                warn!(target: "voice_server.admin_api", endpoint = "asr_llm_tts", session_id = %sid, "ASR 调用失败: {}", e);
                 yield ndjson_line(&ErrorLine { error: format!("asr error: {}", e), code: 1001 })?;
                 return;
             }
@@ -757,7 +730,7 @@ fn build_asr_llm_tts_stream(
             let evt = match item {
                 Ok(e) => e,
                 Err(e) => {
-                    warn!(target: "voice_server.test_api", endpoint = "asr_llm_tts", session_id = %sid, "ASR 流错误: {}", e);
+                    warn!(target: "voice_server.admin_api", endpoint = "asr_llm_tts", session_id = %sid, "ASR 流错误: {}", e);
                     yield ndjson_line(&ErrorLine { error: format!("asr stream: {}", e), code: 1001 })?;
                     return;
                 }
@@ -791,6 +764,6 @@ fn build_asr_llm_tts_stream(
             }
         }
 
-        debug!(target: "voice_server.test_api", endpoint = "asr_llm_tts", session_id = %sid, "/test/asr_llm_tts 全部完成");
+        debug!(target: "voice_server.admin_api", endpoint = "asr_llm_tts", session_id = %sid, "/admin/asr_llm_tts 全部完成");
     }
 }

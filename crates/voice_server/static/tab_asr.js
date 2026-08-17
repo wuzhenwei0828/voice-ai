@@ -1,5 +1,5 @@
 // voice-app frontend — ASR 单能力 tab
-// 选文件 → POST /test/asr → 流式显示识别结果（音频格式由后端处理）
+// 选文件 → POST /admin/asr → 流式显示识别结果（音频格式由后端处理）
 
 (function () {
   'use strict';
@@ -53,8 +53,8 @@
       const buf = await selectedFile.arrayBuffer();
       log('upload start:', selectedFile.name, buf.byteLength, 'B');
 
-      setStatus('调用 /test/asr ...');
-      const resp = await fetch('/test/asr', {
+      setStatus('调用 /admin/asr ...');
+      const resp = await fetch('/admin/asr', {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
         body: buf,

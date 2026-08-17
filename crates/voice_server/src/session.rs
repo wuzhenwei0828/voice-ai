@@ -5,7 +5,7 @@
 //!
 //! 下行通过 webhttp::websocket::OutMessage 推给客户端。
 //!
-//! pipeline 复用 test_api::llm_tts_items（LLM → 切句 → TTS → 句间 crossfade），
+//! pipeline 复用 admin_api::llm_tts_items（LLM → 切句 → TTS → 句间 crossfade），
 //! 本文件只负责：上行消息分发、ASR 阶段、事件 → VoicePayload 映射、取消。
 //!
 //! ## Pipeline 并发策略：**打断旧的**（auto-interrupt on new utterance），但只在新句真有内容时
@@ -53,18 +53,21 @@
 //!   观察 token 提前退出；`on_payload` 本身是同步非阻塞的，Interrupt/SessionEnd
 //!   随下一条 WS 消息顺序到达即生效，不存在抢占问题。
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
+
+use parking_lot::Mutex;
 
 use actix::prelude::Recipient;
 use futures_util::StreamExt;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use voice_proto::VoicePayload;
 use webhttp::websocket::OutMessage;
 
 use crate::client::{asr::wrap_pcm_as_wav, AsrClient, LlmClient, TtsClient};
-use crate::test_api::{llm_tts_items, LlmTtsItem};
+use crate::admin_api::{llm_tts_items, LlmTtsItem};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
@@ -153,6 +156,9 @@ impl AudioAccumulator {
 
 pub struct VoiceSession {
     pub session_id: String,
+    /// 仅用于日志/观测的"用户视角"状态机。注意：spawn pipeline 后立即转回 Listening，
+    /// 不反映 pipeline 内部 ASR/LLM/TTS 子阶段；并发安全靠 CancellationToken + current_real_cancel，
+    /// 不是靠这个字段。
     pub state: SessionState,
     /// SessionEnd 之后不再接受任何上行消息，也不触发新 pipeline
     closed: bool,
@@ -172,6 +178,25 @@ pub struct VoiceSession {
     tts: Arc<dyn TtsClient>,
     /// 下行发送目标：actix 的 Recipient，跨任务 clone
     down_addr: Recipient<OutMessage>,
+}
+
+/// pipeline 退出时兜底清掉自己在 `current_real_cancel` 中的注册（M4 part B）。
+///
+/// 只有当"自己仍然是 current"时才清，避免覆盖更新的 pipeline（auto-interrupt 链）的注册。
+/// 这样无论 pipeline 是正常完成、被 cancel、还是 panic 早 return，current_real_cancel
+/// 都不会留下 stale token 误 cancel 后续 pipeline。
+struct CurrentCancelGuard {
+    current: Arc<Mutex<Option<CancellationToken>>>,
+    cancel: CancellationToken,
+}
+
+impl Drop for CurrentCancelGuard {
+    fn drop(&mut self) {
+        let mut g = self.current.lock();
+        if g.as_ref().map(|c| c == &self.cancel).unwrap_or(false) {
+            *g = None;
+        }
+    }
 }
 
 impl VoiceSession {
@@ -213,14 +238,18 @@ impl VoiceSession {
     }
 
     /// 处理上行 payload（同步；可触发异步 pipeline 任务）
-    pub fn on_payload(&mut self, p: VoicePayload) {
+    ///
+    /// 返回 `Some(JoinHandle)` 表示本调用 spawn 了一个 pipeline 任务，
+    /// 调用方（service.rs）应将其推入 service 级 JoinSet 以追踪 panic / 优雅退出。
+    /// `None` 表示本调用没 spawn（例如音频过短、空文本、非 AudioChunk）。
+    pub fn on_payload(&mut self, p: VoicePayload) -> Option<JoinHandle<()>> {
         if self.closed {
             debug!(
                 target: "voice_server.session",
                 session_id = %self.session_id,
                 "会话已 SessionEnd，忽略上行 payload: {:?}", p
             );
-            return;
+            return None;
         }
         match p {
             VoicePayload::SessionStart {
@@ -243,6 +272,7 @@ impl VoiceSession {
                 self.sample_rate = sample_rate;
                 self.channels = channels as u16;
                 self.transition(SessionState::Listening);
+                None
             }
             VoicePayload::AudioChunk {
                 seq,
@@ -266,7 +296,7 @@ impl VoiceSession {
                 }
                 self.audio_buf.push(data);
                 if is_last {
-                    self.trigger_pipeline(TriggerReason::ClientIsLast);
+                    self.trigger_pipeline(TriggerReason::ClientIsLast)
                 } else if self.audio_buf.elapsed_ms() >= MAX_UTTERANCE_MS {
                     warn!(
                         target: "voice_server.session",
@@ -275,7 +305,7 @@ impl VoiceSession {
                         limit_ms = MAX_UTTERANCE_MS as u64,
                         "单句超长，服务端强制触发"
                     );
-                    self.trigger_pipeline(TriggerReason::DurationCap);
+                    self.trigger_pipeline(TriggerReason::DurationCap)
                 } else if self.audio_buf.len() >= MAX_AUDIO_BYTES {
                     warn!(
                         target: "voice_server.session",
@@ -284,7 +314,9 @@ impl VoiceSession {
                         limit = MAX_AUDIO_BYTES,
                         "缓冲超限，服务端强制触发"
                     );
-                    self.trigger_pipeline(TriggerReason::BufferCap);
+                    self.trigger_pipeline(TriggerReason::BufferCap)
+                } else {
+                    None
                 }
             }
             VoicePayload::Interrupt { .. } => {
@@ -296,13 +328,14 @@ impl VoiceSession {
                 // 全局 cancel 终止所有在跑 pipeline，再重建让下一句从干净状态起
                 self.global_cancel.cancel();
                 self.global_cancel = CancellationToken::new();
-                *self.current_real_cancel.lock().unwrap() = None;
+                *self.current_real_cancel.lock() = None;
                 self.transition(SessionState::Listening);
                 send_down(&self.down_addr, VoicePayload::LlmDelta {
                     session_id: self.session_id.clone(),
                     delta: "[已打断]".to_string(),
                     is_final: true,
                 });
+                None
             }
             VoicePayload::SessionEnd { reason, .. } => {
                 info!(
@@ -313,6 +346,7 @@ impl VoiceSession {
                 );
                 self.global_cancel.cancel();
                 self.closed = true;
+                None
             }
             other => {
                 debug!(
@@ -320,28 +354,34 @@ impl VoiceSession {
                     session_id = %self.session_id,
                     "忽略非上行 payload: {:?}", other
                 );
+                None
             }
         }
     }
 
-    fn trigger_pipeline(&mut self, reason: TriggerReason) {
+    fn trigger_pipeline(&mut self, reason: TriggerReason) -> Option<JoinHandle<()>> {
+        // 先把"耗时"取出来再 drain（drain 后 audio_buf 计时会被下次 push 重置）
+        let bytes_before = self.audio_buf.len();
+        let elapsed_before = self.audio_buf.elapsed_ms();
         let audio = self.audio_buf.drain();
         if audio.len() < MIN_UTTERANCE_BYTES {
             warn!(
                 target: "voice_server.session",
                 session_id = %self.session_id,
                 bytes = audio.len(),
+                bytes_before,
+                elapsed_ms = elapsed_before as u64,
                 min = MIN_UTTERANCE_BYTES,
                 "音频过短（噪声/半句），丢弃不触发 pipeline"
             );
-            return;
+            return None;
         }
         info!(
             target: "voice_server.session",
             session_id = %self.session_id,
             trigger = ?reason,
             bytes = audio.len(),
-            elapsed_ms = self.audio_buf.elapsed_ms() as u64,
+            elapsed_ms = elapsed_before as u64,
             "句尾触发 pipeline"
         );
 
@@ -364,11 +404,13 @@ impl VoiceSession {
         let tts = self.tts.clone();
         let down_addr = self.down_addr.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             run_pipeline(session_id, audio, sample_rate, channels, asr, llm, tts, down_addr, cancel, current_real_cancel).await;
         });
 
         self.transition(SessionState::Listening);
+
+        Some(handle)
     }
 }
 
@@ -381,9 +423,9 @@ impl Drop for VoiceSession {
     }
 }
 
-/// 完整 pipeline：ASR → LLM → 切句 → TTS（复用 test_api::llm_tts_items）。
+/// 完整 pipeline：ASR → LLM → 切句 → TTS（复用 admin_api::llm_tts_items）。
 ///
-/// 与 /test/asr_llm_tts 结构对称，差异仅在 wire 侧：
+/// 与 /admin/asr_llm_tts 结构对称，差异仅在 wire 侧：
 ///   - 下行推 VoicePayload（msgpack 信封）而非 NDJSON
 ///   - 全程受 CancellationToken 约束（用户打断）
 ///   - Tts chunk 直接带原始 PCM 字节（不做 base64）
@@ -415,13 +457,32 @@ async fn run_pipeline(
     );
     // recognize 建连（HTTP 请求）本身也进 select：否则建连期间无法被打断，
     // 只能等 HTTP 超时，Interrupt 形同虚设
+    // 同时加 tokio::time::timeout：上游挂死/极慢响应 → future 被 drop，不会永久持有
+    // Arc client + Mutex + HTTP 连接资源（M4 part A）
+    let asr_timeout = std::time::Duration::from_secs(30);
     let mut asr_stream = match tokio::select! {
         _ = cancel.cancelled() => {
             warn!(target: "voice_server.session", session_id = %session_id, "ASR 建连阶段被取消");
             return;
         }
-        // filename=None 走 asr.rs 默认 "audio.wav"，与上面 wav 字节的 RIFF 格式匹配
-        r = asr.recognize(&session_id, None, wav) => r,
+        r = tokio::time::timeout(asr_timeout, asr.recognize(&session_id, None, wav)) => {
+            match r {
+                Ok(inner) => inner,
+                Err(_elapsed) => {
+                    error!(
+                        target: "voice_server.session",
+                        session_id = %session_id,
+                        timeout_secs = asr_timeout.as_secs(),
+                        "ASR recognize 超时"
+                    );
+                    send_down(&down_addr, VoicePayload::Error {
+                        code: 1001,
+                        message: format!("asr timeout after {}s", asr_timeout.as_secs()),
+                    });
+                    return;
+                }
+            }
+        }
     } {
         Ok(s) => s,
         Err(e) => {
@@ -500,7 +561,13 @@ async fn run_pipeline(
     // ===== 注册为 current real 并 cancel 上一个 real pipeline（auto-interrupt on new utterance）=====
     // 空文本的 pipeline 已经早 return，不会污染这条路径。
     // 只 cancel 上一个「已经进入 LLM/TTS」的 pipeline（prev_token），不动当前 pipeline 的 cancel。
-    let prev = current_real_cancel.lock().unwrap().replace(cancel.clone());
+    // CurrentCancelGuard 在 pipeline 退出时清掉自己的 token，避免 stale token 误 cancel 后续
+    // （M4 part B：drop guard）
+    let _guard = CurrentCancelGuard {
+        current: current_real_cancel.clone(),
+        cancel: cancel.clone(),
+    };
+    let prev = current_real_cancel.lock().replace(cancel.clone());
     if let Some(prev) = prev {
         info!(
             target: "voice_server.session",
@@ -535,7 +602,7 @@ async fn run_pipeline(
                 send_down(&down_addr, VoicePayload::TtsAudio {
                     session_id: session_id.clone(),
                     seq,
-                    // test_api 侧是 base64 字符串（NDJSON 需要），WS 侧还原为原始字节
+                    // admin_api 侧是 base64 字符串（NDJSON 需要），WS 侧还原为原始字节
                     data: base64::Engine::decode(
                         &base64::engine::general_purpose::STANDARD,
                         &audio,
@@ -560,7 +627,16 @@ async fn run_pipeline(
 fn send_down(addr: &Recipient<OutMessage>, p: VoicePayload) {
     match voice_proto::encode_indication(&p) {
         Ok(bytes) => {
-            let _ = addr.do_send(OutMessage { data: bytes });
+            // 注：Recipient::do_send 返回 ()，无法获知失败 —— 用 try_send 接住 SendError
+            // （SendError 的 Display 只输出变体名 "receiver is full" / "receiver is gone"），
+            // 弱网下能定位"客户端没收到 TTS"这类问题
+            if let Err(e) = addr.try_send(OutMessage { data: bytes }) {
+                debug!(
+                    target: "voice_server.session",
+                    session_id = ?p.session_id(),
+                    "下行 try_send 失败（客户端可能已断开）: {}", e
+                );
+            }
         }
         Err(e) => warn!(
             target: "voice_server.session",
@@ -570,8 +646,18 @@ fn send_down(addr: &Recipient<OutMessage>, p: VoicePayload) {
     }
 }
 
+// 编译期断言：VoiceSession 必须满足 DashMap 的 Send + Sync 要求（m2）。
+// 不依赖任何外部 crate —— 直接用 where 子句即可，重构时若不小心破坏 Send/Sync，
+// 编译器会在这里报错。
+#[allow(dead_code)]
+fn _assert_voice_session_send_sync()
+where
+    VoiceSession: Send + Sync,
+{
+}
+
 /// 在 `buf` 中找下一个"句末标点"，返回该标点之后第一个字节的位置（byte index）
-/// pub 供 `test_api` 切句逻辑复用
+/// pub 供 `admin_api` 切句逻辑复用
 pub fn next_sentence_end(buf: &str) -> Option<usize> {
     for (i, c) in buf.char_indices() {
         if matches!(c, '。' | '！' | '?' | '.' | '!') {

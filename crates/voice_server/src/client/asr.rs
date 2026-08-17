@@ -40,6 +40,7 @@ pub trait AsrClient: Send + Sync {
 /// 通用 OpenAI-兼容 ASR 客户端
 pub struct HttpAsrClient {
     openai: OpenAIConfig,
+    client: Client<OpenAIConfig>,
     model: String,
     // 注意：async-openai 暂不暴露往请求里塞自定义 header 的口子
     // （OpenAIConfig::with_http_client 可以接自定义 reqwest，但用起来与 SDK 其他路径有冲突），
@@ -48,7 +49,8 @@ pub struct HttpAsrClient {
 
 impl HttpAsrClient {
     pub fn new(openai: OpenAIConfig, model: String) -> Self {
-        Self { openai, model }
+        let client = Client::with_config(openai.clone());
+        Self { openai, client, model }
     }
 }
 
@@ -85,9 +87,8 @@ impl AsrClient for HttpAsrClient {
             model: self.model.clone(),
             ..Default::default()
         };
-        let client = Client::with_config(self.openai.clone());
 
-        let resp: CreateTranscriptionResponseJson = match client.audio().transcribe(req).await {
+        let resp: CreateTranscriptionResponseJson = match self.client.audio().transcribe(req).await {
             Ok(r) => r,
             Err(e) => {
                 let err_text = e.to_string();

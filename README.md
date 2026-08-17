@@ -27,7 +27,7 @@ voice-app/
     └── ws-payload-helper/                # （辅助工具）
 ```
 
-> 注：原 `voice-client/`（终端 SDK + CLI demo）已停用——`bin/voice_terminal.rs` 不在 tree 里，无调用方。要恢复 Rust 终端 CLI 时可以重建该 crate。
+> 注：原 `voice-client/`（终端 SDK + CLI 客户端）已停用——`bin/voice_terminal.rs` 不在 tree 里，无调用方。要恢复 Rust 终端 CLI 时可以重建该 crate。
 
 ## 端到端跑通
 
@@ -61,7 +61,7 @@ with wave.open('test.wav','wb') as w:
 "
 ```
 
-### 3. 跑终端 demo
+### 3. 跑终端 CLI
 
 终端 CLI 已停用（`voice-client` crate 已从 workspace 移除，见项目结构说明）。当前主线是浏览器前端，访问 `http://127.0.0.1:8080` 即可。
 
@@ -72,13 +72,13 @@ with wave.open('test.wav','wb') as w:
 服务端日志（节选，siliconflow 真实服务示例）：
 ```
 INFO voice_server.service: WS 连接建立
-INFO voice_server.service: 新建 VoiceSession session_id=voice-cli-demo
-INFO voice_server.session: VoiceSession 创建 session_id=voice-cli-demo
-INFO voice_server.session: 收到 SessionStart session_id=voice-cli-demo
+INFO voice_server.service: 新建 VoiceSession session_id=voice-cli-admin
+INFO voice_server.session: VoiceSession 创建 session_id=voice-cli-admin
+INFO voice_server.session: 收到 SessionStart session_id=voice-cli-admin
 INFO voice_server.session: 状态转换 from=Idle to=Listening
 INFO voice_server.session: VAD 句尾，触发 pipeline bytes=48000 elapsed_ms=1659
 INFO voice_server.session: 状态转换 from=Listening to=Processing
-INFO voice_server.session: pipeline 开始 session_id=voice-cli-demo
+INFO voice_server.session: pipeline 开始 session_id=voice-cli-admin
 INFO voice_server.asr: ASR POST 请求 (48000 bytes)
 INFO voice_server.asr: 收到 ASR partial/final text=你好世界 is_final=true
 INFO voice_server.session: ASR final 完成，进入 LLM
@@ -89,7 +89,7 @@ INFO voice_server.tts: TTS POST 请求 text_len=4
 INFO voice_server.tts: 收到 TTS chunk seq=0 bytes=32000 is_last=false
 INFO voice_server.tts: 收到 TTS chunk seq=1 bytes=0 is_last=true
 INFO voice_server.session: pipeline 全部完成
-INFO voice_server.session: 收到 SessionEnd session_id=voice-cli-demo reason=normal exit
+INFO voice_server.session: 收到 SessionEnd session_id=voice-cli-admin reason=normal exit
 INFO voice_server.service: WS 断开，移除 session
 ```
 
@@ -193,3 +193,79 @@ curl -sN -X POST http://localhost:8080/test/tts \
 | tokio + tokio-util | async runtime + CancellationToken |
 | reqwest | HTTP client（连 ASR/LLM/TTS 真实服务） |
 | tracing | 日志 |
+
+## Switching to Bailian（DashScope）
+
+`crates/voice-providers/` 是新接入的 provider 实现：百炼 GAX（protobuf-over-WSS）的 ASR/TTS + OpenAI-compat 的 LLM。voice-server 通过 `provider.kind=bailian` 切换到这条链路。
+
+> **状态**：骨架阶段，单元测试 + codec + WS pool 全过，**未做真实 DashScope 联调**（需 API key）。详见本节末尾的"生产化待补"清单。
+
+### 架构
+
+```
+crates/voice-providers/
+├── proto/bailian.proto         # 手写 GAX 消息子集（ASR + TTS）
+├── build.rs                    # prost-build（protoc-bin-vendored，无需 host 装 protoc）
+├── src/
+│   ├── codec.rs                # 4-byte BE u32 length-prefix || cmd || payload
+│   ├── ws_pool.rs              # 双 lane (Asr/Tts) WS pool + Semaphore + PooledConn RAII
+│   ├── asr/{mod,paraformer}.rs # AsrClient + AsrModelAdapter（Paraformer-realtime-v2）
+│   ├── tts/{mod,cosyvoice}.rs  # TtsClient + TtsModelAdapter（CosyVoice-v2）
+│   ├── llm.rs                  # 手搓 reqwest OpenAI-compat 流式
+│   ├── config.rs               # BailianConfig + 从 serde_yaml::Mapping 解析
+│   └── provider.rs             # build_all() 顶层入口
+└── tests/                      # codec / ws_pool / asr / tts 集成测试
+```
+
+依赖方向：**voice-server → voice-providers**（单向）。voice-providers 自带 `AsrClient / LlmClient / TtsClient / AsrEvent / LlmEvent / TtsEvent` 类型与 voice-server 对应类型同构，由 PR1 在 voice-server 侧用 wrapper 适配。
+
+### YAML 配置
+
+```yaml
+provider:
+  kind: bailian                                       # openai_compat (default) | bailian
+  api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"   # LLM 走 OpenAI-compat
+  api_key: "sk-..."
+  timeout_ms: 30000
+
+bailian:                                             # 仅 kind=bailian 时消费
+  ws_endpoint: "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
+  pool:
+    max_connections: 16
+    acquire_timeout_ms: 5000
+    idle_timeout_ms: 60000
+    connect_timeout_ms: 10000
+  asr:
+    model: "paraformer-realtime-v2"
+    sample_rate: 16000
+    channels: 1
+    enable_intermediate_result: true
+    enable_punctuation: true
+  tts:
+    model: "cosyvoice-v2"
+    voice: "longxiaochun"
+    sample_rate: 16000
+    response_format: "pcm"
+    stream: true
+  llm:
+    model: "qwen-max"                                # api_base / api_key 从 provider 继承
+```
+
+也可用环境变量：`VOICE_PROVIDER_KIND=bailian`（覆盖 provider.kind）。
+
+### 模型可扩展点
+
+加一个新百炼模型（如 `sensevoice-v1` ASR 或 `sambert` TTS）只需：
+1. 在 `proto/bailian.proto` 追加消息（若需要）
+2. 在 `asr/` 或 `tts/` 加一个 `xxx.rs` 实现 `AsrModelAdapter` / `TtsModelAdapter`
+3. 在 `select_asr_adapter` / `select_tts_adapter` match 加 arm
+
+pool / codec / wire / session 都不用动。
+
+### 生产化待补（PR 5+ 之前）
+
+- **真实拨号**：当前 `make_real_dialer` 返回 `Handshake` 错误；需用 `async-tungstenite` 接通 DashScope WSS + Authorization header
+- **GAX cmd byte 校准**：当前 cmd 是基于通用 GAX 模式的合理默认，需 `wscat -c` 抓真实握手后核对
+- **健康检查增强**：当前仅 lazy + on-error；生产应加心跳（每 30s 发 noop 帧，超时关掉）
+- **限流分 lane**：`pool.max_connections` 当前每 lane 共享；可能需要拆 `asr_max_connections` / `tts_max_connections`
+- **错误分类细化**：`PoolError::Handshake` 应区分 401/403/429 等

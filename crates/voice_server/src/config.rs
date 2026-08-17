@@ -60,6 +60,10 @@ pub struct VoiceConfig {
     pub llm: LlmConfig,
     #[serde(default)]
     pub tts: TtsConfig,
+    /// NEW: 仅 provider.kind=bailian 时消费。用 serde_yaml::Value 避免 voice-server
+    /// 硬依赖 voice-providers crate。具体解析由 voice_providers::BailianConfig::from_voice_config 做。
+    #[serde(default)]
+    pub bailian: Option<serde_yaml::Mapping>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +95,9 @@ fn default_worker_num() -> usize {
 /// 顶层 provider：作为 asr/llm/tts 的连接级默认
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
+    /// NEW: provider 选择。None = OpenAiCompat（向后兼容）
+    #[serde(default)]
+    pub kind: Option<crate::provider::ProviderKind>,
     /// OpenAI-兼容 base URL，如 https://api.siliconflow.cn/v1
     /// 客户端会自动拼 OpenAI 标准路径（/audio/transcriptions、/chat/completions、/audio/speech）
     #[serde(default)]
@@ -147,6 +154,7 @@ impl ProviderConfig {
 impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
+            kind: None,
             api_base: String::new(),
             api_key: String::new(),
             timeout_ms: default_timeout_ms(),
@@ -183,6 +191,7 @@ impl AsrConfig {
     pub fn resolved(&self, provider: Option<&ProviderConfig>) -> ProviderConfig {
         let p = provider.cloned().unwrap_or_default();
         ProviderConfig {
+            kind: p.kind,
             api_base: if self.api_base.is_empty() { p.api_base } else { self.api_base.clone() },
             api_key: if self.api_key.is_empty() { p.api_key } else { self.api_key.clone() },
             timeout_ms: self.timeout_ms.unwrap_or(p.timeout_ms),
@@ -228,6 +237,7 @@ impl LlmConfig {
     pub fn resolved(&self, provider: Option<&ProviderConfig>) -> ProviderConfig {
         let p = provider.cloned().unwrap_or_default();
         ProviderConfig {
+            kind: p.kind,
             api_base: if self.api_base.is_empty() { p.api_base } else { self.api_base.clone() },
             api_key: if self.api_key.is_empty() { p.api_key } else { self.api_key.clone() },
             timeout_ms: self.timeout_ms.unwrap_or(p.timeout_ms),
@@ -283,6 +293,7 @@ impl TtsConfig {
         let p = provider.cloned().unwrap_or_default();
         (
             ProviderConfig {
+                kind: p.kind,
                 api_base: if self.api_base.is_empty() { p.api_base } else { self.api_base.clone() },
                 api_key: if self.api_key.is_empty() { p.api_key } else { self.api_key.clone() },
                 timeout_ms: self.timeout_ms.unwrap_or(p.timeout_ms),
@@ -333,6 +344,18 @@ impl VoiceConfig {
             if let Ok(v) = std::env::var("VOICE_PROVIDER_API_BASE") {
                 p.api_base = v;
             }
+            if let Ok(v) = std::env::var("VOICE_PROVIDER_KIND") {
+                // apply_env_overrides 保持 infallible；非法值仅告警并保留当前配置。
+                match v.to_lowercase().as_str() {
+                    "openai_compat" | "openai-compat" => {
+                        p.kind = Some(crate::provider::ProviderKind::OpenAiCompat)
+                    }
+                    "bailian" => p.kind = Some(crate::provider::ProviderKind::Bailian),
+                    other => eprintln!(
+                        "warning: unknown VOICE_PROVIDER_KIND={other}; keeping current provider kind"
+                    ),
+                }
+            }
             if let Ok(v) = std::env::var("VOICE_PROVIDER_API_KEY") {
                 p.api_key = v;
             }
@@ -380,6 +403,7 @@ impl Default for VoiceConfig {
             asr: AsrConfig::default(),
             llm: LlmConfig::default(),
             tts: TtsConfig::default(),
+            bailian: None,
         }
     }
 }

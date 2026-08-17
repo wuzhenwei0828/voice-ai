@@ -2,9 +2,10 @@
 resolver = "2"
 members = [
     "crates/voice-proto",
-    "crates/voice-server",
     "crates/voice-vad",
-    "crates/ws-payload-helper",
+    "crates/voice_server",
+    "crates/voice-providers",
+    "crates/ws_payload_helper",
 ]
 
 [workspace.package]
@@ -14,15 +15,17 @@ authors = ["wuzhenwei"]
 
 [workspace.dependencies]
 voice-proto = { path = "crates/voice-proto" }
-webproto = { path = "/Users/wuzhenwei/Code/github/webproto" }
-webhttp = { path = "/Users/wuzhenwei/Code/github/webhttp" }
-webclient = { path = "/Users/wuzhenwei/Code/github/webclient" }
+voice-providers = { path = "crates/voice-providers" }
+webproto = "0.1.0"
+webhttp = "0.1.12"
+webclient = "0.1.1"
 
 tokio = { version = "1.33", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 rmp-serde = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi", "time", "local-time", "json"] }
@@ -36,3 +39,10 @@ axum = { version = "0.7", features = ["macros"] }
 tower = "0.5"
 uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
+parking_lot = "0.12"
+
+# voice-providers (Bailian GAX + WS) 依赖
+prost = "0.13"
+prost-build = "0.13"
+async-tungstenite = { version = "0.28", features = ["tokio-rustls-native-certs"] }
+bytes = "1"

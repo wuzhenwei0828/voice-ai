@@ -48,6 +48,7 @@ pub struct HttpTtsClient {
     stream: bool,
     extra_headers: HeaderMap,
     timeout: Duration,
+    client: reqwest::Client,
 }
 
 impl HttpTtsClient {
@@ -61,8 +62,22 @@ impl HttpTtsClient {
         stream: bool,
         extra_headers: HeaderMap,
         timeout: Duration,
-    ) -> Self {
-        Self { base_url, path, api_key, model, voice, response_format, stream, extra_headers, timeout }
+    ) -> anyhow::Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()?;
+        Ok(Self {
+            base_url,
+            path,
+            api_key,
+            model,
+            voice,
+            response_format,
+            stream,
+            extra_headers,
+            timeout,
+            client,
+        })
     }
 }
 
@@ -86,11 +101,6 @@ impl TtsClient for HttpTtsClient {
         } else {
             format!("{}{}", self.base_url, self.path)
         };
-
-        let client = reqwest::Client::builder()
-            .timeout(self.timeout)
-            .build()
-            .map_err(|e| ClientError::Http(e.to_string()))?;
 
         #[derive(serde::Serialize)]
         struct Req<'a> {
@@ -116,7 +126,7 @@ impl TtsClient for HttpTtsClient {
             },
             stream: if self.stream { Some(true) } else { None },
         };
-        let mut req = client
+        let mut req = self.client
             .request(reqwest::Method::POST, &url)
             .header("x-session-id", session_id)
             .json(&body);
@@ -348,5 +358,5 @@ pub fn build_tts_client(
         cfg.stream,
         headers,
         timeout,
-    )))
+    )?))
 }

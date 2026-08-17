@@ -1,5 +1,5 @@
 // voice-app frontend — TTS 单能力 tab
-// 输入文本 → POST /test/tts → 累积 audio chunk → 拼成 WAV → 播放/下载
+// 输入文本 → POST /admin/tts → 累积 audio chunk → 拼成 WAV → 播放/下载
 
 (function () {
   'use strict';
@@ -28,8 +28,8 @@
     textEl.disabled = true;
     reset();
     try {
-      status.textContent = '调用 /test/tts ...';
-      const resp = await fetch('/test/tts', {
+      status.textContent = '调用 /admin/tts ...';
+      const resp = await fetch('/admin/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text }),

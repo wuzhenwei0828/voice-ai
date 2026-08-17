@@ -1,6 +1,6 @@
-// voice-app web demo — 浏览器端 voice pipeline
+// voice-app web admin — 浏览器端 voice pipeline
 // 流程：
-//   1. WS 连接 /ws/voice/web/demo/listener
+//   1. WS 连接 /ws/voice/web/admin/listener
 //   2. 发送 SessionStart (codec=pcm_s16le, sample_rate=16000, channels=1)
 //   3. AudioContext + AudioWorklet 持续采集麦克风 → Float32 → 转 s16le → 二进制帧 → WS
 //   4. AudioWorklet 内：按 FRAME_SAMPLES 攒帧 + 重采样 + RMS 能量 VAD；
@@ -796,7 +796,7 @@
       addMessage('error', 'WS 未连接');
       return;
     }
-    const obj = {Indication: {data: {type: 'session_start', session_id: 'web-demo', sample_rate: 16000, channels: 1, codec: 'pcm_s16le', language: 'zh-CN'}}};
+    const obj = {Indication: {data: {type: 'session_start', session_id: 'web-admin', sample_rate: 16000, channels: 1, codec: 'pcm_s16le', language: 'zh-CN'}}};
     const bytes = msgpackEncode(obj);
     console.log('[DBG] sending bytes, length=', bytes.length, 'ctor=', bytes.constructor.name);
     ws.send(bytes);

@@ -173,8 +173,7 @@ impl std::io::Write for TeeWriter {
         let mut out = std::io::stdout().lock();
         out.write_all(buf)?;
         out.flush()?;
-        self.file.lock().unwrap().write_all(buf)?;
-        Ok(buf.len())
+        self.file.lock().unwrap().write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -341,6 +340,7 @@ pub fn default_config_path(bin_name: &str) -> PathBuf {
 ///   1. 显式传入 `explicit`（即使不存在也用它）
 ///   2. 环境变量 `VOICE_WEB_STATIC_DIR`
 ///   3. 搜索常见路径：
+///        - `<CARGO_MANIFEST_DIR>/static`     (crate 内置静态目录,编译期锚定,任意 CWD 都能找到)
 ///        - `./static`
 ///        - `./web`
 ///        - `./crates/voice-server/static`     (workspace 根目录启动)
@@ -358,6 +358,7 @@ pub fn resolve_web_static_dir(explicit: Option<&str>) -> Option<PathBuf> {
         return Some(PathBuf::from(v));
     }
     let candidates: &[&str] = &[
+        concat!(env!("CARGO_MANIFEST_DIR"), "/static"),
         "./static",
         "./web",
         "./crates/voice-server/static",

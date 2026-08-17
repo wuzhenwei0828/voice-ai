@@ -1,5 +1,5 @@
 // voice-app frontend — ASR→LLM→TTS 全链路 tab
-// 选文件 → POST /test/asr_llm_tts → 按 stage 分发渲染 + 累积音频拼 WAV 播放
+// 选文件 → POST /admin/asr_llm_tts → 按 stage 分发渲染 + 累积音频拼 WAV 播放
 
 (function () {
   'use strict';
@@ -63,8 +63,8 @@
       const buf = await selectedFile.arrayBuffer();
       log('upload start:', selectedFile.name, buf.byteLength, 'B');
 
-      setStatus('调用 /test/asr_llm_tts ...');
-      const resp = await fetch('/test/asr_llm_tts', {
+      setStatus('调用 /admin/asr_llm_tts ...');
+      const resp = await fetch('/admin/asr_llm_tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
         body: buf,

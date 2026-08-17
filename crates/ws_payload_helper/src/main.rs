@@ -1,10 +1,10 @@
 //! ws-payload-helper: 把 VoicePayload 编码成 msgpack 字节，输出 hex
 //!
 //! 用法：
-//!   ws-payload-helper session_start --session-id web_demo
-//!   ws-payload-helper audio_chunk --session-id web_demo --seq 1 --is-last true --data @test.raw
-//!   ws-payload-helper interrupt --session-id web_demo
-//!   ws-payload-helper session_end --session-id web_demo --reason "done"
+//!   ws-payload-helper session_start --session-id web_admin
+//!   ws-payload-helper audio_chunk --session-id web_admin --seq 1 --is-last true --data @test.raw
+//!   ws-payload-helper interrupt --session-id web_admin
+//!   ws-payload-helper session_end --session-id web_admin --reason "done"
 //!   ws-payload-helper all    一次打印所有常用 payload 的 hex
 //!
 //! 用 @filename 从文件读 bytes（如音频）

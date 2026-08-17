@@ -1,7 +1,7 @@
 # voice-app 实施进度
 
 > 用于跨会话继续工作时快速恢复上下文。每完成一项 / 改一个决策就在这里追加。
-> **最近更新**：2026-08-17
+> **最近更新**：2026-08-17（并发与线程安全 review + 修复 round 1）
 
 ---
 
@@ -186,12 +186,30 @@ VOICE_<ASR|LLM|TTS>_MODEL             # model
 2. **VoiceSession 的 DashMap 持有**：当前 `on_payload` 是同步的，但每个 session 只处理一条消息就丢（Spawn 出 Actor 之后 session 就没被持久持有）。需要改成 session 在 DashMap 里跨消息调用 `on_payload` —— 影响多轮上下文。
 3. **log guard leak**：`voice-config::init_logging` 里 `Box::leak` 了 writer guard（避免 stdout guard 提前 drop）；无害但不优雅
 4. **服务端 graceful shutdown**：Ctrl-C 时正在处理的请求会被砍掉；生产里要等 in-flight 结束
+5. ~~**reqwest Client 每次新建**~~ → 已在 2026-08-17 并发修复 round 1 解决（`client/asr.rs`, `llm.rs`, `tts.rs`：client 进 struct 字段复用；TTS 构造改为 `-> anyhow::Result<Self>`）。详见 review.md §6.2 C2。
+6. **JoinSet graceful drain**：round 1 只做到"跟踪 + janitor 观察 panic"，**没做** shutdown 时 `join_next` 等 in-flight 完成；当前依赖 `VoiceSession::drop → global_cancel.cancel()` 链兜底。要完整版需 webhttp 加 shutdown hook。详见 review.md §6.2 C1 + §6.6 P0。
+7. **M3 — 事件 run_id 字段**：round 1 **没改**。`AsrPartial / LlmDelta / TtsAudio` 当前没有 `run_id`，auto-interrupt / WsDisconnect 后 client 没法区分"被打断的半截 vs 完整句"。需要 voice-proto 加字段 + session/test_api 都改。详见 review.md §6.3 M3。
+8. **M5 — Interrupt 冷却 flag**：round 1 **没改**。`Interrupt` 与下一条 `WsMessage` 极短间隔时，新消息可能在 Interrupt 之前进入 `on_payload`，基于老 `global_cancel` 派生 child_token 准备 spawn，然后被 cancel → 白发一次 ASR HTTP。要在 Interrupt 后置 N ms 冷却窗口。详见 review.md §6.3 M5。
 
 ### 性能
 
 - **Pipeline 异步顺序**：当前 ASR 串 LLM 串 TTS（除了 TTS 内部 chunk 并行）；Phase 2 pipeline overlap 已经实现（LLM 按句切分，TTS 边出边推）
-- **reqwest Client 每次新建**：每个请求 `reqwest::Client::new()` 有 TLS 握手开销，应该复用同一个 Client
 - **前端 TTS 句间可能微间隙**：`<audio>` + onended 链式排队在每句 chunk 之间会有几十毫秒间隙；若要无缝可改 Web Audio API（`AudioContext` + `AudioBufferSourceNode` 时间戳排程），本次未做
+
+### 并发与线程安全（review §6 round 1 已修）
+
+✅ **C2** HTTP client 复用（asr/llm/tts） — 2026-08-17
+✅ **M1** `std::sync::Mutex` → `parking_lot::Mutex`（无 poison） — 2026-08-17
+✅ **M2** `send_down` 用 `try_send` 替换 `do_send`，失败 `debug!` 上报 — 2026-08-17
+✅ **M4** ASR 建连 30s `tokio::time::timeout` + `CurrentCancelGuard`（drop 时仅当 current==self 才清空） — 2026-08-17
+✅ **m1** 删除 test_api.rs 重复 `wrap_pcm_as_wav`，从 `client::asr` 导入 — 2026-08-17
+✅ **m2** `_assert_voice_session_send_sync()` 编译期断言 — 2026-08-17
+✅ **m3** TeeWriter `write` 返回真实写入字节数（之前总返 `buf.len()`） — 2026-08-17
+✅ **m4** `state` 字段加注释：仅日志观测，不反映 pipeline 子阶段 — 2026-08-17
+✅ **m5** `trigger_pipeline` drain 前抓 `elapsed_before` / `bytes_before` — 2026-08-17
+⚠️ **C1** JoinSet 跟踪 + janitor 观察 panic（**最小版**；没做 shutdown wait） — 2026-08-17
+❌ **M3** 事件 run_id — 未改
+❌ **M5** Interrupt 冷却 — 未改
 
 ### 测试
 
@@ -219,6 +237,7 @@ VOICE_<ASR|LLM|TTS>_MODEL             # model
    ```
 3. **看 logs/*.log 验证 pipeline 完整跑通**
 4. **从"下一步优先级"挑一项继续**
+5. **如果是接着 round 1 并发 review**：剩余 P2+ 项见上文「Bug #6-#8」（C1 完整版 / M3 run_id / M5 冷却）
 
 **Phase 2 第 6 项（TTS 存盘）当前由浏览器侧覆盖**：「TTS」tab 已能下载合成 WAV 文件，肉眼/播放器可验证音质；Rust CLI 路径随 voice-client 移除而停用。
 ```rust

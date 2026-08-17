@@ -1,5 +1,5 @@
 // voice-app frontend — LLM 单能力 tab
-// 输入 prompt → POST /test/llm → 流式文本回复
+// 输入 prompt → POST /admin/llm → 流式文本回复
 
 (function () {
   'use strict';
@@ -19,8 +19,8 @@
     promptEl.disabled = true;
     output.innerHTML = '';
     try {
-      status.textContent = '调用 /test/llm ...';
-      const resp = await fetch('/test/llm', {
+      status.textContent = '调用 /admin/llm ...';
+      const resp = await fetch('/admin/llm', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt }),

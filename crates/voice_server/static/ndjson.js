@@ -1,6 +1,6 @@
 // voice-app frontend — NDJSON 流解析 helper
 // 把 fetch response 的 body 流按 \n 切成 JSON 对象逐个 yield
-// 用于消费 /test/asr /test/llm /test/tts /test/llm_tts 的 NDJSON 响应
+// 用于消费 /admin/asr /admin/llm /admin/tts /admin/llm_tts 的 NDJSON 响应
 
 window.parseNdjson = async function* parseNdjson(response) {
   if (!response.ok) {

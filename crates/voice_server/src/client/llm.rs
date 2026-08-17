@@ -30,6 +30,7 @@ pub trait LlmClient: Send + Sync {
 
 pub struct HttpLlmClient {
     openai: OpenAIConfig,
+    client: Client<OpenAIConfig>,
     model: String,
     // 注意：async-openai 暂不暴露往请求里塞自定义 header 的口子，
     // 所以 provider / llm.headers 配置项在 LLM 这里先不消费；TTS 走手搓 reqwest 所以能用。
@@ -37,7 +38,8 @@ pub struct HttpLlmClient {
 
 impl HttpLlmClient {
     pub fn new(openai: OpenAIConfig, model: String) -> Self {
-        Self { openai, model }
+        let client = Client::with_config(openai.clone());
+        Self { openai, client, model }
     }
 }
 
@@ -87,8 +89,7 @@ impl LlmClient for HttpLlmClient {
             ),
         }
 
-        let client = Client::with_config(self.openai.clone());
-        let mut raw_stream = match client.chat().create_stream(req).await {
+        let mut raw_stream = match self.client.chat().create_stream(req).await {
             Ok(s) => {
                 info!(
                     target: "voice_server.llm",

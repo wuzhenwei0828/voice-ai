@@ -10,9 +10,10 @@
 pub mod client;
 pub mod config;
 pub mod logging;
+pub mod provider;
 pub mod service;
 pub mod session;
-pub mod test_api;
+pub mod admin_api;
 
 pub use client::{
     build_asr_client, build_llm_client, build_tts_client, AsrClient, HttpAsrClient,
@@ -23,5 +24,6 @@ pub use logging::{
     candidate_paths, default_config_path, init_logging, load_yaml, resolve_config_path,
     resolve_web_static_dir, LogConfig, LogFormat,
 };
+pub use provider::{build_all_for_kind, ProviderKind, VoiceProvider};
 pub use service::VoiceService;
 pub use session::{SessionState, VoiceSession};

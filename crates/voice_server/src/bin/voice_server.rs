@@ -14,10 +14,7 @@ use std::sync::Arc;
 use clap::Parser;
 use tracing::info;
 
-use voice_server::{
-    build_asr_client, build_llm_client, build_tts_client, init_logging, load_yaml,
-    resolve_config_path, resolve_web_static_dir, VoiceConfig, VoiceService,
-};
+use voice_server::{init_logging, load_yaml, resolve_config_path, resolve_web_static_dir, VoiceConfig, VoiceService};
 
 #[derive(Parser, Debug)]
 #[command(name = "voice_server", about = "Voice server entry point")]
@@ -38,7 +35,7 @@ struct Cli {
     #[arg(long)]
     log_file: Option<String>,
 
-    /// 静态文件目录（web demo）；环境变量 VOICE_WEB_STATIC_DIR 也可
+    /// 静态文件目录（web admin）；环境变量 VOICE_WEB_STATIC_DIR 也可
     #[arg(long)]
     web_static_dir: Option<String>,
 }
@@ -96,9 +93,13 @@ async fn main() -> anyhow::Result<()> {
     init_logging(&cfg.log)?;
 
     // 4. 打印最终生效的配置
+    let provider_kind = cfg.provider.as_ref()
+        .and_then(|p| p.kind)
+        .unwrap_or_default();
     info!(
         target: "voice_server",
         config_file = %cfg_path.display(),
+        provider_kind = ?provider_kind,
         server_port = cfg.server.port,
         worker_num = cfg.server.worker_num,
         log_level = %cfg.log.level,
@@ -114,10 +115,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // 5. 构造客户端
-    let provider = cfg.provider.as_ref();
-    let asr = build_asr_client(&cfg.asr, provider)?;
-    let llm = build_llm_client(&cfg.llm, provider)?;
-    let tts = build_tts_client(&cfg.tts, provider)?;
+    let (asr, llm, tts) = voice_server::build_all_for_kind(&cfg)?;
 
     let static_dir =
         resolve_web_static_dir(cli.web_static_dir.as_deref()).unwrap_or_else(|| std::path::PathBuf::from("./static"));
@@ -148,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
     );
     info!(
         target: "voice_server",
-        ws_url = format!("ws://127.0.0.1:{}/ws/voice/web/demo", cfg.server.port),
+        ws_url = format!("ws://127.0.0.1:{}/ws/voice/web/admin", cfg.server.port),
         ws_format = "ws://host:port/ws/{business}/{actor}/{connid}",
         "WebSocket 路由"
     );

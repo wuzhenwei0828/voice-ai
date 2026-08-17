@@ -1,5 +1,5 @@
 // voice-app frontend — LLM+TTS 单能力 tab
-// 输入文本 → POST /test/llm_tts → 累积 audio chunk → 拼成 WAV → 播放/下载
+// 输入文本 → POST /admin/llm_tts → 累积 audio chunk → 拼成 WAV → 播放/下载
 // （接口只输出 TTS 音频，LLM 中间文本在服务端日志可见）
 
 (function () {
@@ -29,8 +29,8 @@
     textEl.disabled = true;
     reset();
     try {
-      status.textContent = '调用 /test/llm_tts ...';
-      const resp = await fetch('/test/llm_tts', {
+      status.textContent = '调用 /admin/llm_tts ...';
+      const resp = await fetch('/admin/llm_tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text }),
