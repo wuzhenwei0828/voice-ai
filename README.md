@@ -70,7 +70,7 @@ RUST_LOG=info cargo run -p voice-client --bin voice_terminal -- \
   --file test.wav
 ```
 
-打断：在终端 demo 运行时按 `q` + Enter 触发 Interrupt。
+打断：在终端 demo 运行时按 `q` + Enter 触发 Interrupt；浏览器前端「打断」按钮 = 同一逻辑（发 WS Interrupt + 清本地 TTS 队列）。浏览器侧的**跨句打断**走自动路径：新问句 ASR `is_final` + 非空文本 → 前端只清本地 TTS 队列 + 停止播放，**不发** WS Interrupt（服务端自有 pipeline cancel 逻辑：非空 ASR → cancel 上一个 LLM/TTS pipeline，见 `session.rs::run_pipeline`）。
 
 ### 4. 观察日志（每个关键节点都有）
 
@@ -104,7 +104,7 @@ INFO voice_server.service: WS 断开，移除 session
 |------|------|------|
 | Phase 1 MVP | ✅ | VoicePayload + ASR 文本 |
 | Phase 2 半双工对话 | ✅ | LLM 流式 + TTS 流式 + 按句切分 |
-| Phase 3 全双工 | ⏳ 部分 | 打断机制（服务端支持 Interrupt），客户端 VAD 还在浏览器侧做 |
+| Phase 3 全双工 | ⏳ 部分 | 打断机制（服务端支持 Interrupt + 新问句自动 cancel 旧 pipeline），客户端 VAD 还在浏览器侧做；前端 TTS 跨句自动打断（本地清队列）已实现 |
 | Phase 4 生产化 | ❌ | 限流、监控、审核、多租户未做 |
 
 ## 单能力验证接口
@@ -131,13 +131,54 @@ curl -sN -X POST http://localhost:8080/test/tts \
   -d '{"text":"你好世界"}' | jq -c '{seq, is_last, len:(.audio|length)}'
 ```
 
+## 前端 TTS 播放与跨句打断设计
+
+**问题**：后端把一句话切成多个 PCM chunk 流式下发（每个 chunk 都是句子的一个片段，不是整句）。如果前端给 `<audio>` 直接换 `src = 新 blob` 来播每个 chunk，会出现：
+- 同一句内的 chunk 互相截断（每个新 chunk 立即覆盖上一个正在播的 `src`，只剩最后一个 chunk 能完整播完 → "你好！有..." 只剩 "你好"）
+- 每次换 src 都会让上一个 `play()` 的 Promise 以 `AbortError` reject，console 刷错误日志
+
+**方案**（实现见 `crates/voice-server/static/app.js`）：
+
+```
+                  ┌──────────────────────────────┐
+                  │  WS 收到 TtsAudio{seq,data}  │
+                  └──────────────┬───────────────┘
+                                 ▼
+                wrapPcmAsWav → Blob → URL.createObjectURL
+                                 ▼
+                       push 到 ttsQueue[]
+                                 ▼
+                  ┌──── 队空? ────┐
+                  │               │
+                是                否（正在播）
+                  │               │
+                  ▼               ▼
+                return        audioElement.play() 后
+                （标记         onended/onerror 链
+                ttsPlaying     下一条
+                =false）
+```
+
+**句内顺序播放**：TTS 的多个 chunk 进 `ttsQueue`，`playNextTts()` 在 `onended` / `onerror` 触发下一条；`play()` 的 `AbortError` 静默处理（属正常打断），其他错误打 warn；每条播完 / 失败 / 被打断都 `URL.revokeObjectURL()`，避免 blob URL 泄漏。
+
+**跨句打断**（barge-in）：
+- 用户说话 → 客户端 VAD 句尾 → 发 `AudioChunk.is_last=true`
+- 服务端起新 pipeline → 新 ASR 拿到非空文本 → `current_real_cancel.replace(...)` + `prev.cancel()`（见 `crates/voice-server/src/session.rs::run_pipeline`）→ 旧 LLM/TTS pipeline 在 `tokio::select!` 的 `cancel.cancelled()` 分支醒来并 `return`
+- 服务端不再生成旧回答的 TTS chunk
+- 前端在 ASR `is_final` + **非空文本**（过滤噪音 / 静音段）时调 `stopTtsPlayback()`：清空 `ttsQueue` + revoke 队列里所有 blob URL + 停当前播放 + 复位扬声器 badge
+- **不发 WS Interrupt** —— 服务端有自己的 pipeline cancel 链路，前端多发一次是抢跑，会让新一轮 pipeline 在刚 spawn 那一刻就被错误地终止
+
+**显式 Interrupt**（"打断"按钮）：仍然发 WS Interrupt + `stopTtsPlayback()`，与 CLI `q` 同义。
+
+**已知改进点**：`<audio>` + onended 链式排队在 chunk 之间可能有几十毫秒间隙；若要无缝可改 Web Audio API（`AudioContext` + `AudioBufferSourceNode` 时间戳排程），本次未做。
+
 ## 关键设计决策
 
 1. **VoicePayload 用 enum + tag** —— 上行（音频流）和下行（ASR/LLM/TTS 结果）共用一个 wire format
 2. **不用 webproto 改 webproto** —— VoicePayload 定义在 `voice-proto` crate 内，复用 webproto 的 `Message<VoicePayload>` 信封（向后兼容）
 3. **AudioChunk 用 Indication 单向推** —— 高频上行避免每个分片带 event_id
 4. **状态机 Idle/Listening/Processing/Speaking** —— 简化版（实际 Listening 和 Processing/Speaking 互不冲突，可以并发）
-5. **CancellationToken 打断** —— 任何阶段被 Interrupt 即停；目前未在 TTS chunk-by-chunk 上做取消（下一段 LLM 不再生成即可）
+5. **CancellationToken 打断** —— 任何阶段被 Interrupt 即停；服务端还有「新 ASR 拿到非空文本 → 自动 cancel 旧 LLM/TTS pipeline」的链式机制，前端不需要再发 Interrupt。**TTS chunk-by-chunk 的取消**：浏览器前端用播放队列（同一 utterance 内的 chunk 顺序播放到完，新 utterance 到来时整队列 + 当前播放一次清空），不再用「换 src 打断 play()」的反模式（会产生 AbortError 并截断音频）
 6. **logging 全面覆盖** —— SessionStart/AudioChunk/VAD/ASR partial+final/LLM delta/切句/TTS chunk/SessionEnd/Interrupt/状态转换/WsConnect/WsDisconnect 全打 `tracing::*!`
 
 ## 已知 bug 与改进点

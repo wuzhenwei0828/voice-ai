@@ -1,0 +1,36 @@
+# voice-server 配置
+# 字段名与 async-openai::OpenAIConfig 对齐：api_base / api_key
+# 顶层 `provider` 是 asr/llm/tts 的连接级默认值（被 per-section 字段覆盖）
+
+log:
+  level: info
+  file: ../../logs/voice-server.log          # 相对 src/config/config.yaml → crates/voice-server/logs/
+  format: text                             # text | json
+
+server:
+  port: 8080
+  worker_num: 3
+
+# 连接级默认：所有 client 都走这个 api_base / api_key
+# 单独 section 可以覆盖
+provider:
+  api_base: "https://api.siliconflow.cn/v1"
+  api_key: "sk-****"
+  timeout_ms: 30000
+  headers:
+    X-Region: cn-beijing
+
+# ASR：multipart/form-data 上传音频 → {"text": "..."}
+asr:
+  model: "FunAudioLLM/SenseVoiceSmall"
+
+# LLM：流式 chat completion
+llm:
+  model: "Qwen/Qwen2.5-7B-Instruct"
+
+# TTS：文本 → 音频（手搓 reqwest，因为 Voice 字段要传自定义字符串如 "fnlp/MOSS-TTSD-v0.5:alex"）
+tts:
+  model: "FunAudioLLM/CosyVoice2-0.5B"
+  voice: "FunAudioLLM/CosyVoice2-0.5B:alex"
+  response_format: "pcm"
+  stream: true

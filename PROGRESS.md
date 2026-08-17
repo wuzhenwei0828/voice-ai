@@ -12,7 +12,7 @@
 ```
 Phase 1 MVP ████████████████████ 100% (4/4)   ✅ 完成
 Phase 2 半双工 ██████████████░░░░░░  66% (2/3)  ⚠️ 还差 TTS 存盘
-Phase 3 全双工 ████████████░░░░░░░░  75% (3/4)  ⚠️ 客户端 VAD：能量 MVP 已就绪，待接采集端
+Phase 3 全双工 ████████████░░░░░░░░  75% (3/4)  ⚠️ 客户端 VAD：能量 MVP 已就绪，待接采集端；浏览器侧 TTS 句内顺序播放 + 跨句打断已实现
 Phase 4 生产化 ░░░░░░░░░░░░░░░░░░░░   0% (0/4)  ❌ 未开始
 ```
 
@@ -88,7 +88,7 @@ voice-app/
 | 步骤 | 状态 | 文件 | 备注 |
 |------|------|------|------|
 | 8. 客户端 VAD | ⚠️ | `voice-client/src/vad.rs`（`VoiceActivityDetector` trait + `EnergyVad`） | 能量阈值 MVP 已实现 + 单测；待接入采集端；Silero VAD（ONNX）作后续增强 |
-| 9. 打断机制 | ✅ | 服务端 `session.rs::CancellationToken` + 客户端 `voice_terminal.rs::Interrupt` | CLI 输入 `q` 触发 |
+| 9. 打断机制 | ✅ | 服务端 `session.rs::CancellationToken`（含「新 ASR 拿到非空文本 → 自动 cancel 旧 LLM/TTS pipeline」）+ 客户端 `voice_terminal.rs::Interrupt` | CLI 输入 `q` 触发；浏览器前端「打断」按钮 = 同 WS Interrupt + 清本地 TTS 队列；**跨句自动打断**：ASR `is_final` + 非空文本 → 只清本地 TTS 队列，**不**发 WS Interrupt（由服务端 cancel 链路兜底） |
 | 10. LLM 按句切分送 TTS | ✅ | `session.rs::next_sentence_end` | 按 `。！？.? !` 切，**中文句号也要切** |
 | 11. ASR partial 实时上屏 | ✅ | 服务端流式 `AsrPartial { is_final: false }` + 客户端 `on_payload` 区分 |
 
@@ -194,6 +194,7 @@ VOICE_<ASR|LLM|TTS>_MODEL             # model
 
 - **Pipeline 异步顺序**：当前 ASR 串 LLM 串 TTS（除了 TTS 内部 chunk 并行）；Phase 2 pipeline overlap 已经实现（LLM 按句切分，TTS 边出边推）
 - **reqwest Client 每次新建**：每个请求 `reqwest::Client::new()` 有 TLS 握手开销，应该复用同一个 Client
+- **前端 TTS 句间可能微间隙**：`<audio>` + onended 链式排队在每句 chunk 之间会有几十毫秒间隙；若要无缝可改 Web Audio API（`AudioContext` + `AudioBufferSourceNode` 时间戳排程），本次未做
 
 ### 测试
 
