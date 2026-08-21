@@ -49,6 +49,9 @@ pub mod pb {
 pub use asr::{
     ArcAsr, AsrClient, AsrEvent, AsrModelAdapter, ClientError, BoxStream,
 };
+pub use asr::asr_ws_pool::{
+    AsrPoolConfig, AsrWsError, AsrWsPool, WsPool,
+};
 pub use codec::{
     CodecError, GaxFrame, REQ_AUDIO_ASR, REQ_OPEN_ASR, REQ_OPEN_TTS,
     REQ_STOP_ASR, REQ_STOP_TTS, REQ_TEXT_TTS, RESP_AUDIO_TTS, RESP_DONE_TTS,
@@ -63,5 +66,5 @@ pub use tts::{
     ArcTts, RealtimeEventHint, ServerEventHint, TtsClient, TtsEvent, TtsModelAdapter, TtsProtocol,
 };
 pub use ws_pool::{
-    Dialer, LaneKind, PoolConfig as WsPoolConfig, PoolError, WebSocketLike, WsPool,
+    Dialer, LaneKind, PoolConfig as WsConnPoolConfig, PoolError, WebSocketLike, WsConnPool,
 };

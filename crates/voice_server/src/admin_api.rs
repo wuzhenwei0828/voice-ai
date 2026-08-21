@@ -28,7 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 use crate::client::{asr::wrap_pcm_as_wav, ArcAsr, ArcLlm, ArcTts, ClientError};
-use crate::session::{next_sentence_end, AsrEvent, LlmEvent};
+use crate::session::{next_sentence_end, parse_asr_emotion_tags, AsrEvent, LlmEvent};
 
 // ====== 请求 / 响应结构 ======
 
@@ -361,7 +361,7 @@ pub async fn llm(
     info!(target: "voice_server.admin_api", endpoint = "llm", session_id = %sid, prompt_len = req.prompt.chars().count(), "/admin/llm 收到请求");
 
     let stream = llm
-        .chat(&sid, &req.prompt)
+        .chat(&sid, &req.prompt, None)
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
 
@@ -517,7 +517,8 @@ pub async fn llm_tts(
     let prompt = req.text.clone();
     let sid_inner = sid.clone();
 
-    let items = llm_tts_items(prompt, sid_inner, llm.get_ref().clone(), tts.get_ref().clone());
+    // /admin/llm_tts 是直接调 LLM，不经过 ASR，没有情绪标签可解析
+    let items = llm_tts_items(prompt, None, sid_inner, llm.get_ref().clone(), tts.get_ref().clone());
 
     Ok(HttpResponse::Ok()
         .content_type("application/x-ndjson")
@@ -549,15 +550,19 @@ fn llm_tts_lines(
 /// 供 /admin/llm_tts、/admin/asr_llm_tts 与 session.rs 的 WS pipeline 共用
 /// （后两者额外透出 Llm 文本事件）。
 /// 接受 Arc 而非 &Arc 是因为 actix-web 的 streaming() 要求 `Stream + 'static`，Arc 便宜 clone。
+///
+/// `emotion_hint`：从 ASR 文本里解析出来的说话人情绪（参见 `session::parse_asr_emotion_tags`），
+/// 作为 system message 的参考传给 LLM。`None` 表示无情绪（如 `/admin/llm_tts` 直接调用的场景）。
 pub fn llm_tts_items(
     prompt: String,
+    emotion_hint: Option<String>,
     sid: String,
     llm: ArcLlm,
     tts: ArcTts,
 ) -> impl Stream<Item = LlmTtsItem> + 'static {
     stream! {
         // 阶段 1: 拉 LLM 流
-        let mut llm_stream = match llm.chat(&sid, &prompt).await {
+        let mut llm_stream = match llm.chat(&sid, &prompt, emotion_hint.as_deref()).await {
             Ok(s) => s,
             Err(e) => {
                 warn!(target: "voice_server.admin_api", endpoint = "llm_tts", session_id = %sid, "LLM 调用失败: {}", e);
@@ -748,8 +753,24 @@ fn build_asr_llm_tts_stream(
             return;
         }
 
+        // 解析 ASR 情绪标签（如 <|zh|><|SAD|><|Speech|>...），情绪作为 system message 传给 LLM
+        let parsed = parse_asr_emotion_tags(&prompt);
+        if parsed.text.is_empty() {
+            yield ndjson_line(&ErrorLine { error: "asr result empty after stripping tags".to_string(), code: 1001 })?;
+            return;
+        }
+        if parsed.emotion.is_some() {
+            info!(
+                target: "voice_server.admin_api",
+                endpoint = "asr_llm_tts",
+                session_id = %sid,
+                emotion = ?parsed.emotion,
+                "ASR 文本含情绪标签"
+            );
+        }
+
         // 阶段 2+3: 复用 LLM→TTS 管线
-        let mut items = Box::pin(llm_tts_items(prompt, sid.clone(), llm, tts));
+        let mut items = Box::pin(llm_tts_items(parsed.text, parsed.emotion, sid.clone(), llm, tts));
         while let Some(item) = items.next().await {
             match item {
                 LlmTtsItem::Llm { delta, is_final } => {

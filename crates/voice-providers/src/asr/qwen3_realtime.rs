@@ -184,7 +184,7 @@ use async_stream::stream;
 use tokio::sync::mpsc;
 
 use crate::asr::BoxStream;
-use crate::ws_pool::{Dialer, LaneKind, WsMessage, WsPool};
+use crate::ws_pool::{Dialer, LaneKind, WsMessage, WsConnPool};
 
 /// 客户端 → 后台任务的命令
 #[derive(Debug)]
@@ -226,7 +226,7 @@ impl RealtimeAsrSession {
 ///    - `recv_message()` 的 Text 事件 → 解析后推 event_tx；`session.finished` 终止
 /// 4. 终止时连接按 clean/errored 决定归还或关闭
 pub async fn start_realtime_session(
-    pool: Arc<WsPool>,
+    pool: Arc<WsConnPool>,
     adapter: Qwen3RealtimeAdapter,
     dialer: Dialer,
     sample_rate: u32,

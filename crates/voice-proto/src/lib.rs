@@ -42,6 +42,16 @@ pub enum VoicePayload {
         session_id: String,
     },
 
+    // ---- 下行：服务端 → 客户端（握手 ack）----
+    /// 服务端处理 `SessionStart` 后返回的握手 ack。
+    /// 客户端应等收到 `success=true` 的 ack 再开始推 PCM；
+    /// `success=false` 时附 `message` 描述失败原因（缺 endpoint / 上游 WSS 失败 / 等）。
+    SessionAck {
+        session_id: String,
+        success: bool,
+        message: String,
+    },
+
     // ---- 上行：客户端 → 服务端（音频流）----
     // data 用 serde_bytes 走 msgpack bin8/16/32，比 Vec<u8> 默认的 "array of u8s" 节省 ~2x 体积。
     // 通过 #[serde(with = "serde_bytes")] 包裹即可，无须改字段类型，调用方仍可用 Vec<u8>。
@@ -57,8 +67,15 @@ pub enum VoicePayload {
     // ---- 下行：服务端 → 客户端（流式结果）----
     AsrPartial {
         session_id: String,
+        /// incremental 增量（FunASR 累积文本 → server 端转 delta 后下发）。
+        /// `is_final=true` 时若 `replace_last=false`：携带整个句子文本，作为新一行 final 提交。
+        /// `is_final=true` 且 `replace_last=true`：携带 2pass-offline 二次纠错结果，替换最近一条 final 行（不要新增）。
         text: String,
         is_final: bool,
+        /// 2pass-offline 二次纠错专用：true 表示用 text 替换最近一条 final 行（不要 append 新行）。
+        /// 其它情况为 false。#[serde(default)] 保证旧客户端 / 旧消息可正常解析。
+        #[serde(default)]
+        replace_last: bool,
     },
     LlmDelta {
         session_id: String,
@@ -88,7 +105,8 @@ impl VoicePayload {
             | VoicePayload::AudioChunk { session_id, .. }
             | VoicePayload::AsrPartial { session_id, .. }
             | VoicePayload::LlmDelta { session_id, .. }
-            | VoicePayload::TtsAudio { session_id, .. } => Some(session_id),
+            | VoicePayload::TtsAudio { session_id, .. }
+            | VoicePayload::SessionAck { session_id, .. } => Some(session_id),
             VoicePayload::Error { .. } => None,
         }
     }
@@ -157,5 +175,41 @@ mod tests {
 
         let e = VoicePayload::Error { code: 1, message: "x".into() };
         assert_eq!(e.session_id(), None);
+    }
+
+    #[test]
+    fn round_trip_session_ack() {
+        let p = VoicePayload::SessionAck {
+            session_id: "abc".into(),
+            success: true,
+            message: String::new(),
+        };
+        let bytes = encode_indication(&p).unwrap();
+        let (_kind, decoded) = decode_payload(&bytes).unwrap();
+        match decoded {
+            VoicePayload::SessionAck { session_id, success, message } => {
+                assert_eq!(session_id, "abc");
+                assert!(success);
+                assert_eq!(message, "");
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // 失败 ack
+        let p_fail = VoicePayload::SessionAck {
+            session_id: "abc".into(),
+            success: false,
+            message: "missing api_key".into(),
+        };
+        let bytes = encode_indication(&p_fail).unwrap();
+        let (_kind, decoded) = decode_payload(&bytes).unwrap();
+        match decoded {
+            VoicePayload::SessionAck { session_id, success, message } => {
+                assert_eq!(session_id, "abc");
+                assert!(!success);
+                assert_eq!(message, "missing api_key");
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }

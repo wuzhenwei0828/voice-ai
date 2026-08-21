@@ -44,3 +44,4 @@ parking_lot = "0.12"
 bytes = "1"
 prost = "0.13"
 prost-build = "0.13"
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }

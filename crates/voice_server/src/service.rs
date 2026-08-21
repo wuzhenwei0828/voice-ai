@@ -17,6 +17,7 @@ use voice_proto::decode_payload;
 use webhttp::websocket::{ActorMsg, OutMessage};
 use webhttp::{ServiceCallback, WsData};
 
+use crate::agent::LlmAgent;
 use crate::client::ArcAsr;
 use crate::client::ArcLlm;
 use crate::client::ArcTts;
@@ -24,7 +25,10 @@ use crate::session::VoiceSession;
 
 pub struct VoiceService {
     pub asr: ArcAsr,
+    /// 裸 LlmClient，给 admin endpoints 用（无记忆）
     pub llm: ArcLlm,
+    /// LlmAgent，session pipeline 用（带 per-session 短期记忆）
+    pub agent: Arc<LlmAgent>,
     pub tts: ArcTts,
     /// session_id -> VoiceSession
     sessions: DashMap<String, VoiceSession>,
@@ -40,7 +44,7 @@ pub struct VoiceService {
 }
 
 impl VoiceService {
-    pub fn new(asr: ArcAsr, llm: ArcLlm, tts: ArcTts) -> Self {
+    pub fn new(asr: ArcAsr, llm: ArcLlm, agent: Arc<LlmAgent>, tts: ArcTts) -> Self {
         let pipeline_tasks = Arc::new(Mutex::new(JoinSet::new()));
 
         // janitor：循环 join_next，已完成的任务自动从 set 移除；panic 转 error 日志。
@@ -83,6 +87,7 @@ impl VoiceService {
         Self {
             asr,
             llm,
+            agent,
             tts,
             sessions: DashMap::new(),
             web_static_dir: None,
@@ -125,12 +130,6 @@ impl ServiceCallback for VoiceService {
                         .route("/tts", web::post().to(crate::admin_api::tts))
                         .route("/llm_tts", web::post().to(crate::admin_api::llm_tts))
                         .route("/asr_llm_tts", web::post().to(crate::admin_api::asr_llm_tts))
-                )
-                // 实时流式 ASR（qwen3-asr-flash-realtime）独立 WS 端点，
-                // 与 /ws/voice/* 的 VoicePayload pipeline 互不影响；必须先于 Files 注册
-                .service(
-                    web::scope("/stream")
-                        .route("/asr", web::to(crate::asr_stream_api::ws_asr_stream))
                 );
 
         if let Some(path) = &self.web_static_dir {
@@ -174,13 +173,20 @@ impl ServiceCallback for VoiceService {
                 };
                 debug!(target: "voice_server.service", session_id = %session_id, ?kind, "收到 WS 消息");
 
+                // live-asr 业务：复用 webhttp 路由 + voice-providers WsConnPool 跨会话复用
+                // （公共协议：fun-asr / qwen-audio-3.0 / paraformer，docs L3289）
+                if business == "live-asr" {
+                    crate::live_asr_api::handle_message(addr, session_id, payload);
+                    return Ok(ActorMsg::Ok);
+                }
+
                 // 找/建 session
                 let mut entry = self.sessions.entry(session_id.clone()).or_insert_with(|| {
                     info!(target: "voice_server.service", session_id = %session_id, "新建 VoiceSession");
                     VoiceSession::new(
                         session_id.clone(),
                         self.asr.clone(),
-                        self.llm.clone(),
+                        self.agent.clone(),
                         self.tts.clone(),
                         addr,
                     )

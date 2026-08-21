@@ -16,7 +16,7 @@ use voice_providers::codec::GaxFrame;
 use voice_providers::pb::TtsAudioChunk;
 use voice_providers::tts::TtsEvent;
 use voice_providers::ws_pool::test_helpers::MockWs;
-use voice_providers::ws_pool::{Dialer, LaneKind, PoolConfig, WebSocketLike, WsMessage, WsPool};
+use voice_providers::ws_pool::{Dialer, LaneKind, PoolConfig, WebSocketLike, WsMessage, WsConnPool};
 
 // ===== helpers =====
 
@@ -48,7 +48,7 @@ fn binary(bytes: Vec<u8>) -> WsMessage {
 
 #[tokio::test]
 async fn qwen_audio_tts_pipeline_full_flow() {
-    let pool = WsPool::new(PoolConfig {
+    let pool = WsConnPool::new(PoolConfig {
         max_connections: 2,
         ..PoolConfig::default()
     });
@@ -99,7 +99,7 @@ async fn qwen_audio_tts_pipeline_full_flow() {
 
 #[tokio::test]
 async fn qwen_audio_tts_task_failed_propagates_error() {
-    let pool = WsPool::new(PoolConfig {
+    let pool = WsConnPool::new(PoolConfig {
         max_connections: 1,
         ..PoolConfig::default()
     });
@@ -138,7 +138,7 @@ async fn qwen_audio_tts_task_failed_propagates_error() {
 
 #[tokio::test]
 async fn cosyvoice_v3_routes_to_json_duplex() {
-    let pool = WsPool::new(PoolConfig {
+    let pool = WsConnPool::new(PoolConfig {
         max_connections: 1,
         ..PoolConfig::default()
     });
@@ -172,7 +172,7 @@ async fn cosyvoice_v3_routes_to_json_duplex() {
 
 #[tokio::test]
 async fn qwen_audio_tts_peer_close_returns_err() {
-    let pool = WsPool::new(PoolConfig {
+    let pool = WsConnPool::new(PoolConfig {
         max_connections: 1,
         ..PoolConfig::default()
     });
@@ -211,7 +211,7 @@ async fn qwen_audio_tts_peer_close_returns_err() {
 async fn qwen_realtime_pipeline_decodes_base64_audio() {
     use base64::Engine as _;
 
-    let pool = WsPool::new(PoolConfig {
+    let pool = WsConnPool::new(PoolConfig {
         max_connections: 1,
         ..PoolConfig::default()
     });
@@ -255,7 +255,7 @@ async fn qwen_realtime_pipeline_decodes_base64_audio() {
 
 #[tokio::test]
 async fn qwen_realtime_error_propagates() {
-    let pool = WsPool::new(PoolConfig {
+    let pool = WsConnPool::new(PoolConfig {
         max_connections: 1,
         ..PoolConfig::default()
     });
@@ -294,7 +294,7 @@ async fn qwen_realtime_error_propagates() {
 async fn cosyvoice_v2_gax_legacy_still_works() {
     use voice_providers::codec::{RESP_AUDIO_TTS, RESP_DONE_TTS};
 
-    let pool = WsPool::new(PoolConfig {
+    let pool = WsConnPool::new(PoolConfig {
         max_connections: 1,
         ..PoolConfig::default()
     });

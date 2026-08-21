@@ -3,7 +3,7 @@
 //! Wire format（OpenAI-Whisper 兼容）：multipart/form-data
 //!   - file: 音频字节
 //!   - model: 模型 ID
-//! response: `{"text": "..."}`
+//!   response: `{"text": "..."}`
 
 use async_openai::config::{Config, OpenAIConfig};
 use async_openai::error::OpenAIError;
@@ -116,6 +116,23 @@ impl AsrClient for HttpAsrClient {
                                 re.is_connect(),
                             )
                         }
+                        // async-openai 拿到非 OpenAI 格式的 error body 时走这里：
+                        // 上游（FunASR / FastAPI 默认 / 自定义）返回 `{"detail": ...}` / `{"message": ...}`，
+                        // 没有顶层 `error` 字段，serde 反序列化为 ApiErrorResponse 失败。
+                        // 注意：原始 body 已被 async-openai 丢掉，只能从 serde err 看到 "格式不对"，
+                        // 真正的 server-side 错误细节仍需看上游日志（或用 reqwest 拦截 raw body）。
+                        OpenAIError::JSONDeserialize(de) => (
+                            Some(format!(
+                                "upstream 返回非 OpenAI 错误格式（缺少 error 字段）: {}",
+                                de
+                            )),
+                            Some("non_openai_error_format".to_string()),
+                            None,
+                            None,
+                            None,
+                            false,
+                            false,
+                        ),
                         _ => (None, None, None, None, None, false, false),
                     };
                 warn!(

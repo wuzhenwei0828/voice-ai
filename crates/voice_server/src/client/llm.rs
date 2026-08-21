@@ -1,87 +1,200 @@
-//! LLM 客户端：基于 `async-openai::chat().create_stream()`
+//! LLM 客户端：手搓 reqwest 调 OpenAI-compat SSE 聊天接口
+//!
+//! 之所以不用 async-openai：`async-openai::chat().create_stream()` 内部把
+//! `reqwest_eventsource::EventSource`（持有 `reqwest::Response`）放进独立
+//! `tokio::spawn` 任务，再用 mpsc 把事件转发给消费者。当上游 pipeline 被
+//! `CancellationToken` 取消时，外层 stream 被 drop，但 spawned 任务要等下一次
+//! 事件 send 失败后才会调用 `event_source.close()` —— **HTTP 连接不会立刻关闭**，
+//! LLM 服务端会继续生成到自然结束。auto-interrupt 就表现为"打断不起作用"。
+//!
+//! 这里直接 `await reqwest::Response::bytes_stream()` 解析 SSE，stream 被 drop
+//! 时立刻 abort HTTP 连接，cancel 才真正生效。
 //!
 //! Wire format（OpenAI-compat）：JSON `{model, messages, stream: true}` + SSE 响应
 
-use async_openai::config::{Config, OpenAIConfig};
-use async_openai::error::OpenAIError;
-use async_openai::types::{ChatCompletionRequestMessage, CreateChatCompletionRequest};
-use async_openai::Client;
+use async_stream::stream;
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
+use reqwest::{Client, Method};
+use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info};
 
 use crate::client::error::ClientError;
-use crate::config::{llm_openai, LlmConfig, ProviderConfig};
+use crate::config::{LlmConfig, ProviderConfig};
 use crate::session::LlmEvent;
 
-pub type BoxStream<T> = Pin<Box<dyn futures_util::Stream<Item = T> + Send>>;
+pub type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
 pub type ArcLlm = Arc<dyn LlmClient>;
+
+/// 单条 chat 消息（OpenAI-compat 协议）。`role` 取 `"system"` / `"user"` / `"assistant"`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
 
 #[async_trait]
 pub trait LlmClient: Send + Sync {
+    /// 便利方法：单轮对话。`emotion_hint` 会作为 system message 拼到 prompt 前面。
+    /// 内部会构造 `[emotion_system?, user]` 两/一条消息后转给 [`chat_with_messages`]。
     async fn chat(
         &self,
         session_id: &str,
         prompt: &str,
+        emotion_hint: Option<&str>,
+    ) -> Result<BoxStream<Result<LlmEvent, ClientError>>, ClientError>;
+
+    /// 原始入口：调用方（典型场景：agent 多轮对话）预构造消息数组（含历史 + system + 当前 user），
+    /// 直接发给上游 LLM；本方法不做 emotion system 等封装。
+    async fn chat_with_messages(
+        &self,
+        session_id: &str,
+        messages: &[ChatMessage],
     ) -> Result<BoxStream<Result<LlmEvent, ClientError>>, ClientError>;
 }
 
 pub struct HttpLlmClient {
-    openai: OpenAIConfig,
-    client: Client<OpenAIConfig>,
+    api_base: String,
+    api_key: String,
     model: String,
-    // 注意：async-openai 暂不暴露往请求里塞自定义 header 的口子，
-    // 所以 provider / llm.headers 配置项在 LLM 这里先不消费；TTS 走手搓 reqwest 所以能用。
+    headers: reqwest::header::HeaderMap,
+    http: Client,
 }
 
 impl HttpLlmClient {
-    pub fn new(openai: OpenAIConfig, model: String) -> Self {
-        let client = Client::with_config(openai.clone());
-        Self { openai, client, model }
+    pub fn new(resolved: ProviderConfig, model: String) -> Self {
+        let api_base = resolved.api_base.clone();
+        let api_key = resolved.api_key.clone();
+        let headers = resolved.to_header_map();
+        let http = Client::builder()
+            .timeout(resolved.timeout())
+            .build()
+            .expect("reqwest client builder");
+        Self {
+            api_base,
+            api_key,
+            model,
+            headers,
+            http,
+        }
     }
+}
+
+#[derive(Serialize)]
+struct ChatReq<'a> {
+    model: &'a str,
+    messages: &'a [ChatMessage],
+    stream: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatChunk {
+    #[serde(default)]
+    #[allow(dead_code)]
+    id: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    model: String,
+    #[serde(default)]
+    choices: Vec<ChatChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatChoice {
+    #[serde(default)]
+    delta: ChatDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ChatDelta {
+    #[serde(default)]
+    content: Option<String>,
 }
 
 #[async_trait]
 impl LlmClient for HttpLlmClient {
+    /// 便利方法：单轮对话。构造 emotion system + user 两条消息后转给 [`chat_with_messages`]。
     async fn chat(
         &self,
         session_id: &str,
         prompt: &str,
+        emotion_hint: Option<&str>,
     ) -> Result<BoxStream<Result<LlmEvent, ClientError>>, ClientError> {
-        // ===== 请求：把所有发出去的字段都打出来 =====
-        let api_base = self.openai.api_base();
-        let full_url = format!("{}/chat/completions", api_base.trim_end_matches('/'));
-        let prompt_preview: String = prompt.chars().take(500).collect();
+        // 情绪提示：仅用于调整回复的语气/措辞，禁止 LLM 主动告诉用户情绪是什么
+        let mut messages: Vec<ChatMessage> = Vec::with_capacity(2);
+        if let Some(e) = emotion_hint {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: format!(
+                    "[情绪参考] 请据此调整回复的语气和措辞，但**不要在回复中提及、复述或暗示用户当前的情绪**，\
+                     也不要解释你是如何判断的；直接、自然地回答用户的问题即可。\
+                     （用户当前说话的情绪可能是：{e}，仅供你参考，可能不准确）"
+                ),
+            });
+        }
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: prompt.to_string(),
+        });
+
+        self.chat_with_messages(session_id, &messages).await
+    }
+
+    /// 原始入口：调用方预构造消息数组，直接发给上游 LLM。
+    /// 内部负责：拼请求体 → 发 HTTP → 解析 SSE → 返回 stream。
+    async fn chat_with_messages(
+        &self,
+        session_id: &str,
+        messages: &[ChatMessage],
+    ) -> Result<BoxStream<Result<LlmEvent, ClientError>>, ClientError> {
+        let url = format!(
+            "{}/chat/completions",
+            self.api_base.trim_end_matches('/')
+        );
+
+        let body = ChatReq {
+            model: &self.model,
+            messages,
+            stream: true,
+        };
+
+        let messages_count = messages.len();
+        let has_system = messages.iter().any(|m| m.role == "system");
+        // 找最后一条 user message 作为 prompt 预览
+        let user_prompt = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+        let prompt_preview: String = user_prompt.chars().take(500).collect();
         info!(
             target: "voice_server.llm",
             session_id,
             method = "POST",
-            url = %full_url,
+            url = %url,
             model = %self.model,
             stream = true,
-            messages_count = 1usize,
-            prompt_chars = prompt.chars().count(),
+            messages_count,
+            has_system,
+            prompt_chars = user_prompt.chars().count(),
             prompt_preview = %prompt_preview,
             "LLM 请求即将发送"
         );
 
-        let req = CreateChatCompletionRequest {
-            model: self.model.clone(),
-            messages: vec![ChatCompletionRequestMessage::User(prompt.to_string().into())],
-            stream: Some(true),
-            ..Default::default()
-        };
         // ===== 请求体 JSON：方便对照实际发出的 payload =====
-        match serde_json::to_string(&req) {
-            Ok(body) => info!(
+        match serde_json::to_string(&body) {
+            Ok(s) => info!(
                 target: "voice_server.llm.req",
                 session_id,
-                body = %body,
+                body = %s,
                 "LLM 请求体"
             ),
-            Err(e) => warn!(
+            Err(e) => tracing::warn!(
                 target: "voice_server.llm.req",
                 session_id,
                 "LLM 请求体序列化失败: {}",
@@ -89,197 +202,161 @@ impl LlmClient for HttpLlmClient {
             ),
         }
 
-        let mut raw_stream = match self.client.chat().create_stream(req).await {
-            Ok(s) => {
-                info!(
-                    target: "voice_server.llm",
-                    session_id,
-                    "LLM 连接建立，stream 已开始"
-                );
-                s
-            }
-            Err(e) => {
-                let err_text = e.to_string();
-                let (api_message, api_type, api_param, api_code, reqwest_status, is_timeout, is_connect) =
-                    match &e {
-                        OpenAIError::ApiError(api_err) => (
-                            Some(api_err.message.clone()),
-                            api_err.r#type.clone(),
-                            api_err.param.clone(),
-                            api_err.code.clone(),
-                            None,
-                            false,
-                            false,
-                        ),
-                        OpenAIError::Reqwest(re) => {
-                            let s = re.status().map(|s| s.as_u16());
-                            (
-                                None,
-                                None,
-                                None,
-                                None,
-                                s,
-                                re.is_timeout(),
-                                re.is_connect(),
-                            )
-                        }
-                        _ => (None, None, None, None, None, false, false),
-                    };
-                warn!(
-                    target: "voice_server.llm.err",
-                    session_id,
-                    url = %full_url,
-                    error = %err_text,
-                    error_debug = ?e,
-                    api_message = api_message.as_deref().unwrap_or(""),
-                    api_type = api_type.as_deref().unwrap_or(""),
-                    api_param = api_param.as_deref().unwrap_or(""),
-                    api_code = api_code.as_deref().unwrap_or(""),
-                    reqwest_status = reqwest_status.unwrap_or(0),
-                    is_timeout,
-                    is_connect,
-                    "LLM create_stream 失败"
-                );
-                return Err(ClientError::Http(err_text));
-            }
-        };
+        let mut req = self
+            .http
+            .request(Method::POST, &url)
+            .header("Content-Type", "application/json")
+            .json(&body);
+        // 透传 provider/llm 自定义 headers
+        for (k, v) in self.headers.iter() {
+            req = req.header(k, v);
+        }
+        if !self.api_key.is_empty() {
+            let key = self
+                .api_key
+                .strip_prefix("Bearer ")
+                .or_else(|| self.api_key.strip_prefix("bearer "))
+                .unwrap_or(&self.api_key);
+            req = req.header("Authorization", format!("Bearer {}", key));
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(ClientError::Status(status.as_u16()));
+        }
+        info!(
+            target: "voice_server.llm",
+            session_id,
+            "LLM 连接建立，stream 已开始"
+        );
+
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let is_sse = ct.contains("text/event-stream");
 
         let session = session_id.to_string();
-        let stream = async_stream::stream! {
-            let mut chunk_count: u32 = 0;
-            let mut total_delta_chars: usize = 0;
-            let mut first_chunk_logged = false;
-            while let Some(item) = raw_stream.next().await {
-                chunk_count += 1;
-                match item {
-                    Ok(chunk) => {
-                        // ===== 原始 chunk（JSON）：方便排查 delta 为空 / 字段名差异 =====
-                        match serde_json::to_string(&chunk) {
-                            Ok(raw) => info!(
-                                target: "voice_server.llm.resp",
-                                session_id = %session,
-                                seq = chunk_count,
-                                raw = %raw,
-                                "LLM 原始 chunk"
-                            ),
-                            Err(e) => warn!(
-                                target: "voice_server.llm.resp",
-                                session_id = %session,
-                                seq = chunk_count,
-                                "LLM chunk 序列化失败: {}",
-                                e
-                            ),
-                        }
-                        // 首个 chunk 多打一行摘要（id / model / choices 数）
-                        if !first_chunk_logged {
-                            first_chunk_logged = true;
-                            info!(
-                                target: "voice_server.llm.resp",
-                                session_id = %session,
-                                chunk_id = %chunk.id,
-                                chunk_model = %chunk.model,
-                                choices_count = chunk.choices.len(),
-                                "LLM 首个 chunk 摘要"
-                            );
-                        }
-
-                        let (delta, is_final) = chunk
-                            .choices
-                            .into_iter()
-                            .next()
-                            .map(|c| {
-                                let d = c.delta.content.unwrap_or_default();
-                                let fin = c.finish_reason.is_some();
-                                (d, fin)
-                            })
-                            .unwrap_or_default();
-                        total_delta_chars += delta.chars().count();
-                        info!(
-                            target: "voice_server.llm",
-                            session_id = %session,
-                            seq = chunk_count,
-                            delta_len = delta.chars().count(),
-                            is_final = is_final,
-                            delta = %delta,
-                            "收到 LLM delta"
-                        );
-                        yield Ok(LlmEvent { delta, is_final });
-                    }
-                    Err(e) => {
-                        let err_text = e.to_string();
-                        let (api_message, api_type, api_param, api_code, reqwest_status, is_timeout, is_connect) =
-                            match &e {
-                                OpenAIError::ApiError(api_err) => (
-                                    Some(api_err.message.clone()),
-                                    api_err.r#type.clone(),
-                                    api_err.param.clone(),
-                                    api_err.code.clone(),
-                                    None,
-                                    false,
-                                    false,
-                                ),
-                                OpenAIError::Reqwest(re) => {
-                                    let s = re.status().map(|s| s.as_u16());
-                                    (
-                                        None,
-                                        None,
-                                        None,
-                                        None,
-                                        s,
-                                        re.is_timeout(),
-                                        re.is_connect(),
-                                    )
+        let stream: Pin<Box<dyn Stream<Item = Result<LlmEvent, ClientError>> + Send>> = if is_sse {
+            let mut sse_buf: Vec<u8> = Vec::new();
+            let mut byte_stream = Box::pin(resp.bytes_stream());
+            Box::pin(stream! {
+                let mut chunk_count: u32 = 0;
+                let mut total_delta_chars: usize = 0;
+                while let Some(chunk_res) = byte_stream.next().await {
+                    let chunk = match chunk_res {
+                        Ok(c) => c,
+                        Err(e) => { yield Err(ClientError::Http(e.to_string())); return; }
+                    };
+                    sse_buf.extend_from_slice(&chunk);
+                    // 按行切分（SSE 事件以 \n 分隔）；同时支持 \r\n
+                    while let Some(pos) = sse_buf.iter().position(|&b| b == b'\n') {
+                        let mut line: Vec<u8> = sse_buf.drain(..=pos).collect();
+                        // 去掉换行符
+                        line.pop();
+                        if line.last() == Some(&b'\r') { line.pop(); }
+                        if line.starts_with(b"data: ") {
+                            let payload = &line[6..];
+                            if payload == b"[DONE]" || payload.is_empty() { continue; }
+                            match serde_json::from_slice::<ChatChunk>(payload) {
+                                Ok(c) => {
+                                    if let Some(choice) = c.choices.into_iter().next() {
+                                        let delta = choice.delta.content.unwrap_or_default();
+                                        let is_final = choice.finish_reason.is_some();
+                                        chunk_count += 1;
+                                        total_delta_chars += delta.chars().count();
+                                        info!(
+                                            target: "voice_server.llm",
+                                            session_id = %session,
+                                            seq = chunk_count,
+                                            delta_len = delta.chars().count(),
+                                            is_final,
+                                            delta = %delta,
+                                            "收到 LLM delta"
+                                        );
+                                        if !delta.is_empty() || is_final {
+                                            yield Ok(LlmEvent { delta, is_final });
+                                        }
+                                    }
                                 }
-                                _ => (None, None, None, None, None, false, false),
-                            };
-                        warn!(
-                            target: "voice_server.llm.err",
-                            session_id = %session,
-                            seq = chunk_count,
-                            error = %err_text,
-                            error_debug = ?e,
-                            api_message = api_message.as_deref().unwrap_or(""),
-                            api_type = api_type.as_deref().unwrap_or(""),
-                            api_param = api_param.as_deref().unwrap_or(""),
-                            api_code = api_code.as_deref().unwrap_or(""),
-                            reqwest_status = reqwest_status.unwrap_or(0),
-                            is_timeout,
-                            is_connect,
-                            "LLM 流错误"
-                        );
-                        yield Err(ClientError::Http(err_text));
+                                Err(e) => {
+                                    tracing::warn!(
+                                        target: "voice_server.llm.err",
+                                        session_id = %session,
+                                        error = %e,
+                                        payload = %String::from_utf8_lossy(payload),
+                                        "LLM SSE 解析失败"
+                                    );
+                                    yield Err(ClientError::Decode(e.to_string()));
+                                    return;
+                                }
+                            }
+                        }
+                        // 其他 SSE 字段（event: / id: / retry: / 空行）忽略
                     }
                 }
+                info!(
+                    target: "voice_server.llm",
+                    session_id = %session,
+                    chunk_count,
+                    total_delta_chars,
+                    "LLM 流结束"
+                );
+            })
+        } else {
+            // 非 SSE：尝试单段 JSON
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| ClientError::Http(e.to_string()))?;
+            match serde_json::from_slice::<ChatChunk>(&bytes) {
+                Ok(c) => {
+                    if let Some(choice) = c.choices.into_iter().next() {
+                        let delta = choice.delta.content.unwrap_or_default();
+                        let is_final = choice.finish_reason.is_some();
+                        Box::pin(stream! {
+                            debug!(
+                                target: "voice_server.llm",
+                                session_id = %session,
+                                delta_len = delta.chars().count(),
+                                is_final,
+                                "LLM 非 SSE 单段响应"
+                            );
+                            yield Ok(LlmEvent { delta, is_final });
+                        })
+                    } else {
+                        return Err(ClientError::Decode("no choices in response".into()));
+                    }
+                }
+                Err(e) => return Err(ClientError::Decode(e.to_string())),
             }
-            info!(
-                target: "voice_server.llm",
-                session_id = %session,
-                chunk_count,
-                total_delta_chars,
-                "LLM 流结束"
-            );
         };
 
-        Ok(Box::pin(stream))
+        Ok(stream)
     }
 }
-
-// 注：llm.headers 配置项当前不消费 —— 见 HttpLlmClient 字段上的注释。
 
 pub fn build_llm_client(
     cfg: &LlmConfig,
     provider: Option<&ProviderConfig>,
 ) -> anyhow::Result<Arc<dyn LlmClient>> {
     let resolved = cfg.resolved(provider);
-    let openai = llm_openai(cfg, provider);
+    let timeout_ms = resolved.timeout_ms;
 
     tracing::info!(
         target: "voice_server.factory",
         kind = "http",
         api_base = %resolved.api_base,
         model = %cfg.model,
-        "构造 HttpLlmClient"
+        timeout_ms,
+        "构造 HttpLlmClient（手搓 reqwest，drop stream 立即关闭 HTTP 连接）"
     );
 
-    Ok(Arc::new(HttpLlmClient::new(openai, cfg.model.clone())))
+    Ok(Arc::new(HttpLlmClient::new(resolved, cfg.model.clone())))
 }

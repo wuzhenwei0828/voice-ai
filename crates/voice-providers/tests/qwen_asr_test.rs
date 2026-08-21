@@ -1,4 +1,4 @@
-//! Qwen 系列 ASR adapter 端到端集成测试 —— 走 MockWs + WsPool，
+//! Qwen 系列 ASR adapter 端到端集成测试 —— 走 MockWs + WsConnPool，
 //! 验证 `StreamingAsrClient` 在 Qwen JSON 协议下的完整识别流。
 //!
 //! 覆盖：
@@ -17,7 +17,7 @@ use voice_providers::codec::{
     GaxFrame, WireFormat, REQ_AUDIO_ASR, REQ_OPEN_ASR, RESP_TRANSCRIPT,
 };
 use voice_providers::ws_pool::{
-    Dialer, LaneKind, PoolConfig, PoolError, WebSocketLike, WsPool, WsMessage,
+    Dialer, LaneKind, PoolConfig, PoolError, WebSocketLike, WsConnPool, WsMessage,
 };
 
 use voice_providers::asr::qwen::QwenAsrAdapter;
@@ -279,7 +279,7 @@ async fn qwen_streaming_client_emits_partial_then_final() {
         .to_string(),
     ];
 
-    let pool = WsPool::new(PoolConfig {
+    let pool = WsConnPool::new(PoolConfig {
         max_connections: 2,
         ..PoolConfig::default()
     });
@@ -329,7 +329,7 @@ async fn qwen_streaming_client_breaks_on_final() {
         .to_string(),
     ];
 
-    let pool = WsPool::new(PoolConfig::default());
+    let pool = WsConnPool::new(PoolConfig::default());
     let outgoing = Arc::new(Mutex::new(Vec::new()));
     let dialer = dialer_with_responses(responses, outgoing.clone());
     let client = StreamingAsrClient::new(
@@ -369,7 +369,7 @@ async fn qwen_streaming_client_propagates_task_failed() {
         .to_string(),
     ];
 
-    let pool = WsPool::new(PoolConfig::default());
+    let pool = WsConnPool::new(PoolConfig::default());
     let outgoing = Arc::new(Mutex::new(Vec::new()));
     let dialer = dialer_with_responses(responses, outgoing);
     let client = StreamingAsrClient::new(
@@ -407,7 +407,7 @@ async fn qwen_streaming_client_outgoing_frames_correct_wire_format() {
         .to_string(),
     ];
 
-    let pool = WsPool::new(PoolConfig::default());
+    let pool = WsConnPool::new(PoolConfig::default());
     let outgoing = Arc::new(Mutex::new(Vec::new()));
     let dialer = dialer_with_responses(responses, outgoing.clone());
     let client = StreamingAsrClient::new(
@@ -451,7 +451,7 @@ async fn qwen_pooled_conn_send_text_and_binary() {
     })
     .to_string()];
 
-    let pool = WsPool::new(PoolConfig {
+    let pool = WsConnPool::new(PoolConfig {
         max_connections: 2,
         ..PoolConfig::default()
     });
@@ -498,7 +498,7 @@ async fn qwen_streaming_client_handles_multiple_audio_chunks() {
         .to_string(),
     ];
 
-    let pool = WsPool::new(PoolConfig::default());
+    let pool = WsConnPool::new(PoolConfig::default());
     let outgoing = Arc::new(Mutex::new(Vec::new()));
     let dialer = dialer_with_responses(responses, outgoing.clone());
     let client = StreamingAsrClient::new(

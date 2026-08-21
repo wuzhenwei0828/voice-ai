@@ -45,6 +45,10 @@ use serde::{Deserialize, Serialize};
 // re-export 给 voice_server 上层用
 pub use crate::logging::LogConfig;
 
+/// Redis key 统一前缀。所有 redis 消费者（agent / 未来的 cache / rate-limit 等）
+/// 在自己 namespace 后缀前先拼这个。代码里写死，需要换前缀时直接改这里。
+pub const REDIS_KEY_PREFIX: &str = "voice:";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoiceConfig {
     #[serde(default)]
@@ -60,6 +64,67 @@ pub struct VoiceConfig {
     pub llm: LlmConfig,
     #[serde(default)]
     pub tts: TtsConfig,
+    /// Redis 连接配置（横切：agent / 未来的 cache / rate-limit 等共用）
+    #[serde(default)]
+    pub redis: RedisConfig,
+    /// LLM Agent 配置：短期记忆后端选择 + 窗口容量
+    #[serde(default)]
+    pub agent: AgentConfig,
+}
+
+/// 顶层 Redis 连接配置。所有需要 Redis 的功能（短期记忆、缓存、限流等）
+/// 都从这一段拿连接信息和默认 TTL。key 前缀由代码里的 [`REDIS_KEY_PREFIX`] 常量控制。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedisConfig {
+    /// Redis URL（如 `redis://127.0.0.1:6379/`）。None = 未启用 Redis。
+    #[serde(default)]
+    pub url: Option<String>,
+    /// 各功能未单独指定 TTL 时用这个，默认 3600 秒（1 小时）
+    #[serde(default = "default_redis_ttl_secs")]
+    pub default_ttl_secs: u64,
+}
+
+impl Default for RedisConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            default_ttl_secs: default_redis_ttl_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConfig {
+    /// 记忆后端：`in_memory`（默认，单进程）| `redis`（跨进程共享）
+    #[serde(default = "default_memory_backend")]
+    pub memory_backend: String,
+    /// 滑动窗口容量（保留最近 N 条对话记录）
+    #[serde(default = "default_memory_window")]
+    pub memory_window: usize,
+    /// 短期记忆 Redis TTL（秒）。None = 用 `redis.default_ttl_secs`。
+    /// `memory_backend=in_memory` 时不生效。
+    #[serde(default)]
+    pub memory_ttl_secs: Option<u64>,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            memory_backend: default_memory_backend(),
+            memory_window: default_memory_window(),
+            memory_ttl_secs: None,
+        }
+    }
+}
+
+fn default_memory_backend() -> String {
+    "in_memory".to_string()
+}
+fn default_memory_window() -> usize {
+    20
+}
+fn default_redis_ttl_secs() -> u64 {
+    3600
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -322,6 +387,11 @@ impl VoiceConfig {
     ///   - VOICE_PROVIDER_API_KEY                  （provider 段）
     ///   - VOICE_<ASR|LLM|TTS>_API_KEY             （per-section 覆盖）
     ///   - VOICE_<ASR|LLM|TTS>_MODEL               （per-section）
+    ///   - VOICE_REDIS_URL                          （redis 顶层段，连接 URL）
+    ///   - VOICE_REDIS_DEFAULT_TTL_SECS             （redis 顶层段，默认 TTL）
+    ///   - VOICE_AGENT_MEMORY_BACKEND              （agent 段，in_memory | redis）
+    ///   - VOICE_AGENT_MEMORY_WINDOW               （agent 段，滑动窗口容量）
+    ///   - VOICE_AGENT_MEMORY_TTL_SECS             （agent 段，TTL 覆盖）
     pub fn apply_env_overrides(&mut self) {
         self.log.apply_env_overrides();
         if let Ok(v) = std::env::var("VOICE_PORT") {
@@ -340,6 +410,35 @@ impl VoiceConfig {
         apply_section_env(&mut self.asr, "ASR");
         apply_section_env_llm(&mut self.llm, "LLM");
         apply_section_env_tts(&mut self.tts, "TTS");
+        apply_redis_env(&mut self.redis);
+        apply_agent_env(&mut self.agent);
+    }
+}
+
+fn apply_redis_env(c: &mut RedisConfig) {
+    if let Ok(v) = std::env::var("VOICE_REDIS_URL") {
+        c.url = Some(v);
+    }
+    if let Ok(v) = std::env::var("VOICE_REDIS_DEFAULT_TTL_SECS") {
+        if let Ok(n) = v.parse() {
+            c.default_ttl_secs = n;
+        }
+    }
+}
+
+fn apply_agent_env(c: &mut AgentConfig) {
+    if let Ok(v) = std::env::var("VOICE_AGENT_MEMORY_BACKEND") {
+        c.memory_backend = v;
+    }
+    if let Ok(v) = std::env::var("VOICE_AGENT_MEMORY_WINDOW") {
+        if let Ok(n) = v.parse() {
+            c.memory_window = n;
+        }
+    }
+    if let Ok(v) = std::env::var("VOICE_AGENT_MEMORY_TTL_SECS") {
+        if let Ok(n) = v.parse() {
+            c.memory_ttl_secs = Some(n);
+        }
     }
 }
 
@@ -380,6 +479,8 @@ impl Default for VoiceConfig {
             asr: AsrConfig::default(),
             llm: LlmConfig::default(),
             tts: TtsConfig::default(),
+            redis: RedisConfig::default(),
+            agent: AgentConfig::default(),
         }
     }
 }

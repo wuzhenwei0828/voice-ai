@@ -12,13 +12,15 @@ pub enum ClientError {
     Decode(String),
     #[error("service returned status {0}")]
     Status(u16),
+    #[error("ws error: {0}")]
+    Ws(String),
 }
 
 // 兼容旧代码里的 Display impl 路径
 impl ClientError {
     pub fn to_string_short(&self) -> String {
         match self {
-            ClientError::Http(m) | ClientError::Io(m) | ClientError::Decode(m) => m.clone(),
+            ClientError::Http(m) | ClientError::Io(m) | ClientError::Decode(m) | ClientError::Ws(m) => m.clone(),
             ClientError::Status(c) => c.to_string(),
         }
     }

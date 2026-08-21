@@ -20,8 +20,8 @@
   const CHANNELS = 1;
   const FRAME_SAMPLES = 320;        // 20ms @ 16kHz，一帧 640 字节
   const SILENCE_THRESHOLD = 0.01;   // RMS 阈值（Float32 量纲）
-  const VAD_START_FRAMES = 3;       // 起句去抖：连续 3 帧浊音（60ms）
-  const VAD_END_FRAMES = 30;        // 句尾：连续 30 帧静音（600ms）
+  const VAD_START_FRAMES = 5;       // 起句去抖：连续 3 帧浊音（60ms）
+  const VAD_END_FRAMES = 40;        // 句尾：连续 30 帧静音（600ms）
   const VAD_MAX_FRAMES = 1500;      // 单句上限 30s，与服务端 MAX_UTTERANCE_MS 呼应
   const PREROLL_FRAMES = 5;         // 起句前保留 ~100ms 前置静音帧
   // URL 路径匹配 webhttp WS 路由 /{api_prefix}/{wsapi}/{business}/{actor}/{connid}
@@ -559,9 +559,9 @@
   //        （旧实现把 is_last 当电平用，静音期每帧都标 true，导致服务端每帧起一次 pipeline）
   const WORKLET_SRC = `
     class PcmCaptureProcessor extends AudioWorkletProcessor {
-      constructor() {
-        super();
-        const o = (this.processorOptions || {});
+      constructor(options) {
+        super(options);
+        const o = (options && options.processorOptions) || {};
         this._targetRate = o.targetRate || 16000;
         this._frameSamples = o.frameSamples || 320;
         this._threshold = o.threshold != null ? o.threshold : 0.01;

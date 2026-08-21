@@ -18,6 +18,7 @@ pub mod paraformer;
 pub mod qwen;
 pub mod qwen3_realtime;
 pub mod session;
+pub mod asr_ws_pool;
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -29,7 +30,7 @@ use futures_util::Stream;
 use tracing::{debug, info, warn};
 
 use crate::codec::GaxFrame;
-use crate::ws_pool::{LaneKind, PoolError, WsPool};
+use crate::ws_pool::{LaneKind, PoolError, WsConnPool};
 
 // ===== 公共类型（与 voice-server 同构） =====
 
@@ -145,7 +146,7 @@ pub const ASR_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 一个 session 内的 ASR 客户端。AsrClient::recognize 每次调用都新建一个会话。
 pub struct StreamingAsrClient {
-    pool: Arc<WsPool>,
+    pool: Arc<WsConnPool>,
     adapter: Box<dyn AsrModelAdapter>,
     /// 拨号器：在 build_all 时注入
     dialer: crate::ws_pool::Dialer,
@@ -156,7 +157,7 @@ pub struct StreamingAsrClient {
 
 impl StreamingAsrClient {
     pub fn new(
-        pool: Arc<WsPool>,
+        pool: Arc<WsConnPool>,
         adapter: Box<dyn AsrModelAdapter>,
         dialer: crate::ws_pool::Dialer,
         sample_rate: u32,
@@ -317,7 +318,7 @@ fn adapter_parse_for(model: &str, payload: &[u8]) -> Result<Option<AsrEvent>, Cl
 // ===== factory =====
 
 pub fn build_asr_client(
-    pool: Arc<WsPool>,
+    pool: Arc<WsConnPool>,
     model: &str,
     sample_rate: u32,
     channels: u16,

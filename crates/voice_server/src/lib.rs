@@ -7,19 +7,21 @@
 //!   - `service`     VoiceService: 实现 webhttp::ServiceCallback
 //!   - `bin/voice_server.rs` 启动入口
 
+pub mod agent;
 pub mod client;
 pub mod config;
 pub mod logging;
 pub mod service;
 pub mod session;
 pub mod admin_api;
-pub mod asr_stream_api;
+pub mod live_asr_api;
 
+pub use agent::{LlmAgent, RedisStore, InMemoryStore, MemoryStore};
 pub use client::{
     build_asr_client, build_llm_client, build_tts_client, AsrClient, HttpAsrClient,
     HttpLlmClient, HttpTtsClient, LlmClient, TtsClient,
 };
-pub use config::{AsrConfig, LlmConfig, ProviderConfig, ServerConfig, TtsConfig, VoiceConfig};
+pub use config::{AsrConfig, LlmConfig, ProviderConfig, REDIS_KEY_PREFIX, ServerConfig, TtsConfig, VoiceConfig};
 pub use logging::{
     candidate_paths, default_config_path, init_logging, load_yaml, resolve_config_path,
     resolve_web_static_dir, LogConfig, LogFormat,

@@ -53,7 +53,6 @@ pub struct QwenAsrAdapter {
     /// `payload.parameters.max_sentence_silence`（VAD 断句静音阈值 ms）。None=服务端默认 800
     max_sentence_silence: Option<u32>,
     /// 是否开启 ITN（数字、日期等转写，如 `123` → `一百二十三`）
-    enable_inverse_text_normalization: bool,
     /// 是否开启语义断句（开启后不再返回 `emo_tag` / `emo_confidence`）
     semantic_punctuation_enabled: bool,
 }
@@ -68,7 +67,6 @@ impl QwenAsrAdapter {
                 canonical: "fun-asr-flash-8k-realtime",
                 format: "pcm",
                 max_sentence_silence: Some(800),
-                enable_inverse_text_normalization: false,
                 semantic_punctuation_enabled: false,
             },
             // Fun-ASR 16kHz 系列
@@ -80,7 +78,6 @@ impl QwenAsrAdapter {
                 canonical: "fun-asr-realtime",
                 format: "pcm",
                 max_sentence_silence: Some(800),
-                enable_inverse_text_normalization: false,
                 semantic_punctuation_enabled: false,
             },
             // Qwen-Audio 3.0 主力
@@ -89,7 +86,6 @@ impl QwenAsrAdapter {
                 canonical: "qwen-audio-3.0-asr-flash-streaming",
                 format: "pcm",
                 max_sentence_silence: Some(800),
-                enable_inverse_text_normalization: false,
                 semantic_punctuation_enabled: false,
             },
             // Paraformer 16kHz
@@ -98,7 +94,6 @@ impl QwenAsrAdapter {
                 canonical: "paraformer-realtime-v2",
                 format: "pcm",
                 max_sentence_silence: Some(800),
-                enable_inverse_text_normalization: false,
                 // paraformer 默认 semantic_punctuation_enabled=false 以保留情感字段
                 // 见 real-asr-code.md#情感识别
                 semantic_punctuation_enabled: false,
@@ -109,7 +104,6 @@ impl QwenAsrAdapter {
                 canonical: "paraformer-realtime-8k-v2",
                 format: "pcm",
                 max_sentence_silence: Some(800),
-                enable_inverse_text_normalization: false,
                 // 8k v2 情感识别要求 semantic_punctuation_enabled = false
                 semantic_punctuation_enabled: false,
             },
@@ -119,7 +113,6 @@ impl QwenAsrAdapter {
                 canonical: "qwen-audio-3.0-asr-flash-streaming",
                 format: "pcm",
                 max_sentence_silence: Some(800),
-                enable_inverse_text_normalization: false,
                 semantic_punctuation_enabled: false,
             },
         }
@@ -152,7 +145,6 @@ struct RunParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_sentence_silence: Option<u32>,
     semantic_punctuation_enabled: bool,
-    enable_inverse_text_normalization: bool,
 }
 
 // ===== 服务端事件 JSON 解析 =====
@@ -261,7 +253,6 @@ impl AsrModelAdapter for QwenAsrAdapter {
             format: self.format,
             max_sentence_silence: self.max_sentence_silence,
             semantic_punctuation_enabled: self.semantic_punctuation_enabled,
-            enable_inverse_text_normalization: self.enable_inverse_text_normalization,
         };
         let payload = build_run_task(self.model, session_id, sr, ch, &params)
             .expect("encode run-task JSON");
@@ -379,6 +370,79 @@ mod tests {
         assert_eq!(v["payload"]["task_group"], "audio");
         assert_eq!(v["payload"]["task"], "asr");
         assert_eq!(v["payload"]["function"], "recognition");
+    }
+
+    /// 锁定 run-task 帧形态完全符合 `qwen-asr-docs/qwen-asr-client-api.md`：
+    /// 不允许出现规范外的字段（之前曾误带 `enable_inverse_text_normalization`）。
+    #[test]
+    fn run_task_frame_conforms_to_client_api_spec() {
+        use serde_json::json;
+        let adapter = QwenAsrAdapter::for_model("qwen-audio-3.0-asr-flash-streaming");
+        let frame = adapter.open_request("task-abc", 16000, 1);
+
+        let v: serde_json::Value = serde_json::from_slice(&frame.payload).unwrap();
+
+        // header 必须仅 3 个字段
+        let header = v["header"].as_object().expect("header 是对象");
+        assert_eq!(header.len(), 3, "header 只允许 3 个字段，实际: {:?}", header.keys().collect::<Vec<_>>());
+        assert_eq!(header["action"], "run-task");
+        assert_eq!(header["streaming"], "duplex");
+        assert_eq!(header["task_id"], "task-abc");
+
+        // payload 顶层字段必须是 spec 允许的子集：task_group / task / function / model / parameters / input
+        let payload = v["payload"].as_object().expect("payload 是对象");
+        let allowed_top: std::collections::BTreeSet<&str> =
+            ["task_group", "task", "function", "model", "parameters", "input"]
+                .iter().copied().collect();
+        let actual_top: std::collections::BTreeSet<&str> = payload.keys().map(|s| s.as_str()).collect();
+        let extra: Vec<_> = actual_top.difference(&allowed_top).copied().collect();
+        assert!(
+            extra.is_empty(),
+            "payload 顶层含 spec 未定义的字段：{:?}（实际: {:?}）",
+            extra, actual_top
+        );
+
+        // parameters 必须是 spec 允许的子集：format / sample_rate / max_sentence_silence /
+        // semantic_punctuation_enabled / vocabulary_id / vocabulary / language_hints /
+        // multi_threshold_mode_enabled / heartbeat / speech_noise_threshold / special_word_filter
+        let params = payload["parameters"].as_object().unwrap();
+        let allowed_param: std::collections::BTreeSet<&str> = [
+            "format", "sample_rate", "max_sentence_silence", "semantic_punctuation_enabled",
+            "vocabulary_id", "vocabulary", "language_hints", "multi_threshold_mode_enabled",
+            "heartbeat", "speech_noise_threshold", "special_word_filter",
+        ].iter().copied().collect();
+        let actual_param: std::collections::BTreeSet<&str> =
+            params.keys().map(|s| s.as_str()).collect();
+        let extra: Vec<_> = actual_param.difference(&allowed_param).copied().collect();
+        assert!(
+            extra.is_empty(),
+            "parameters 含 spec 未定义的字段：{:?}（实际: {:?}, 允许: {:?}）",
+            extra, actual_param, allowed_param
+        );
+
+        // input 不携带上下文时按 spec 是 {}
+        assert_eq!(payload["input"], json!({}));
+    }
+
+    /// finish-task 帧形态完全符合 spec：header 3 字段 + payload.input = {}
+    #[test]
+    fn finish_task_frame_conforms_to_client_api_spec() {
+        use serde_json::json;
+        let adapter = QwenAsrAdapter::for_model("fun-asr-realtime");
+        let frame = adapter.stop_frame("task-xyz");
+
+        assert_eq!(frame.wire, WireFormat::Text);
+        let v: serde_json::Value = serde_json::from_slice(&frame.payload).unwrap();
+
+        let header = v["header"].as_object().unwrap();
+        assert_eq!(header.len(), 3);
+        assert_eq!(header["action"], "finish-task");
+        assert_eq!(header["streaming"], "duplex");
+        assert_eq!(header["task_id"], "task-xyz");
+
+        let payload = v["payload"].as_object().unwrap();
+        assert_eq!(payload.len(), 1);
+        assert_eq!(payload["input"], json!({}));
     }
 
     #[test]

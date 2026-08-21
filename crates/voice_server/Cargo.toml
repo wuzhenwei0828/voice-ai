@@ -16,6 +16,7 @@ tokio-util = { workspace = true }
 async-trait = { workspace = true }
 async-stream = "0.3"
 async-openai = { version = "=0.29.0", features = ["rustls"] }
+async-tungstenite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
@@ -37,4 +38,4 @@ base64 = "0.22"
 actix = "0.13"
 actix-web = "4"
 actix-files = "0.6"
-actix-ws = "0.3"
+redis = { workspace = true }

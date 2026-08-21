@@ -8,7 +8,7 @@
 //! ## 抽象
 //!
 //! - `WebSocketLike` trait：抽象掉 `async-tungstenite` 实际连接，方便 mock 测试
-//! - `WsPool` 维护两条 lane（每条 lane 有独立 semaphore + idle list）
+//! - `WsConnPool` 维护两条 lane（每条 lane 有独立 semaphore + idle list）
 //! - `PooledConn` RAII 句柄：Drop 时自动 release 回 pool（或 unhealthy 时关掉）
 //!
 //! ## 健康检查（lazy + on-error）
@@ -163,9 +163,9 @@ struct PoolEntry {
     created_at: Instant,
 }
 
-// ===== WsPool =====
+// ===== WsConnPool =====
 
-pub struct WsPool {
+pub struct WsConnPool {
     cfg: PoolConfig,
     lanes: [Lane; 2],
 }
@@ -174,7 +174,7 @@ pub struct WsPool {
 /// 真实实现里会调 `async-tungstenite::connect_async`，mock 测试里返回 VecDeque-backed impl。
 pub type Dialer = Arc<dyn Fn(LaneKind) -> BoxFuture<'static, Result<Box<dyn WebSocketLike>, PoolError>> + Send + Sync>;
 
-impl WsPool {
+impl WsConnPool {
     pub fn new(cfg: PoolConfig) -> Arc<Self> {
         let max = cfg.max_connections.max(1);
         Arc::new(Self {
@@ -305,7 +305,7 @@ impl WsPool {
 pub struct PooledConn {
     conn: Option<Box<dyn WebSocketLike>>,
     lane_idx: usize,
-    pool: Arc<WsPool>,
+    pool: Arc<WsConnPool>,
     /// semaphore permit：持有它期间其它 acquire 会被阻塞；drop 时释放
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }

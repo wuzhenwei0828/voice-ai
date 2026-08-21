@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 
 use crate::asr::{AsrEvent, AsrModelAdapter, ClientError};
 use crate::codec::GaxFrame;
-use crate::ws_pool::{Dialer, LaneKind, WsPool};
+use crate::ws_pool::{Dialer, LaneKind, WsConnPool};
 
 /// 客户端 → 服务端的控制命令
 #[derive(Debug)]
@@ -67,7 +67,7 @@ impl StreamingAsrSession {
 ///    - 收到 Err / 连接断开 → 终止
 /// 4. 返回的 events 流由调用方消费（典型用法：推到前端 WS）
 pub async fn start_session(
-    pool: Arc<WsPool>,
+    pool: Arc<WsConnPool>,
     adapter: Box<dyn AsrModelAdapter>,
     dialer: Dialer,
     sample_rate: u32,

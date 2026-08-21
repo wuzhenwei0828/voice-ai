@@ -33,10 +33,13 @@ pub type ArcLlm = Arc<dyn LlmClient>;
 
 #[async_trait]
 pub trait LlmClient: Send + Sync {
+    /// `emotion_hint`：来自 ASR 的情绪提示（可选），将作为 system message 发送给 LLM；
+    /// 传 `None` 时只发 user 消息。
     async fn chat(
         &self,
         session_id: &str,
         prompt: &str,
+        emotion_hint: Option<&str>,
     ) -> Result<BoxStream<Result<LlmEvent, ClientError>>, ClientError>;
 }
 
@@ -106,11 +109,23 @@ impl LlmClient for HttpLlmClient {
         &self,
         session_id: &str,
         prompt: &str,
+        emotion_hint: Option<&str>,
     ) -> Result<BoxStream<Result<LlmEvent, ClientError>>, ClientError> {
         let url = format!("{}/chat/completions", self.api_base.trim_end_matches('/'));
+        // 情绪提示：明确告诉 LLM "仅供参考、不一定准确"，避免 LLM 被错误情绪带偏
+        let system_msg: Option<String> = emotion_hint.map(|e| format!(
+            "用户当前说话的情绪可能是：{e}。这个情绪推测仅供参考，可能不准确，请以用户实际的言语内容为主来回应。"
+        ));
+
+        let mut messages: Vec<ChatMsg<'_>> = Vec::with_capacity(2);
+        if let Some(sys) = &system_msg {
+            messages.push(ChatMsg { role: "system", content: sys.as_str() });
+        }
+        messages.push(ChatMsg { role: "user", content: prompt });
+
         let body = ChatReq {
             model: &self.model,
-            messages: vec![ChatMsg { role: "user", content: prompt }],
+            messages,
             stream: true,
         };
         info!(
@@ -118,6 +133,8 @@ impl LlmClient for HttpLlmClient {
             session_id,
             url = %url,
             model = %self.model,
+            has_system = system_msg.is_some(),
+            emotion_hint = emotion_hint.unwrap_or(""),
             prompt_chars = prompt.chars().count(),
             "LLM POST 请求即将发送（voice-providers 直连）"
         );

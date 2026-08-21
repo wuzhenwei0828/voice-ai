@@ -35,13 +35,28 @@ tts:
   response_format: "pcm"
   stream: true
 
-# 实时流式 ASR（qwen3-asr-flash-realtime，Realtime API）—— /stream/asr WS 端点 + /asr_realtime.html 页面
-# 可选段：不配置时端点仍在，但 start 会返回明确配置错误
-# 环境变量等价覆盖：DASHSCOPE_API_KEY / VOICE_ASR_STREAM_{API_KEY,MODEL,WORKSPACE_ID,REGION,ENDPOINT}
-asr_stream:
-  model: "qwen3-asr-flash-realtime"
-  api_key: "sk-*******"                       # DashScope API key
-  workspace_id: "llm-xxxxxx"                  # 业务空间 ID（ASR realtime 专属域名必需，除非给 endpoint）
-  region: "cn-beijing"                        # cn-beijing | ap-southeast-1
-  # endpoint: "wss://自定义域名/api-ws/v1/realtime"   # 显式覆盖（缺 ?model= 自动追加）
+# Redis：横切关注点，agent / 未来的 cache / rate-limit 等共用
+# 不配 url 就当未启用 Redis，agent 会自动 fallback 到 in_memory
+# key 全局前缀 ("voice:") 写死在代码里（REDIS_KEY_PREFIX），不在此处配置
+redis:
+  # url: "redis://user:pass@127.0.0.1:6379/0"   # 认证信息内嵌在 URL 里
+  default_ttl_secs: 3600           # 各 consumer 未单独指定 TTL 时用这个
+
+# LLM Agent：短期记忆后端 + 滑动窗口容量
+# 想跨实例共享对话上下文时：redis.url + agent.memory_backend=redis
+# Redis key 命名空间 = `redis.key_prefix` + 代码里写死的 "memory:" → "voice:memory:"
+agent:
+  memory_backend: "in_memory"      # in_memory（单进程）| redis（跨实例）
+  memory_window: 20                # 滑动窗口：保留最近 N 条对话记录
+  # memory_ttl_secs: 3600          # None = 继承 redis.default_ttl_secs
+
+# 实时流式 ASR（公共协议：fun-asr / qwen-audio-3.0 / paraformer；wspool 跨浏览器会话复用）
+# 端点：/ws/live-asr/web/<connid>（走 webhttp 既有 WS 路由 + VoicePayload 协议）
+# 环境变量等价覆盖：DASHSCOPE_API_KEY / VOICE_ASR_LIVE_{API_KEY,MODEL,WORKSPACE_ID,REGION,ENDPOINT}
+asr_live:
+  model: "fun-asr-realtime"               # 或 qwen-audio-3.0-asr-flash-streaming / paraformer-realtime-v2
+  api_key: "sk-*******"                  # DashScope API key
+  workspace_id: "llm-xxxxxx"             # 业务空间 ID（公共协议端点必需，除非给 endpoint）
+  region: "cn-beijing"                   # cn-beijing | ap-southeast-1
+  # endpoint: "wss://自定义域名/api-ws/v1/inference"   # 显式覆盖
 

@@ -3,10 +3,9 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>实时流式 ASR · qwen3-asr-flash-realtime</title>
+<title>实时流式 ASR · live-asr (session_ack 握手)</title>
 <link rel="stylesheet" href="style.css" />
 <style>
-  /* 页面私有样式（复用 style.css 主体，仅少量补充） */
   .back-link {
     font-size: 12px;
     color: #8b949e;
@@ -15,31 +14,81 @@
   }
   .back-link:hover { color: #79b8ff; }
 
-  .vad-dot {
-    display: inline-block;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: #4a5260;
-    margin-right: 6px;
-    vertical-align: middle;
-  }
-  .vad-speaking .vad-dot {
-    background: #4ade80;
-    animation: blink 1s infinite;
-  }
-
+  /* partial 行：当前正在识别的句子，灰显 */
   #partial-line {
     min-height: 24px;
     color: #c9d1d9;
     opacity: 0.75;
+    font-size: 15px;
   }
-  #final-list .final { margin-top: 6px; }
+  #partial-line .partial { font-style: italic; }
+  #partial-line .empty-hint { color: #4a5260; }
+
+  /* final 列表：所有已完成的句子（按时间顺序累加） */
+  #final-list {
+    max-height: 50vh;
+    overflow-y: auto;
+    margin-top: 6px;
+    padding-right: 4px;
+  }
+  /* 自定义滚动条 */
+  #final-list::-webkit-scrollbar { width: 8px; }
+  #final-list::-webkit-scrollbar-track { background: #0e1117; }
+  #final-list::-webkit-scrollbar-thumb { background: #2a2f3a; border-radius: 4px; }
+  #final-list::-webkit-scrollbar-thumb:hover { background: #3a4150; }
+
+  #final-list .final {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    color: #79e89a;
+    border-left: 3px solid #4ade80;
+    padding: 4px 8px;
+    margin-top: 6px;
+    line-height: 1.5;
+  }
+  /* 修正（2pass-offline 替换过的行）—— 左边框变蓝 */
+  #final-list .final.corrected {
+    border-left-color: #79b8ff;
+    color: #a5d8ff;
+  }
+  /* 错误行 */
+  #final-list .final.err {
+    border-left-color: #f87171;
+    color: #f87171;
+  }
+  #final-list .final .idx {
+    color: #6e7681;
+    font-size: 12px;
+    min-width: 32px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  #final-list .final .ts {
+    color: #4a5260;
+    font-size: 11px;
+    min-width: 60px;
+    font-variant-numeric: tabular-nums;
+  }
+  #final-list .final .text { flex: 1; }
+
+  /* 顶部计数条 */
+  .count-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 12px;
+    color: #8b949e;
+    padding: 0 2px 6px 2px;
+    border-bottom: 1px dashed #2a2f3a;
+    margin-bottom: 8px;
+  }
+  .count-bar .count-num { color: #79e89a; font-weight: bold; }
 
   #event-log {
     font-size: 12px;
     color: #8b949e;
-    max-height: 160px;
+    max-height: 140px;
     overflow-y: auto;
     line-height: 1.5;
   }
@@ -48,11 +97,10 @@
 <body>
 
 <header>
-  <h1>⚡ 实时流式 ASR <span style="font-size:13px;color:#8b949e;">qwen3-asr-flash-realtime（Realtime API）</span><a class="back-link" href="/">← 返回主页面</a></h1>
+  <h1>⚡ 实时流式 ASR（live-asr，session_ack 握手）<span style="font-size:13px;color:#8b949e;">WS 建连 → session_start → 服务端建上游 WSS → ack → 推 PCM</span><a class="back-link" href="/">← 返回主页面</a></h1>
   <div class="status-bar">
     <span id="ws-status" class="badge badge-offline">WS：未连接</span>
     <span id="mic-status" class="badge badge-offline">麦克风：关</span>
-    <span id="vad-status" class="badge">服务端 VAD：--</span>
     <span id="stream-status" class="badge">会话：空闲</span>
   </div>
 </header>
@@ -61,22 +109,27 @@
   <section class="test-panel">
     <h2>🎤 麦克风实时识别</h2>
     <div class="hint">
-      点「开始识别」后持续收音：音频流式送到服务端 <code>/stream/asr</code>（WebSocket），
-      由 <code>voice-providers</code> 的 Realtime 会话转发给 DashScope，识别结果实时回显。
-      断句由<b>服务端 VAD</b> 完成（静音约 400ms 出句终）；说多句会逐句给出最终结果。
-      「结束」= 发 session.finish 收尾；「放弃」= 直接丢弃当前会话。
+      点「开始识别」：浏览器先与后端建立 WS，发 <code>session_start</code> → 后端建上游 WSS、发
+      <code>run-task</code>、等 <code>task-started</code> → 返回 <code>session_ack</code> →
+      浏览器等到 ack 后才开始拉麦克风推 PCM。识别途中模型逐句回 partial / final。点「结束」→
+      服务端发 <code>finish-task</code> → 收完剩余结果后关闭 WSS。
     </div>
 
     <div class="test-controls">
       <button id="btn-start">▶ 开始识别</button>
       <button id="btn-finish" disabled>⏹ 结束</button>
       <button id="btn-abandon" disabled>✖ 放弃</button>
+      <button id="btn-clear" disabled>🗑 清空</button>
       <span id="status-text" class="status-text">空闲</span>
     </div>
 
     <div class="test-output">
       <div class="output-label">转写结果</div>
       <div id="transcript" class="output-box">
+        <div class="count-bar">
+          <span>已识别 <span id="final-count" class="count-num">0</span> 句</span>
+          <span id="partial-hint" style="color:#6e7681;">说新句子时会自动追加到下面</span>
+        </div>
         <div id="partial-line"><span class="empty-hint">（还没开始说话）</span></div>
         <div id="final-list"></div>
       </div>

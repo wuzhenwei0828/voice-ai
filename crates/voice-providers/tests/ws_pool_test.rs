@@ -6,7 +6,7 @@ use std::sync::Arc;
 use futures_util::future::FutureExt;
 use voice_providers::codec::GaxFrame;
 use voice_providers::ws_pool::{
-    Dialer, LaneKind, PoolConfig, PoolError, WebSocketLike, WsPool,
+    Dialer, LaneKind, PoolConfig, PoolError, WebSocketLike, WsConnPool,
 };
 use voice_providers::ws_pool::test_helpers::MockWs;
 
@@ -78,7 +78,7 @@ fn test_dialer_with_incoming(
 
 #[tokio::test]
 async fn acquire_release_returns_to_idle() {
-    let pool = WsPool::new(PoolConfig {
+    let pool = WsConnPool::new(PoolConfig {
         max_connections: 4,
         ..PoolConfig::default()
     });
@@ -104,7 +104,7 @@ async fn acquire_release_returns_to_idle() {
 
 #[tokio::test]
 async fn release_unhealthy_dials_new_on_next_acquire() {
-    let pool = WsPool::new(PoolConfig {
+    let pool = WsConnPool::new(PoolConfig {
         max_connections: 4,
         ..PoolConfig::default()
     });
@@ -126,7 +126,7 @@ async fn release_unhealthy_dials_new_on_next_acquire() {
 
 #[tokio::test]
 async fn max_connections_blocks_extra_acquire() {
-    let pool = WsPool::new(PoolConfig {
+    let pool = WsConnPool::new(PoolConfig {
         max_connections: 2,
         acquire_timeout: std::time::Duration::from_millis(200),
         ..PoolConfig::default()
@@ -152,7 +152,7 @@ async fn max_connections_blocks_extra_acquire() {
 
 #[tokio::test]
 async fn lanes_are_isolated() {
-    let pool = WsPool::new(PoolConfig {
+    let pool = WsConnPool::new(PoolConfig {
         max_connections: 4,
         ..PoolConfig::default()
     });

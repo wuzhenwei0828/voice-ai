@@ -30,7 +30,7 @@ use tracing::{debug, info, warn};
 
 use crate::asr::{BoxStream, ClientError};
 use crate::codec::GaxFrame;
-use crate::ws_pool::{LaneKind, PooledConn, WsMessage, WsPool};
+use crate::ws_pool::{LaneKind, PooledConn, WsMessage, WsConnPool};
 
 use base64::Engine as _;
 
@@ -186,7 +186,7 @@ pub trait TtsClient: Send + Sync {
 // ===== StreamingTtsClient =====
 
 pub struct StreamingTtsClient {
-    pool: Arc<WsPool>,
+    pool: Arc<WsConnPool>,
     adapter: Box<dyn TtsModelAdapter>,
     /// 调用方传入的 model 名（如 `cosyvoice-v2-gax`），用于在 pipeline 内重新 select adapter
     /// （不能用 adapter.model_name()，因为 adapter 可能返回标准化的 `&'static str`，丢失路由信息）
@@ -199,7 +199,7 @@ pub struct StreamingTtsClient {
 
 impl StreamingTtsClient {
     pub fn new(
-        pool: Arc<WsPool>,
+        pool: Arc<WsConnPool>,
         adapter: Box<dyn TtsModelAdapter>,
         input_model: String,
         dialer: crate::ws_pool::Dialer,
@@ -588,7 +588,7 @@ async fn realtime_pipeline(
 // ===== factory =====
 
 pub fn build_tts_client(
-    pool: Arc<WsPool>,
+    pool: Arc<WsConnPool>,
     model: &str,
     voice: &str,
     sample_rate: u32,

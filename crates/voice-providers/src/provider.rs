@@ -17,7 +17,7 @@ use crate::asr::{build_asr_client, ArcAsr};
 use crate::config::BailianConfig;
 use crate::llm::{build_llm_client, ArcLlm};
 use crate::tts::{build_tts_client, ArcTts};
-use crate::ws_pool::{Dialer, LaneKind, PoolConfig, TungsteniteWs, WebSocketLike, WsPool};
+use crate::ws_pool::{Dialer, LaneKind, PoolConfig, TungsteniteWs, WebSocketLike, WsConnPool};
 
 // ===== build_all =====
 
@@ -41,7 +41,7 @@ pub fn build_all(cfg: &BailianConfig) -> anyhow::Result<(ArcAsr, ArcLlm, ArcTts)
         idle_timeout: cfg.pool.idle_timeout(),
         connect_timeout: cfg.pool.connect_timeout(),
     };
-    let pool = WsPool::new(pool_cfg);
+    let pool = WsConnPool::new(pool_cfg);
 
     // TTS 端点优先级：tts.endpoint > 自动构造
     let tts_ws_endpoint = cfg
@@ -93,19 +93,19 @@ pub fn build_all(cfg: &BailianConfig) -> anyhow::Result<(ArcAsr, ArcLlm, ArcTts)
     Ok((asr, llm, tts))
 }
 
-/// 单独构造 ASR 端的 WsPool + dialer，供 voice-server 暴露流式 ASR WebSocket 端点用。
+/// 单独构造 ASR 端的 WsConnPool + dialer，供 voice-server 暴露流式 ASR WebSocket 端点用。
 ///
 /// 复用 `build_all` 内部的端点解析逻辑（asr.endpoint / workspace_id / 默认 URL 路由）。
 pub fn build_asr_streaming_pool(
     cfg: &BailianConfig,
-) -> (Arc<WsPool>, Dialer) {
+) -> (Arc<WsConnPool>, Dialer) {
     let pool_cfg = PoolConfig {
         max_connections: cfg.pool.max_connections,
         acquire_timeout: cfg.pool.acquire_timeout(),
         idle_timeout: cfg.pool.idle_timeout(),
         connect_timeout: cfg.pool.connect_timeout(),
     };
-    let pool = WsPool::new(pool_cfg);
+    let pool = WsConnPool::new(pool_cfg);
 
     let asr_ws_endpoint = cfg
         .asr

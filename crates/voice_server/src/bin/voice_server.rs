@@ -116,12 +116,63 @@ async fn main() -> anyhow::Result<()> {
     let llm = voice_server::build_llm_client(&cfg.llm, provider_cfg)?;
     let tts = voice_server::build_tts_client(&cfg.tts, provider_cfg)?;
 
+    // 5.5 LlmAgent：根据 cfg.agent.memory_backend 选择 in-memory 或 redis store
+    //   redis 配置在顶层 cfg.redis（URL / 全局前缀 / 默认 TTL），
+    //   agent 的 namespace 后缀 "memory:" 在代码里写死（不用配置）。
+    let backend = cfg.agent.memory_backend.as_str();
+    let store: std::sync::Arc<dyn voice_server::MemoryStore> = match backend {
+        "in_memory" => {
+            info!(
+                target: "voice_server.factory",
+                backend,
+                window_size = cfg.agent.memory_window,
+                "Agent 短期记忆后端 = 进程内 DashMap"
+            );
+            std::sync::Arc::new(voice_server::InMemoryStore::new(cfg.agent.memory_window))
+        }
+        "redis" => {
+            let url = cfg.redis.url.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "agent.memory_backend=redis 但 redis.url 未配置（yaml redis.url 或 env VOICE_REDIS_URL）"
+                )
+            })?;
+            // 完整 key 前缀 = REDIS_KEY_PREFIX 常量 + 代码写死的 "memory:"
+            // → "voice:memory:{session_id}"
+            let full_prefix = format!("{}memory:", voice_server::REDIS_KEY_PREFIX);
+            let ttl = cfg.agent.memory_ttl_secs.unwrap_or(cfg.redis.default_ttl_secs);
+            info!(
+                target: "voice_server.factory",
+                backend,
+                url = %url,
+                window_size = cfg.agent.memory_window,
+                key_prefix = %full_prefix,
+                ttl_secs = ttl,
+                "Agent 短期记忆后端 = Redis（集群共享）"
+            );
+            let store = voice_server::RedisStore::connect_with_prefix(
+                &url,
+                cfg.agent.memory_window,
+                full_prefix,
+                ttl,
+            )
+            .await?;
+            std::sync::Arc::new(store)
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "未知 agent.memory_backend: {}（合法值：in_memory | redis）",
+                other
+            ));
+        }
+    };
+    let agent = std::sync::Arc::new(voice_server::LlmAgent::with_store(llm.clone(), store));
+
     let static_dir =
         resolve_web_static_dir(cli.web_static_dir.as_deref()).unwrap_or_else(|| std::path::PathBuf::from("./static"));
     info!(target: "voice_server.web", static_dir = %static_dir.display(), "web demo 静态目录解析结果");
 
     let service = Arc::new(
-        VoiceService::new(asr, llm, tts)
+        VoiceService::new(asr, llm, agent, tts)
             .with_web_static_dir(&static_dir),
     );
 
