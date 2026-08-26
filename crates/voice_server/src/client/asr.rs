@@ -26,7 +26,7 @@ use tracing::{info, warn};
 
 use crate::client::error::{parse_openai_error, ClientError};
 use crate::config::{AsrConfig, ProviderConfig};
-use crate::session::AsrEvent;
+use crate::events::AsrEvent;
 
 pub type BoxStream<T> = Pin<Box<dyn futures_util::Stream<Item = T> + Send>>;
 pub type ArcAsr = Arc<dyn AsrClient>;

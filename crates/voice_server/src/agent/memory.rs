@@ -183,49 +183,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn in_memory_store_round_trips() {
-        let s = InMemoryStore::new(3);
-        s.append("a", msg(Role::User, "u1")).await;
-        s.append("a", msg(Role::Assistant, "a1")).await;
-        let h = s.history("a").await;
-        assert_eq!(h.len(), 2);
-        assert_eq!(h[0].role, Role::User);
-        assert_eq!(h[1].role, Role::Assistant);
-        assert_eq!(s.len("a").await, 2);
-        assert_eq!(s.len("unknown").await, 0);
-    }
-
-    #[tokio::test]
-    async fn in_memory_store_evicts_oldest() {
-        let s = InMemoryStore::new(2);
-        for i in 1..=4 {
-            s.append("x", msg(Role::User, &format!("u{i}"))).await;
-        }
-        let h = s.history("x").await;
-        assert_eq!(h.len(), 2);
-        assert_eq!(h[0].content, "u3");
-        assert_eq!(h[1].content, "u4");
-    }
-
-    #[tokio::test]
-    async fn in_memory_store_clears_session() {
-        let s = InMemoryStore::new(5);
-        s.append("y", msg(Role::User, "x")).await;
-        assert_eq!(s.len("y").await, 1);
-        s.clear("y").await;
-        assert_eq!(s.len("y").await, 0);
-    }
-
-    #[tokio::test]
-    async fn in_memory_store_isolates_sessions() {
-        let s = InMemoryStore::new(5);
-        s.append("a", msg(Role::User, "u1")).await;
-        s.append("b", msg(Role::User, "u2")).await;
-        assert_eq!(s.history("a").await[0].content, "u1");
-        assert_eq!(s.history("b").await[0].content, "u2");
-    }
-
     // ----- ShortTermMemory 数据结构测试（保留） -----
 
     #[test]

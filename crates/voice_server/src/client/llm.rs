@@ -23,7 +23,7 @@ use tracing::{info, warn};
 
 use crate::client::error::{parse_openai_error, ClientError};
 use crate::config::{LlmConfig, ProviderConfig};
-use crate::session::LlmEvent;
+use crate::events::LlmEvent;
 
 pub type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
 pub type ArcLlm = Arc<dyn LlmClient>;

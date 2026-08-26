@@ -68,7 +68,8 @@ use webhttp::websocket::OutMessage;
 
 use crate::agent::LlmAgent;
 use crate::client::{asr::wrap_pcm_as_wav, AsrClient, LlmClient, TtsClient};
-use crate::admin_api::{llm_tts_items, LlmTtsItem};
+use crate::pipeline::{llm_tts_items, LlmTtsItem};
+use crate::events::AsrEvent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
@@ -76,51 +77,6 @@ pub enum SessionState {
     Listening,
     Processing,
     Speaking,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct AsrEvent {
-    pub text: String,
-    pub is_final: bool,
-    /// `response_format=verbose_json` 时上游返回的语种（如 `"zh"` / `"en"`）。
-    /// **预留字段** —— 目前 voice-server 不消费、不序列化，只是把形状先占住，
-    /// 等后续要做语种识别 / 按语种路由 LLM system prompt 时再启用。
-    pub language: Option<String>,
-    /// `response_format=verbose_json` 时上游返回的音频总时长（秒）。
-    /// **预留字段**，同上，暂不消费。
-    pub duration: Option<f64>,
-    /// `response_format=verbose_json` 时按句/段切分的时间对齐分段。
-    /// **预留字段**，同上，暂不消费。spk=true 时 `AsrSegment::speaker` 也会被填充。
-    pub segments: Option<Vec<AsrSegment>>,
-}
-
-/// `verbose_json` 响应 `segments[]` 里每个元素的形状（参见 yapi.md §1）。
-/// **预留结构**，目前 voice-server 不消费，仅用于未来扩展。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct AsrSegment {
-    pub id: u32,
-    pub start: f64,
-    pub end: f64,
-    pub text: String,
-    /// `spk=true` 时上游会带这个字段（`"spk0"` / `"spk1"` ...）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub speaker: Option<String>,
-    /// SenseVoice 不输出词级时间戳，固定为空数组；保留字段兼容 OpenAI 形态
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub words: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone)]
-pub struct LlmEvent {
-    pub delta: String,
-    pub is_final: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct TtsEvent {
-    pub seq: u32,
-    pub data: Vec<u8>,
-    pub is_last: bool,
 }
 
 /// ASR 情绪解析结果

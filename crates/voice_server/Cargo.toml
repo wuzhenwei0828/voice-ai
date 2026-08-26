@@ -8,7 +8,6 @@ description = "Voice server using webhttp framework"
 
 [dependencies]
 voice-proto = { workspace = true }
-voice-providers = { workspace = true }
 webproto = { workspace = true }
 webhttp = { workspace = true }
 tokio = { workspace = true }

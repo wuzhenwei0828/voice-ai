@@ -24,7 +24,7 @@ use tracing::{info, warn};
 
 use crate::client::error::{parse_openai_error, ClientError};
 use crate::config::{ProviderConfig, TtsConfig};
-use crate::session::TtsEvent;
+use crate::events::TtsEvent;
 
 pub type BoxStream<T> = Pin<Box<dyn futures_util::Stream<Item = T> + Send>>;
 pub type ArcTts = Arc<dyn TtsClient>;
