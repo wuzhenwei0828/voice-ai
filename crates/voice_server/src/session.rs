@@ -78,10 +78,36 @@ pub enum SessionState {
     Speaking,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AsrEvent {
     pub text: String,
     pub is_final: bool,
+    /// `response_format=verbose_json` 时上游返回的语种（如 `"zh"` / `"en"`）。
+    /// **预留字段** —— 目前 voice-server 不消费、不序列化，只是把形状先占住，
+    /// 等后续要做语种识别 / 按语种路由 LLM system prompt 时再启用。
+    pub language: Option<String>,
+    /// `response_format=verbose_json` 时上游返回的音频总时长（秒）。
+    /// **预留字段**，同上，暂不消费。
+    pub duration: Option<f64>,
+    /// `response_format=verbose_json` 时按句/段切分的时间对齐分段。
+    /// **预留字段**，同上，暂不消费。spk=true 时 `AsrSegment::speaker` 也会被填充。
+    pub segments: Option<Vec<AsrSegment>>,
+}
+
+/// `verbose_json` 响应 `segments[]` 里每个元素的形状（参见 yapi.md §1）。
+/// **预留结构**，目前 voice-server 不消费，仅用于未来扩展。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AsrSegment {
+    pub id: u32,
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+    /// `spk=true` 时上游会带这个字段（`"spk0"` / `"spk1"` ...）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
+    /// SenseVoice 不输出词级时间戳，固定为空数组；保留字段兼容 OpenAI 形态
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub words: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +209,15 @@ pub struct VoiceSession {
     /// 从 SessionStart 记下，用于包 WAV 头给 ASR（siliconflow 等 provider 按文件后缀选解码器）
     sample_rate: u32,
     channels: u16,
+    /// 端侧（浏览器）SessionStart 上报的 TTS 输出采样率（Hz）。
+    /// - `Some(n)` —— 传给 HttpTtsClient 当 override，**覆盖** `tts.sample_rate` 配置
+    /// - `None` / `Some(0)` —— 端侧没上报或上报 0，让 HttpTtsClient 走配置兜底
+    /// 注：把 None 和 Some(0) 合并存为 None（写时归一化），简化下游判断
+    client_tts_sample_rate: Option<u32>,
+    /// 端侧（前端 voice 下拉）选中的 TTS 音色**短名**（如 `"alex"`）。
+    /// - `Some(short)` —— 传给 HttpTtsClient 当 override，HttpTtsClient 拼 model 前缀后发给 provider
+    /// - `None` / 空串 —— 端侧没传，让 HttpTtsClient 走配置 `tts.voice` 兜底
+    client_voice: Option<String>,
     asr: Arc<dyn AsrClient>,
     /// LLM 调用走 agent（带短期记忆）
     llm: Arc<LlmAgent>,
@@ -228,6 +263,8 @@ impl VoiceSession {
             audio_buf: AudioAccumulator::new(),
             sample_rate: 0,
             channels: 0,
+            client_tts_sample_rate: None,
+            client_voice: None,
             asr,
             llm,
             tts,
@@ -268,8 +305,14 @@ impl VoiceSession {
                 channels,
                 codec,
                 language,
+                tts_sample_rate,
+                voice,
                 ..
             } => {
+                // 端侧上报的 tts_sample_rate：None / Some(0) 都视为"没上报"，存 None 走配置兜底
+                let tts_sr = tts_sample_rate.filter(|&n| n > 0);
+                // 端侧上报的 voice：None / 空串都视为"没上报"，存 None 走配置兜底
+                let voice_short = voice.filter(|s| !s.trim().is_empty());
                 info!(
                     target: "voice_server.session",
                     session_id = %self.session_id,
@@ -277,11 +320,15 @@ impl VoiceSession {
                     channels,
                     codec = %codec,
                     language = %language,
+                    client_tts_sample_rate = ?tts_sr,
+                    client_voice = ?voice_short,
                     "收到 SessionStart"
                 );
                 // 记下格式参数，供后续 pipeline 包 WAV 头喂给 ASR
                 self.sample_rate = sample_rate;
                 self.channels = channels as u16;
+                self.client_tts_sample_rate = tts_sr;
+                self.client_voice = voice_short;
                 self.transition(SessionState::Listening);
                 None
             }
@@ -410,13 +457,31 @@ impl VoiceSession {
         let session_id = self.session_id.clone();
         let sample_rate = self.sample_rate;
         let channels = self.channels;
+        // 端侧上报的 TTS 输出采样率（None = 走配置兜底）
+        let client_tts_sample_rate = self.client_tts_sample_rate;
+        // 端侧上报的 TTS 音色短名（None = 走配置兜底）
+        let client_voice = self.client_voice.clone();
         let asr = self.asr.clone();
         let llm = self.llm.clone();
         let tts = self.tts.clone();
         let down_addr = self.down_addr.clone();
 
         let handle = tokio::spawn(async move {
-            run_pipeline(session_id, audio, sample_rate, channels, asr, llm, tts, down_addr, cancel, current_real_cancel).await;
+            run_pipeline(
+                session_id,
+                audio,
+                sample_rate,
+                channels,
+                client_tts_sample_rate,
+                client_voice,
+                asr,
+                llm,
+                tts,
+                down_addr,
+                cancel,
+                current_real_cancel,
+            )
+            .await;
         });
 
         self.transition(SessionState::Listening);
@@ -445,6 +510,10 @@ async fn run_pipeline(
     audio: Vec<u8>,
     sample_rate: u32,
     channels: u16,
+    // 端侧 SessionStart 上报的 TTS 输出采样率。`None` 让 HttpTtsClient 走 `TtsConfig.sample_rate` 兜底。
+    client_tts_sample_rate: Option<u32>,
+    // 端侧 SessionStart 上报的 TTS 音色短名。`None` 让 HttpTtsClient 走 `TtsConfig.voice` 兜底。
+    client_voice: Option<String>,
     asr: Arc<dyn AsrClient>,
     llm: Arc<dyn LlmClient>,
     tts: Arc<dyn TtsClient>,
@@ -614,7 +683,18 @@ async fn run_pipeline(
     }
 
     // ===== 阶段 2+3: LLM → 切句 → TTS（共享管线，含句间 crossfade / 全局 seq / 结束标记）=====
-    let mut items = Box::pin(llm_tts_items(prompt, parsed.emotion, session_id.clone(), llm, tts));
+    // sample_rate_override：把端侧 SessionStart 上报的值原样透传 —— HttpTtsClient 内部决定
+    // 用 override 还是配置兜底（sample_rate_override.or(self.sample_rate)）。
+    // voice_override：同理，原样透传 → HttpTtsClient 拼 model 前缀后发给 provider。
+    let mut items = Box::pin(llm_tts_items(
+        prompt,
+        parsed.emotion,
+        session_id.clone(),
+        llm,
+        tts,
+        client_tts_sample_rate,
+        client_voice,
+    ));
     while let Some(item) = {
         tokio::select! {
             _ = cancel.cancelled() => {

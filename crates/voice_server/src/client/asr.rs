@@ -1,24 +1,31 @@
-//! ASR 客户端：基于 `async-openai::audio().transcribe()`
+//! ASR 客户端：手搓 reqwest multipart（不走 async-openai）
 //!
-//! Wire format（OpenAI-Whisper 兼容）：multipart/form-data
-//!   - file: 音频字节
+//! ## 为什么不用 async-openai
+//! SDK 的 `CreateTranscriptionRequest` 只覆盖 OpenAI-Whisper 标准字段（`file`/`model`/`language`/
+//! `response_format`/`prompt`/`temperature`），**没有** FunASR 私有扩展 `punc` / `spk` / `tags`；
+//! SDK 的 multipart 构造也是 internal 的，没法往里塞任意字段。手搓以透传所有 5 个新参数。
+//!
+//! ## Wire format
+//! 请求：`POST {base_url}/audio/transcriptions`，`multipart/form-data`
+//!   - file: 音频字节（filename + content-type）
 //!   - model: 模型 ID
-//!   response: `{"text": "..."}`
+//!   - language / response_format / punc / spk / tags: 可选
+//! 响应（按 response_format 分支）：
+//!   - `json`（默认）：`{"text": "..."}`
+//!   - `text`：纯文本 body
+//!   - `verbose_json`：`{"text", "language", "duration", "segments": [...]}`，spk=true 时 segments 带 speaker
 
-use async_openai::config::{Config, OpenAIConfig};
-use async_openai::error::OpenAIError;
-use async_openai::types::{
-    AudioInput, CreateTranscriptionRequest, CreateTranscriptionResponseJson, InputSource,
-};
-use async_openai::Client;
 use async_stream::try_stream;
 use async_trait::async_trait;
+use reqwest::header::HeaderMap;
+use serde::Deserialize;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, warn};
 
-use crate::client::error::ClientError;
-use crate::config::{asr_openai, AsrConfig, ProviderConfig};
+use crate::client::error::{parse_openai_error, ClientError};
+use crate::config::{AsrConfig, ProviderConfig};
 use crate::session::AsrEvent;
 
 pub type BoxStream<T> = Pin<Box<dyn futures_util::Stream<Item = T> + Send>>;
@@ -37,20 +44,134 @@ pub trait AsrClient: Send + Sync {
     ) -> Result<BoxStream<Result<AsrEvent, ClientError>>, ClientError>;
 }
 
-/// 通用 OpenAI-兼容 ASR 客户端
+/// 通用 OpenAI-兼容 ASR 客户端（手搓 reqwest，支持 FunASR 私有扩展）
 pub struct HttpAsrClient {
-    openai: OpenAIConfig,
-    client: Client<OpenAIConfig>,
+    base_url: String,
+    /// OpenAI-compat 路径。FunASR server 通常挂在 `{api_base}/audio/transcriptions`
+    /// （config 里的 `api_base` 含 `/v1` 后缀时正好对齐）
+    path: String,
+    api_key: Option<String>,
+    extra_headers: HeaderMap,
+    timeout: Duration,
+    client: reqwest::Client,
     model: String,
-    // 注意：async-openai 暂不暴露往请求里塞自定义 header 的口子
-    // （OpenAIConfig::with_http_client 可以接自定义 reqwest，但用起来与 SDK 其他路径有冲突），
-    // 所以 provider / asr.headers 配置项在 ASR / LLM 这里先不消费；TTS 走手搓 reqwest 所以能用。
+    language: Option<String>,
+    response_format: Option<String>,
+    punc: Option<bool>,
+    spk: Option<bool>,
+    tags: Option<bool>,
 }
 
 impl HttpAsrClient {
-    pub fn new(openai: OpenAIConfig, model: String) -> Self {
-        let client = Client::with_config(openai.clone());
-        Self { openai, client, model }
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        base_url: String,
+        path: String,
+        api_key: Option<String>,
+        extra_headers: HeaderMap,
+        timeout: Duration,
+        model: String,
+        language: Option<String>,
+        response_format: Option<String>,
+        punc: Option<bool>,
+        spk: Option<bool>,
+        tags: Option<bool>,
+    ) -> anyhow::Result<Self> {
+        let client = reqwest::Client::builder().timeout(timeout).build()?;
+        Ok(Self {
+            base_url,
+            path,
+            api_key,
+            extra_headers,
+            timeout,
+            client,
+            model,
+            language,
+            response_format,
+            punc,
+            spk,
+            tags,
+        })
+    }
+
+    /// 推一个可选字段到 multipart —— None 时不输出，节省 payload 字节
+    fn push_opt_text(form: reqwest::multipart::Form, name: &str, val: Option<&str>) -> reqwest::multipart::Form {
+        match val {
+            Some(v) if !v.is_empty() => form.text(name.to_string(), v.to_string()),
+            _ => form,
+        }
+    }
+
+    fn push_opt_bool(form: reqwest::multipart::Form, name: &str, val: Option<bool>) -> reqwest::multipart::Form {
+        match val {
+            Some(b) => form.text(name.to_string(), b.to_string()),
+            None => form,
+        }
+    }
+}
+
+// ===== 响应解析 =====
+
+#[derive(Deserialize)]
+struct JsonResponse {
+    #[serde(default)]
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct VerboseJsonResponse {
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    language: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    duration: Option<f64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    segments: Option<Vec<serde_json::Value>>,
+}
+
+/// 按 response_format 提取 `text` 字段；任何格式都收敛到 `AsrEvent { text, is_final: true }`
+fn extract_text(body: &str, response_format: Option<&str>) -> Result<String, ClientError> {
+    match response_format.unwrap_or("json") {
+        "text" => Ok(body.trim().to_string()),
+        "json" => {
+            let r: JsonResponse = serde_json::from_str(body)
+                .map_err(|e| ClientError::Decode(format!("decode ASR json response: {}", e)))?;
+            Ok(r.text)
+        }
+        "verbose_json" => {
+            let r: VerboseJsonResponse = serde_json::from_str(body)
+                .map_err(|e| ClientError::Decode(format!("decode ASR verbose_json response: {}", e)))?;
+            Ok(r.text)
+        }
+        other => Err(ClientError::Decode(format!(
+            "unsupported response_format: {}",
+            other
+        ))),
+    }
+}
+
+/// 按文件名后缀猜 mime —— 上游 funasr-server 用 ffmpeg 解码，content-type 只是 hint，
+/// 主要靠 `filename` 字段决定。给一个合理猜测避免 multipart 默认的 application/octet-stream。
+fn guess_audio_mime(filename: &str) -> &'static str {
+    let lower = filename.to_ascii_lowercase();
+    if lower.ends_with(".wav") {
+        "audio/wav"
+    } else if lower.ends_with(".mp3") {
+        "audio/mpeg"
+    } else if lower.ends_with(".flac") {
+        "audio/flac"
+    } else if lower.ends_with(".ogg") {
+        "audio/ogg"
+    } else if lower.ends_with(".m4a") {
+        "audio/mp4"
+    } else if lower.ends_with(".webm") {
+        "audio/webm"
+    } else {
+        "application/octet-stream"
     }
 }
 
@@ -62,150 +183,237 @@ impl AsrClient for HttpAsrClient {
         filename: Option<&str>,
         audio: Vec<u8>,
     ) -> Result<BoxStream<Result<AsrEvent, ClientError>>, ClientError> {
-        // 请求侧：只打 debug（用户当前不需要看请求细节）
+        let url = if self.path.is_empty() {
+            self.base_url.clone()
+        } else {
+            format!("{}{}", self.base_url, self.path)
+        };
+        let upload_name = filename.unwrap_or("audio.wav").to_string();
+
+        // ===== multipart 组装 =====
+        let file_part = reqwest::multipart::Part::bytes(audio.clone())
+            .file_name(upload_name.clone())
+            .mime_str(guess_audio_mime(&upload_name))
+            .map_err(|e| ClientError::Http(format!("invalid mime: {}", e)))?;
+
+        let mut form = reqwest::multipart::Form::new()
+            .text("model", self.model.clone())
+            .part("file", file_part);
+        form = Self::push_opt_text(form, "language", self.language.as_deref());
+        form = Self::push_opt_text(form, "response_format", self.response_format.as_deref());
+        form = Self::push_opt_bool(form, "punc", self.punc);
+        form = Self::push_opt_bool(form, "spk", self.spk);
+        form = Self::push_opt_bool(form, "tags", self.tags);
+
+        // ===== 请求构造（鉴权 + extra_headers，照搬 tts.rs 模式）=====
+        let mut req = self.client.post(&url).multipart(form);
+        if let Some(key) = &self.api_key {
+            if key.starts_with("Bearer ") || key.starts_with("bearer ") {
+                req = req.header("Authorization", key);
+            } else {
+                req = req.header("Authorization", format!("Bearer {}", key));
+            }
+        }
+        for (name, value) in &self.extra_headers {
+            req = req.header(name, value);
+        }
+
+        // ===== 请求日志 =====
         info!(
             target: "voice_server.asr",
             session_id,
-            api_base = %self.openai.api_base(),
+            method = "POST",
+            url = %url,
             bytes = audio.len(),
             model = %self.model,
-            filename = %filename.unwrap_or("audio.wav"),
-            "ASR 请求 (async-openai transcribe, {} bytes)", audio.len()
+            filename = %upload_name,
+            language = self.language.as_deref().unwrap_or(""),
+            response_format = self.response_format.as_deref().unwrap_or(""),
+            punc = self.punc.unwrap_or(false),
+            spk = self.spk.unwrap_or(false),
+            tags = self.tags.unwrap_or(false),
+            api_key_present = self.api_key.is_some(),
+            extra_headers_count = self.extra_headers.len(),
+            timeout_ms = self.timeout.as_millis() as u64,
+            "ASR 请求即将发送 (multipart, {} bytes)", audio.len()
         );
 
-        // 用前端上传的原始文件名，siliconflow 等 provider 依此选解码器；
-        // 兜底 "audio.wav" 保留旧行为（WS pipeline 是裸 PCM，会沿用兜底）。
-        let upload_name = filename.unwrap_or("audio.wav");
-        let audio_input = AudioInput {
-            source: InputSource::VecU8 {
-                filename: upload_name.to_string(),
-                vec: audio,
-            },
-        };
-        let req = CreateTranscriptionRequest {
-            file: audio_input,
-            model: self.model.clone(),
-            ..Default::default()
-        };
-
-        let resp: CreateTranscriptionResponseJson = match self.client.audio().transcribe(req).await {
+        // ===== 发送 =====
+        let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
-                let err_text = e.to_string();
-                // 按 OpenAIError 变体分类：API 返回的 JSON 错误 / reqwest 传输错误 / 其它
-                let (api_message, api_type, api_param, api_code, reqwest_status, is_timeout, is_connect) =
-                    match &e {
-                        OpenAIError::ApiError(api_err) => (
-                            Some(api_err.message.clone()),
-                            api_err.r#type.clone(),
-                            api_err.param.clone(),
-                            api_err.code.clone(),
-                            None,
-                            false,
-                            false,
-                        ),
-                        OpenAIError::Reqwest(re) => {
-                            let s = re.status().map(|s| s.as_u16());
-                            (
-                                None,
-                                None,
-                                None,
-                                None,
-                                s,
-                                re.is_timeout(),
-                                re.is_connect(),
-                            )
-                        }
-                        // async-openai 拿到非 OpenAI 格式的 error body 时走这里：
-                        // 上游（FunASR / FastAPI 默认 / 自定义）返回 `{"detail": ...}` / `{"message": ...}`，
-                        // 没有顶层 `error` 字段，serde 反序列化为 ApiErrorResponse 失败。
-                        // 注意：原始 body 已被 async-openai 丢掉，只能从 serde err 看到 "格式不对"，
-                        // 真正的 server-side 错误细节仍需看上游日志（或用 reqwest 拦截 raw body）。
-                        OpenAIError::JSONDeserialize(de) => (
-                            Some(format!(
-                                "upstream 返回非 OpenAI 错误格式（缺少 error 字段）: {}",
-                                de
-                            )),
-                            Some("non_openai_error_format".to_string()),
-                            None,
-                            None,
-                            None,
-                            false,
-                            false,
-                        ),
-                        _ => (None, None, None, None, None, false, false),
-                    };
+                let status = e.status().map(|s| s.as_u16()).unwrap_or(0);
                 warn!(
                     target: "voice_server.asr.err",
                     session_id,
-                    api_base = %self.openai.api_base(),
-                    model = %self.model,
-                    error = %err_text,
-                    error_debug = ?e,
-                    api_message = api_message.as_deref().unwrap_or(""),
-                    api_type = api_type.as_deref().unwrap_or(""),
-                    api_param = api_param.as_deref().unwrap_or(""),
-                    api_code = api_code.as_deref().unwrap_or(""),
-                    reqwest_status = reqwest_status.unwrap_or(0),
-                    is_timeout,
-                    is_connect,
-                    "ASR transcribe 失败"
+                    url = %url,
+                    method = "POST",
+                    status,
+                    is_timeout = e.is_timeout(),
+                    is_connect = e.is_connect(),
+                    is_request = e.is_request(),
+                    is_body = e.is_body(),
+                    is_decode = e.is_decode(),
+                    error = %e,
+                    "ASR 请求发送失败（连接/传输层）"
                 );
-                return Err(ClientError::Http(err_text));
+                return Err(ClientError::Http(e.to_string()));
             }
         };
 
-        // 响应侧：raw JSON + 解析后的 text
-        match serde_json::to_string(&resp) {
-            Ok(raw) => info!(
-                target: "voice_server.asr.resp",
+        // ===== 非 2xx → 抓诊断信息（照搬 tts.rs:243-254）=====
+        let status = resp.status();
+        if !status.is_success() {
+            let status_u16 = status.as_u16();
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let request_id = resp
+                .headers()
+                .get("x-request-id")
+                .or_else(|| resp.headers().get("x-trace-id"))
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let headers_dump: String = resp
+                .headers()
+                .iter()
+                .map(|(k, v)| format!("{}: {}", k, v.to_str().unwrap_or("<binary>")))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            // 抓 body 一次：既要写日志（截断预览），又要尝试解析 OpenAI 信封
+            let body = match resp.text().await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(
+                        target: "voice_server.asr.err",
+                        session_id,
+                        url = %url,
+                        status = status_u16,
+                        error = %e,
+                        "ASR 非 2xx body 读取失败"
+                    );
+                    return Err(ClientError::Status(status_u16));
+                }
+            };
+            let body_preview: String = if body.chars().count() > 2048 {
+                let s: String = body.chars().take(2048).collect();
+                format!("{}…<truncated, total {} chars>", s, body.chars().count())
+            } else {
+                body.clone()
+            };
+            warn!(
+                target: "voice_server.asr.err",
                 session_id,
-                raw = %raw,
-                "ASR 原始响应"
-            ),
-            Err(e) => warn!(
-                target: "voice_server.asr.resp",
-                session_id,
-                "ASR 响应序列化失败: {}",
-                e
-            ),
+                url = %url,
+                status = status_u16,
+                content_type = %content_type,
+                request_id = %request_id,
+                headers = %headers_dump,
+                body = %body_preview,
+                "ASR 返回非 2xx"
+            );
+            // 优先按 yapi.md OpenAI 信封解析；解析失败降级到裸 Status
+            if let Some(api_err) = parse_openai_error(&body) {
+                return Err(ClientError::Api {
+                    status: status_u16,
+                    error: api_err,
+                });
+            }
+            return Err(ClientError::Status(status_u16));
         }
+
+        // ===== 2xx：按 response_format 解析 =====
+        let response_format = self.response_format.clone();
+        let raw = resp
+            .text()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+
+        // 原始 body 日志（debug 排查用）
+        info!(
+            target: "voice_server.asr.resp",
+            session_id,
+            body_len = raw.chars().count(),
+            body_preview = %raw.chars().take(512).collect::<String>(),
+            "ASR 原始响应 body"
+        );
+
+        let text = extract_text(&raw, response_format.as_deref())?;
         info!(
             target: "voice_server.asr",
             session_id,
-            text_len = resp.text.chars().count(),
-            text = %resp.text,
+            text_len = text.chars().count(),
+            text = %text,
             "ASR 识别完成"
         );
 
-        // OpenAI-Whisper ASR 返回单 JSON `{"text": "..."}`，非流式
+        // OpenAI-Whisper ASR 返回单 JSON，非流式
         // 包装成单元素 stream（session.rs 已有逻辑适配）
         let stream = try_stream! {
-            yield AsrEvent { text: resp.text, is_final: true };
+            yield AsrEvent {
+                text,
+                is_final: true,
+                // 预留字段 —— verbose_json 的 language/duration/segments 目前未消费，
+                // extract_text 也只返回 text（参见 asr.rs:137）。后续要启用时把
+                // extract_text 换成返回完整结构体即可。
+                language: None,
+                duration: None,
+                segments: None,
+            };
         };
         Ok(Box::pin(stream))
     }
 }
-
-// 注：asr.headers 配置项当前不消费 —— 见 HttpAsrClient 字段上的注释。
 
 pub fn build_asr_client(
     cfg: &AsrConfig,
     provider: Option<&ProviderConfig>,
 ) -> anyhow::Result<Arc<dyn AsrClient>> {
     let resolved = cfg.resolved(provider);
-    let openai = asr_openai(cfg, provider);
+    let base_url = resolved.api_base.clone();
+    let api_key = if resolved.api_key.is_empty() {
+        None
+    } else {
+        Some(resolved.api_key.clone())
+    };
+    let timeout = resolved.timeout();
+    let headers = resolved.to_header_map();
 
     tracing::info!(
         target: "voice_server.factory",
         kind = "http",
-        api_base = %resolved.api_base,
+        base_url = %base_url,
+        path = "/audio/transcriptions",
         model = %cfg.model,
-        "构造 HttpAsrClient"
+        language = cfg.language.as_deref().unwrap_or(""),
+        response_format = cfg.response_format.as_deref().unwrap_or(""),
+        punc = cfg.punc.unwrap_or(false),
+        spk = cfg.spk.unwrap_or(false),
+        tags = cfg.tags.unwrap_or(false),
+        "构造 HttpAsrClient (reqwest multipart)"
     );
 
-    Ok(Arc::new(HttpAsrClient::new(openai, cfg.model.clone())))
+    Ok(Arc::new(HttpAsrClient::new(
+        base_url,
+        "/audio/transcriptions".to_string(),
+        api_key,
+        headers,
+        timeout,
+        cfg.model.clone(),
+        cfg.language.clone(),
+        cfg.response_format.clone(),
+        cfg.punc,
+        cfg.spk,
+        cfg.tags,
+    )?))
 }
+
+// 注：上一版 `asr.headers` 配置项 / OpenAIError 分类的注释已删除 —— 见当前 `extra_headers`
+// 与 5 类 reqwest::Error 分类（is_timeout/is_connect/is_request/is_body/is_decode）。
 
 /// 把裸 PCM（s16le，sample_rate Hz，channels 通道）包成 44 字节 RIFF/WAVE 头。
 ///
@@ -259,5 +467,110 @@ mod tests {
         assert_eq!(u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]), 320);
         // data follows
         assert_eq!(&wav[44..], &pcm[..]);
+    }
+
+    #[test]
+    fn guess_audio_mime_known_extensions() {
+        assert_eq!(guess_audio_mime("audio.wav"), "audio/wav");
+        assert_eq!(guess_audio_mime("audio.mp3"), "audio/mpeg");
+        assert_eq!(guess_audio_mime("audio.flac"), "audio/flac");
+        assert_eq!(guess_audio_mime("audio.ogg"), "audio/ogg");
+        assert_eq!(guess_audio_mime("audio.m4a"), "audio/mp4");
+        assert_eq!(guess_audio_mime("audio.webm"), "audio/webm");
+        // 大小写不敏感
+        assert_eq!(guess_audio_mime("AUDIO.WAV"), "audio/wav");
+        // 未知后缀兜底
+        assert_eq!(guess_audio_mime("audio.bin"), "application/octet-stream");
+        assert_eq!(guess_audio_mime("noext"), "application/octet-stream");
+    }
+
+    #[test]
+    fn extract_text_json_format() {
+        let body = r#"{"text": "你好"}"#;
+        assert_eq!(extract_text(body, Some("json")).unwrap(), "你好");
+    }
+
+    #[test]
+    fn extract_text_json_default_format() {
+        // 缺省 response_format 视为 json
+        let body = r#"{"text": "hello"}"#;
+        assert_eq!(extract_text(body, None).unwrap(), "hello");
+    }
+
+    #[test]
+    fn extract_text_text_format() {
+        // text/plain 格式：body 即文本
+        let body = "你好世界";
+        assert_eq!(extract_text(body, Some("text")).unwrap(), "你好世界");
+        // 带尾随空白也 trim
+        let body = "  hello\n";
+        assert_eq!(extract_text(body, Some("text")).unwrap(), "hello");
+    }
+
+    #[test]
+    fn extract_text_verbose_json_format() {
+        let body = r#"{
+            "task": "transcribe",
+            "language": "zh",
+            "duration": 2.37,
+            "text": "你好，世界。",
+            "segments": [{"id": 0, "start": 0.0, "end": 2.37, "text": "你好，世界。", "words": []}]
+        }"#;
+        assert_eq!(extract_text(body, Some("verbose_json")).unwrap(), "你好，世界。");
+    }
+
+    #[test]
+    fn extract_text_verbose_json_with_spk_segment() {
+        // spk=true 时 segments 带 speaker 字段，必须能解析
+        let body = r#"{
+            "text": "spk0 says hi, spk1 says bye",
+            "language": "en",
+            "duration": 3.0,
+            "segments": [
+                {"id": 0, "start": 0.0, "end": 1.5, "text": "spk0 says hi", "speaker": "spk0", "words": []},
+                {"id": 1, "start": 1.5, "end": 3.0, "text": "spk1 says bye", "speaker": "spk1", "words": []}
+            ]
+        }"#;
+        assert_eq!(
+            extract_text(body, Some("verbose_json")).unwrap(),
+            "spk0 says hi, spk1 says bye"
+        );
+    }
+
+    #[test]
+    fn extract_text_unsupported_format_errors() {
+        let body = "anything";
+        assert!(extract_text(body, Some("xml")).is_err());
+    }
+
+    #[test]
+    fn extract_text_invalid_json_errors() {
+        let body = "{not json}";
+        assert!(extract_text(body, Some("json")).is_err());
+        assert!(extract_text(body, Some("verbose_json")).is_err());
+    }
+
+    #[test]
+    fn push_opt_text_skips_none_and_empty() {
+        let form = reqwest::multipart::Form::new().text("k", "v");
+        // None → 不动 form
+        let _ = HttpAsrClient::push_opt_text(form, "x", None);
+        // 空字符串 → 也不动（避免空值噪音）
+        let _ = HttpAsrClient::push_opt_text(
+            reqwest::multipart::Form::new(),
+            "x",
+            Some(""),
+        );
+        // 这里只能验证不 panic；form 内部状态不可直接 inspect
+    }
+
+    #[test]
+    fn push_opt_bool_skips_none() {
+        let _ = HttpAsrClient::push_opt_bool(reqwest::multipart::Form::new(), "punc", None);
+        let _ = HttpAsrClient::push_opt_bool(
+            reqwest::multipart::Form::new(),
+            "punc",
+            Some(true),
+        );
     }
 }

@@ -43,7 +43,127 @@
   const connStatus = $('conn-status');
   const micStatus = $('mic-status');
   const speakerStatus = $('speaker-status');
-  const latency = $('latency');
+  const btnMicMute = $('btn-mic-mute');
+  const btnSpeakerMute = $('btn-speaker-mute');
+
+  // ====== 麦/喇叭手动静音 ======
+  // micMuted = true 时：worklet 帧不上送（保持 WS 连接，不打断对话）
+  // speakerMuted = true 时：TTS chunk 直接丢弃 + 清空已排队音频
+  let micMuted = false;
+  let speakerMuted = false;
+
+  function applyMuteUi(btn, muted, label, onIcon, offIcon) {
+    btn.dataset.muted = muted ? 'true' : 'false';
+    btn.title = muted ? `${label}：已静音（点击恢复）` : `${label}：正常（点击静音）`;
+    const icon = btn.querySelector('.mute-btn-icon');
+    const lbl = btn.querySelector('.mute-btn-label');
+    if (icon) icon.textContent = muted ? offIcon : onIcon;
+    if (lbl) lbl.textContent = muted ? `${label}静音中` : label;
+  }
+
+  function setMicMuted(muted) {
+    micMuted = !!muted;
+    applyMuteUi(btnMicMute, micMuted, '麦克风', '🎤', '🚫🎤');
+    if (micMuted) {
+      // 徽标改为"已静音"（保留 busy 视觉提示，但 micBusy 信号置 false 避免 avatar 进入 listening）
+      setStatus(micStatus, '麦克风：已静音', 'badge-busy');
+      addMessage('system', '🎤 麦克风已静音 —— 服务端不再收到你的声音');
+    } else {
+      // 取消静音：徽标回到"已开启"；下一帧 worklet 会再把它改成"收音中"
+      setStatus(micStatus, '麦克风：已开启', 'badge-online');
+      addMessage('system', '🎤 麦克风已恢复收音');
+    }
+  }
+
+  function setSpeakerMuted(muted) {
+    speakerMuted = !!muted;
+    applyMuteUi(btnSpeakerMute, speakerMuted, '扬声器', '🔊', '🔇');
+    if (speakerMuted) {
+      // 立即清空播放队列（不打断 WS —— TTS chunk 仍照常接收，下次取消静音可恢复）
+      stopTtsPlayback();
+      setStatus(speakerStatus, '扬声器：已静音', 'badge-busy');
+      addMessage('system', '🔇 扬声器已静音 —— TTS 音频不再播放');
+    } else {
+      setStatus(speakerStatus, '扬声器：空闲', 'badge-online');
+      addMessage('system', '🔊 扬声器已恢复');
+    }
+  }
+
+  if (btnMicMute) btnMicMute.onclick = () => setMicMuted(!micMuted);
+  if (btnSpeakerMute) btnSpeakerMute.onclick = () => setSpeakerMuted(!speakerMuted);
+  // 初始 UI
+  applyMuteUi(btnMicMute, false, '麦克风', '🎤', '🚫🎤');
+  applyMuteUi(btnSpeakerMute, false, '扬声器', '🔊', '🔇');
+
+  // ====== 豆包式 avatar 状态机 ======
+  const avatarWrap = $('phone-avatar-wrap');
+  const phoneStatus = $('phone-status');
+  const phoneSubstatus = $('phone-substatus');
+  const phoneVoiceName = $('phone-voice-name');
+  // 语音管道状态：idle / listening / thinking / speaking
+  let phoneState = 'idle';
+  // 上一帧各路输入信号；状态机按"speaking > listening > thinking > idle"优先级合成
+  let signals = { wsOpen: false, micBusy: false, speakerBusy: false, thinkingUntil: 0 };
+  let stateTimer = null;
+
+  function setPhoneState(next, opts = {}) {
+    if (phoneState === next && !opts.force) return;
+    phoneState = next;
+    if (avatarWrap) avatarWrap.dataset.state = next;
+    if (opts.status !== undefined) phoneStatus.textContent = opts.status;
+    if (opts.substatus !== undefined) phoneSubstatus.textContent = opts.substatus;
+  }
+
+  // 重新合成 avatar 状态：speaking 优先 > listening > thinking(短窗) > idle
+  function recomputePhoneState() {
+    const now = performance.now();
+    if (!signals.wsOpen) {
+      setPhoneState('idle', { status: '未连接', substatus: '点下方按钮开始对话' });
+      return;
+    }
+    if (signals.speakerBusy) {
+      setPhoneState('speaking', { status: '正在说话...', substatus: '' });
+      return;
+    }
+    if (signals.micBusy) {
+      setPhoneState('listening', { status: '正在聆听...', substatus: '' });
+      return;
+    }
+    if (signals.thinkingUntil > now) {
+      const left = ((signals.thinkingUntil - now) / 1000).toFixed(1);
+      setPhoneState('thinking', { status: '正在思考...', substatus: `${left}s` });
+      return;
+    }
+    setPhoneState('idle', { status: '对话进行中', substatus: '等你开口' });
+  }
+
+  // 包装 setStatus：在更新状态徽标同时驱动 avatar 状态机
+  function setPhoneStatus(el, text, klass) {
+    setStatus(el, text, klass);
+    const t = el.textContent;
+    if (el === speakerStatus) {
+      signals.speakerBusy = (klass === 'badge-busy');
+      recomputePhoneState();
+    } else if (el === micStatus) {
+      // mic 实际忙 = 文本里包含"收音中"
+      signals.micBusy = /收音中/.test(t);
+      recomputePhoneState();
+    } else if (el === connStatus) {
+      signals.wsOpen = (klass === 'badge-online');
+      recomputePhoneState();
+    }
+  }
+
+  // 收到 asr_final → 开一个 1.5s 的"思考"窗口，期间 avatar 走 thinking 状态
+  function bumpThinkingWindow() {
+    signals.thinkingUntil = performance.now() + 1500;
+    if (stateTimer) clearTimeout(stateTimer);
+    stateTimer = setTimeout(() => {
+      signals.thinkingUntil = 0;
+      recomputePhoneState();
+    }, 1600);
+    recomputePhoneState();
+  }
 
   // ====== Tab 切换 ======
   // 不影响现有 WS pipeline 状态；切换 tab 只显示/隐藏对应 section
@@ -313,9 +433,22 @@
   }
 
   // ====== UI 辅助 ======
+  // setStatus 同时驱动 avatar 状态机（仅对 connStatus / micStatus / speakerStatus 生效）。
+  // busy 信号按**文本**判断，不按 class —— 这样"已静音"等非 busy 视觉态不会误触发
+  // signals.*Busy，avatar 状态机不会被误导。
   function setStatus(el, text, klass) {
     el.textContent = text;
     el.className = 'badge ' + klass;
+    if (el === speakerStatus) {
+      signals.speakerBusy = /播放中/.test(text);
+    } else if (el === micStatus) {
+      signals.micBusy = /收音中/.test(text);
+    } else if (el === connStatus) {
+      signals.wsOpen = (klass === 'badge-online');
+    }
+    if (el === connStatus || el === micStatus || el === speakerStatus) {
+      recomputePhoneState();
+    }
   }
 
   function addMessage(role, text, opts = {}) {
@@ -356,6 +489,8 @@
   let ttsPlaying = false;
 
   function playTtsAudio(dataBytes, isLast) {
+    // 扬声器静音：直接丢掉这段 TTS 音频（不进队列，不消耗 audio 资源）
+    if (speakerMuted) return;
     const wav = wrapPcmAsWav(dataBytes);
     ttsQueue.push(URL.createObjectURL(new Blob([wav], { type: 'audio/wav' })));
     if (!ttsPlaying) playNextTts();
@@ -432,17 +567,20 @@
       ws.onopen = () => {
         setStatus(connStatus, 'WS：已连接', 'badge-online');
         addMessage('system', '已连接服务端');
-        // 发 SessionStart
-        const start = encodeIndication({
+        // 发 SessionStart；voice 取自当前下拉框（None = 走服务端配置兜底）
+        const voice = window.VoiceSelector.getSelected('pipeline-voice');
+        const startPayload = {
           type: 'session_start',
           session_id: sessionId,
           sample_rate: SAMPLE_RATE,
           channels: CHANNELS,
           codec: 'pcm_s16le',
           language: 'zh-CN',
-        });
+        };
+        if (voice) startPayload.voice = voice;
+        const start = encodeIndication(startPayload);
         ws.send(start);
-        console.log(`[发送] SessionStart session_id=${sessionId} sample_rate=${SAMPLE_RATE} channels=${CHANNELS} codec=pcm_s16le language=zh-CN`);
+        console.log(`[发送] SessionStart session_id=${sessionId} sample_rate=${SAMPLE_RATE} channels=${CHANNELS} codec=pcm_s16le language=zh-CN voice=${voice || '(default)'}`);
         addMessage('system', '已发送 SessionStart');
         resolve();
       };
@@ -479,11 +617,11 @@
                 finalizeMessage(currentUserBubble);
                 currentUserBubble = null;
                 lastAsrStartMs = performance.now();
-                // 用户问句解析完成 → 只打断本地旧回答的语音播放（队列里未播的也算），
-                // 不发 WS interrupt：服务端有自己的 pipeline cancel 逻辑
-                // （上一轮 LLM/TTS 在新问句到来时被自动 cancel）。
-                // 空文本/纯噪音不算新问句，不打断。
-                if (lastAsrText.trim()) stopTtsPlayback();
+                // avatar 进入 thinking 状态：等 LLM 首包 + TTS 首字节的最长 1.5s
+                if (lastAsrText.trim()) {
+                  stopTtsPlayback();
+                  bumpThinkingWindow();
+                }
               }
               break;
             case 'llm_delta':
@@ -710,6 +848,9 @@
     workletNode.port.onmessage = (e) => {
       if (e.data.type !== 'audio') return;
       const { seq, bytes, isLast, rms } = e.data;
+      // 麦克风静音：不发包、不更新状态徽标（避免误导用户以为在收音）
+      // —— worklet 仍然跑着，恢复时无需重新初始化
+      if (micMuted) return;
       if (ws && ws.readyState === WebSocket.OPEN) {
         // timestamp_ms = 本句内时间（isLast 后归零，下一句重新计时）
         if (startedAtMs === null) startedAtMs = Date.now();

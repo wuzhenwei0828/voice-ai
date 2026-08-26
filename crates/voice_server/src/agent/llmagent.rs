@@ -20,7 +20,7 @@ use std::sync::Arc;
 use async_stream::try_stream;
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use tracing::{debug, info};
+use tracing::info;
 
 use crate::agent::memory::{InMemoryStore, MemoryStore, Message, Role, DEFAULT_WINDOW};
 use crate::client::error::ClientError;
@@ -145,7 +145,7 @@ impl LlmClient for LlmAgent {
                         }).await;
                     }
                     let mem_len = store.len(&session_id_owned).await;
-                    debug!(
+                    info!(
                         target: "voice_server.agent",
                         session_id = %session_id_owned,
                         memory_len = mem_len,

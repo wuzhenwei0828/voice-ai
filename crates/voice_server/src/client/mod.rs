@@ -1,10 +1,11 @@
 //! ASR / LLM / TTS 客户端
 //!
-//! 三个 client 都基于 `async-openai` 的 `Client<OpenAIConfig>`，provider 通过
-//! `OpenAIConfig::with_api_base()` 切换（siliconflow、OpenAI 官方等 OpenAI-兼容服务）。
+//! ASR / TTS 走手搓 reqwest（绕开 async-openai 的限制 —— FunASR 私有字段、自定义 voice 字符串），
+//! LLM 仍用 async-openai SDK。provider 通过 `ProviderConfig::api_base` 切换
+//!（siliconflow、OpenAI 官方、自建 ASR 等）。
 //!
 //! 模块组织：
-//!   - `asr.rs`         HttpAsrClient（OpenAI-Whisper multipart）
+//!   - `asr.rs`         HttpAsrClient（手搓 reqwest multipart，支持 FunASR 私有扩展 punc/spk/tags）
 //!   - `funasr.rs`      FunasrClient（直连本地 FunASR 部署，docs/FunASR/runtime/docs/websocket_protocol_zh.md）
 //!   - `llm.rs`         HttpLlmClient
 //!   - `tts.rs`         HttpTtsClient（手搓 reqwest：Voice 枚举不兼容 siliconflow 自定义 voice 字符串）

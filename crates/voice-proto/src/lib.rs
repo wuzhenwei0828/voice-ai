@@ -32,6 +32,16 @@ pub enum VoicePayload {
         channels: u8,
         codec: String,
         language: String,
+        /// **TTS 输出采样率（Hz）** —— 由端侧（浏览器）按 AudioContext 实际能力上报。
+        /// 服务端 `tts.sample_rate` 配置项只做兜底：端侧没传（None / 0）时使用配置值。
+        /// `#[serde(default)]` 兼容旧客户端 —— 不带这字段的 SessionStart 仍能解码。
+        #[serde(default)]
+        tts_sample_rate: Option<u32>,
+        /// **TTS 音色短名**（如 `"alex"`）—— 由端侧（前端 voice 下拉）选好后带过来。
+        /// 服务端 `tts.voice` 配置项只做兜底：端侧没传（None / 空字符串）时使用配置值。
+        /// `#[serde(default)]` 兼容旧客户端。
+        #[serde(default)]
+        voice: Option<String>,
     },
     SessionEnd {
         session_id: String,
@@ -170,11 +180,93 @@ mod tests {
             channels: 1,
             codec: "pcm".into(),
             language: "zh-CN".into(),
+            tts_sample_rate: None,
+            voice: None,
         };
         assert_eq!(p.session_id(), Some("x"));
 
         let e = VoicePayload::Error { code: 1, message: "x".into() };
         assert_eq!(e.session_id(), None);
+    }
+
+    /// tts_sample_rate 缺省（None / 老客户端不发该字段）应能被 round-trip 解码
+    #[test]
+    fn session_start_omits_tts_sample_rate_round_trips() {
+        // 编码端：None（模拟老客户端）
+        let p = VoicePayload::SessionStart {
+            session_id: "s".into(),
+            sample_rate: 16000,
+            channels: 1,
+            codec: "pcm".into(),
+            language: "zh".into(),
+            tts_sample_rate: None,
+            voice: None,
+        };
+        let bytes = encode_indication(&p).unwrap();
+        let (_, decoded) = decode_payload(&bytes).unwrap();
+        match decoded {
+            VoicePayload::SessionStart { tts_sample_rate, voice, .. } => {
+                assert_eq!(tts_sample_rate, None);
+                assert_eq!(voice, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // 验证 #[serde(default)] 在缺字段时也能容错 —— 直接用 rmp-serde 编码一份
+        // 不带 tts_sample_rate / voice 字段的 VoicePayload，再解回，看容错是否生效
+        // （注：Msgpack / JSON 在 serde derive 层都遵循同一个 #[serde(default)] 语义，
+        //  所以即便 wire envelope 是 Message::Indication，serde 容错行为等价）
+        #[derive(serde::Serialize)]
+        struct OldWire<'a> {
+            #[serde(rename = "type")]
+            t: &'a str,
+            session_id: &'a str,
+            sample_rate: u32,
+            channels: u8,
+            codec: &'a str,
+            language: &'a str,
+            // 注意：故意不带 tts_sample_rate / voice —— 模拟老客户端字节
+        }
+        let old = OldWire {
+            t: "session_start",
+            session_id: "s",
+            sample_rate: 16000,
+            channels: 1,
+            codec: "pcm",
+            language: "zh",
+        };
+        let raw = rmp_serde::to_vec_named(&old).unwrap();
+        let v: VoicePayload = rmp_serde::from_slice(&raw).unwrap();
+        match v {
+            VoicePayload::SessionStart { tts_sample_rate, voice, .. } => {
+                assert_eq!(tts_sample_rate, None, "缺省字段应通过 #[serde(default)] 解为 None");
+                assert_eq!(voice, None, "缺省字段应通过 #[serde(default)] 解为 None");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// tts_sample_rate = Some(N) 应能正常 round-trip
+    #[test]
+    fn session_start_with_tts_sample_rate_round_trips() {
+        let p = VoicePayload::SessionStart {
+            session_id: "s".into(),
+            sample_rate: 16000,
+            channels: 1,
+            codec: "pcm".into(),
+            language: "zh".into(),
+            tts_sample_rate: Some(24000),
+            voice: Some("alex".into()),
+        };
+        let bytes = encode_indication(&p).unwrap();
+        let (_, decoded) = decode_payload(&bytes).unwrap();
+        match decoded {
+            VoicePayload::SessionStart { tts_sample_rate, voice, .. } => {
+                assert_eq!(tts_sample_rate, Some(24000));
+                assert_eq!(voice.as_deref(), Some("alex"));
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]

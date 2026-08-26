@@ -160,6 +160,29 @@ main {
   cursor: not-allowed;
 }
 
+/* TTS 音色下拉 —— 各 tab 共用 */
+.voice-selector {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: #c9d1d9;
+}
+.voice-selector select {
+  padding: 6px 10px;
+  font-size: 13px;
+  font-family: inherit;
+  background: #0e1117;
+  color: #e6e6e6;
+  border: 1px solid #3a4150;
+  border-radius: 6px;
+  min-width: 120px;
+}
+.voice-selector select:disabled {
+  color: #8b949e;
+  cursor: not-allowed;
+}
+
 .status-text {
   font-size: 12px;
   color: #8b949e;
@@ -372,6 +395,320 @@ main {
   color: #4a5260;
   font-style: italic;
   padding: 40px;
+}
+
+/* ====== 豆包式"打电话"全流程对话 tab ====== */
+.phone-call {
+  /* 全屏体验：吃掉 main 的 padding，让舞台居中 */
+  margin: -16px -24px;
+  min-height: calc(100vh - 200px);
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  background:
+    radial-gradient(ellipse at top, #1f2440 0%, #0e1117 60%),
+    #0e1117;
+}
+
+.phone-mute-controls {
+  display: flex;
+  gap: 8px;
+}
+
+/* 顶部静音按钮条（无左边的状态徽标，右对齐） */
+.phone-mute-top {
+  justify-content: flex-end;
+  padding: 12px 24px 0;
+}
+
+/* ====== 静音按钮 ====== */
+.mute-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  background: rgba(45, 161, 74, 0.18);
+  color: #86efac;
+  border: 1px solid rgba(45, 161, 74, 0.45);
+  border-radius: 18px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.mute-btn:hover { background: rgba(45, 161, 74, 0.32); }
+
+.mute-btn-icon {
+  font-size: 15px;
+  line-height: 1;
+}
+
+.mute-btn[data-muted="true"] {
+  background: rgba(193, 69, 69, 0.22);
+  color: #fca5a5;
+  border-color: rgba(193, 69, 69, 0.55);
+}
+.mute-btn[data-muted="true"]:hover { background: rgba(193, 69, 69, 0.36); }
+
+/* 在头像旁 / 中央舞台展示时 */
+.phone-mute-controls .mute-btn {
+  padding: 8px 14px;
+  font-size: 13px;
+}
+
+/* ====== 中央通话舞台 ====== */
+.phone-stage {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 24px 16px;
+  min-height: 420px;
+}
+
+/* 头像 + 波形 */
+.phone-avatar-wrap {
+  position: relative;
+  width: 200px;
+  height: 200px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 8px;
+}
+
+/* 三圈呼吸波形 —— 默认 idle 隐藏，只在 listening/thinking/speaking 时显示 */
+.phone-wave {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 180px;
+  height: 180px;
+  margin: -90px 0 0 -90px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.phone-avatar {
+  position: relative;
+  width: 160px;
+  height: 160px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #4f8ef7 0%, #7c5cff 50%, #b266ff 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow:
+    0 0 0 4px rgba(124, 92, 255, 0.18),
+    0 12px 40px rgba(80, 60, 180, 0.45);
+  transition: box-shadow 0.4s ease;
+}
+
+.phone-avatar-emoji {
+  font-size: 70px;
+  line-height: 1;
+  filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.3));
+}
+
+/* 状态文字 */
+.phone-status {
+  font-size: 28px;
+  font-weight: 600;
+  color: #f0f6fc;
+  letter-spacing: 0.04em;
+  text-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
+  transition: color 0.3s ease;
+}
+.phone-substatus {
+  font-size: 14px;
+  color: #8b949e;
+  margin-top: -8px;
+  min-height: 18px;
+}
+.phone-voice-name {
+  font-size: 13px;
+  color: #6e7681;
+  margin-top: 8px;
+}
+.phone-voice-name span {
+  color: #c9d1d9;
+  font-weight: 500;
+}
+
+/* ====== 状态色 ====== */
+
+/* idle：头像轻呼吸 */
+.phone-avatar-wrap[data-state="idle"] .phone-avatar {
+  animation: phone-breathe 3.6s ease-in-out infinite;
+  filter: saturate(0.85);
+}
+
+/* listening：绿色三圈波形 + 头像绿色光晕 */
+.phone-avatar-wrap[data-state="listening"] .phone-wave {
+  border-color: #4ade80;
+  animation: phone-ping 2.4s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+.phone-avatar-wrap[data-state="listening"] .phone-wave-2 { animation-delay: 0.8s; }
+.phone-avatar-wrap[data-state="listening"] .phone-wave-3 { animation-delay: 1.6s; }
+.phone-avatar-wrap[data-state="listening"] .phone-avatar {
+  box-shadow:
+    0 0 0 4px rgba(74, 222, 128, 0.22),
+    0 12px 40px rgba(74, 222, 128, 0.4);
+}
+.phone-avatar-wrap[data-state="listening"] ~ .phone-status { color: #86efac; }
+
+/* thinking：蓝色三圈（节奏更快）+ 头像蓝色光晕 */
+.phone-avatar-wrap[data-state="thinking"] .phone-wave {
+  border-color: #60a5fa;
+  animation: phone-ping 1.6s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+.phone-avatar-wrap[data-state="thinking"] .phone-wave-2 { animation-delay: 0.5s; }
+.phone-avatar-wrap[data-state="thinking"] .phone-wave-3 { animation-delay: 1.0s; }
+.phone-avatar-wrap[data-state="thinking"] .phone-avatar {
+  box-shadow:
+    0 0 0 4px rgba(96, 165, 250, 0.22),
+    0 12px 40px rgba(96, 165, 250, 0.4);
+}
+.phone-avatar-wrap[data-state="thinking"] ~ .phone-status { color: #93c5fd; }
+
+/* speaking：橙色三圈 + 头像橙色光晕 */
+.phone-avatar-wrap[data-state="speaking"] .phone-wave {
+  border-color: #fb923c;
+  animation: phone-ping 2.0s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+.phone-avatar-wrap[data-state="speaking"] .phone-wave-2 { animation-delay: 0.66s; }
+.phone-avatar-wrap[data-state="speaking"] .phone-wave-3 { animation-delay: 1.33s; }
+.phone-avatar-wrap[data-state="speaking"] .phone-avatar {
+  box-shadow:
+    0 0 0 4px rgba(251, 146, 60, 0.22),
+    0 12px 40px rgba(251, 146, 60, 0.4);
+}
+.phone-avatar-wrap[data-state="speaking"] ~ .phone-status { color: #fdba74; }
+
+@keyframes phone-breathe {
+  0%, 100% { transform: scale(1); }
+  50%      { transform: scale(1.04); }
+}
+
+@keyframes phone-ping {
+  0%   { transform: scale(1);   opacity: 0.75; }
+  80%  { transform: scale(1.6); opacity: 0;    }
+  100% { transform: scale(1.6); opacity: 0;    }
+}
+
+/* ====== 大按钮组 ====== */
+.phone-controls {
+  display: flex;
+  gap: 28px;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 16px 32px;
+}
+
+.phone-btn {
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  color: #fff;
+  font-weight: 600;
+  transition: transform 0.15s ease, background 0.2s ease, box-shadow 0.2s ease;
+}
+.phone-btn:hover:not(:disabled) { transform: scale(1.05); }
+.phone-btn:active:not(:disabled) { transform: scale(0.96); }
+.phone-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+/* 开始（绿色通话按钮） */
+.phone-btn-start {
+  width: 88px;
+  height: 88px;
+  background: linear-gradient(135deg, #2da14a 0%, #4ade80 100%);
+  box-shadow: 0 10px 28px rgba(45, 161, 74, 0.45);
+}
+.phone-btn-start:hover:not(:disabled) { box-shadow: 0 14px 36px rgba(45, 161, 74, 0.55); }
+.phone-btn-icon {
+  font-size: 36px;
+  line-height: 1;
+}
+
+/* 结束（红色挂断按钮） */
+.phone-btn-stop {
+  width: 88px;
+  height: 88px;
+  background: linear-gradient(135deg, #c14545 0%, #ef4444 100%);
+  box-shadow: 0 10px 28px rgba(193, 69, 69, 0.45);
+}
+.phone-btn-stop:hover:not(:disabled) { box-shadow: 0 14px 36px rgba(193, 69, 69, 0.55); }
+.phone-btn-stop .phone-btn-icon {
+  font-size: 40px;
+  font-weight: 700;
+}
+
+/* 打断（橙色，稍小） */
+.phone-btn-interrupt {
+  width: 60px;
+  height: 60px;
+  background: linear-gradient(135deg, #c08f3d 0%, #fbbf24 100%);
+  box-shadow: 0 6px 18px rgba(192, 143, 61, 0.45);
+  font-size: 14px;
+}
+.phone-btn-interrupt:hover:not(:disabled) { box-shadow: 0 8px 22px rgba(192, 143, 61, 0.55); }
+
+/* ====== 折叠区（对话日志 / 设置） ====== */
+.phone-details {
+  margin: 0 16px 12px;
+  background: rgba(22, 27, 34, 0.7);
+  border: 1px solid #2a2f3a;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.phone-details > summary {
+  cursor: pointer;
+  padding: 10px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #c9d1d9;
+  user-select: none;
+  list-style: none;
+}
+.phone-details > summary::-webkit-details-marker { display: none; }
+.phone-details > summary::before {
+  content: "▸ ";
+  display: inline-block;
+  transition: transform 0.15s;
+}
+.phone-details[open] > summary::before { content: "▾ "; }
+.phone-details[open] > summary { border-bottom: 1px solid #2a2f3a; }
+
+.phone-conv-log {
+  max-height: 36vh;
+  padding: 12px;
+  margin: 0;
+}
+
+.phone-settings-body {
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* pipeline tab 内 voice-selector 占满一行 */
+.phone-settings-body .voice-selector {
+  font-size: 14px;
+}
+.phone-settings-body .voice-selector select {
+  min-width: 160px;
+  padding: 8px 12px;
 }
 
 .msg {

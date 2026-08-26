@@ -14,7 +14,6 @@
     <span id="conn-status" class="badge badge-offline">未连接</span>
     <span id="mic-status" class="badge badge-offline">麦克风：关</span>
     <span id="speaker-status" class="badge badge-offline">扬声器：空闲</span>
-    <span id="latency" class="badge">延迟：--</span>
   </div>
 </header>
 
@@ -29,26 +28,74 @@
 
 <main>
   <!-- ========== 全流程对话（现有 WS pipeline）========== -->
-  <section id="tab-pipeline" class="tab-pane">
-    <div class="pane-grid">
-      <section class="controls">
-        <button id="btn-start">开始对话</button>
-        <button id="btn-interrupt" disabled>打断</button>
-        <button id="btn-stop" disabled>结束</button>
+  <section id="tab-pipeline" class="tab-pane phone-call">
+    <!-- 静音手动开关（连接 / 麦 / 喇叭 状态徽标统一在页面顶部 header 显示） -->
+    <div class="phone-mute-controls phone-mute-top">
+      <button id="btn-mic-mute" class="mute-btn" data-muted="false" title="麦克风静音 / 恢复">
+        <span class="mute-btn-icon" data-on="🎤" data-off="🎤"></span>
+        <span class="mute-btn-label">麦克风</span>
+      </button>
+      <button id="btn-speaker-mute" class="mute-btn" data-muted="false" title="扬声器静音 / 恢复">
+        <span class="mute-btn-icon" data-on="🔊" data-off="🔊"></span>
+        <span class="mute-btn-label">扬声器</span>
+      </button>
+    </div>
+
+    <!-- 中央通话舞台：头像 + 呼吸波形 + 状态文字 -->
+    <div class="phone-stage">
+      <div class="phone-avatar-wrap" id="phone-avatar-wrap" data-state="idle">
+        <!-- 三圈呼吸波形 —— 状态切换时显示/隐藏 -->
+        <div class="phone-wave phone-wave-1"></div>
+        <div class="phone-wave phone-wave-2"></div>
+        <div class="phone-wave phone-wave-3"></div>
+        <!-- 头像 -->
+        <div class="phone-avatar">
+          <span class="phone-avatar-emoji">🤖</span>
+        </div>
+      </div>
+
+      <div class="phone-status" id="phone-status">准备就绪</div>
+      <div class="phone-substatus" id="phone-substatus">点下方按钮开始对话</div>
+
+      <div class="phone-voice-name">
+        音色：<span id="phone-voice-name">加载中...</span>
+      </div>
+    </div>
+
+    <!-- 大按钮组（豆包式：开始=绿圆形 / 打断=橙 / 结束=红圆形） -->
+    <div class="phone-controls">
+      <button id="btn-interrupt" class="phone-btn phone-btn-interrupt" disabled>打断</button>
+      <button id="btn-start" class="phone-btn phone-btn-start" title="开始对话">
+        <span class="phone-btn-icon">📞</span>
+      </button>
+      <button id="btn-stop" class="phone-btn phone-btn-stop" disabled title="结束">
+        <span class="phone-btn-icon">✕</span>
+      </button>
+    </div>
+
+    <!-- 折叠：对话日志 -->
+    <details class="phone-details" id="phone-transcript-details">
+      <summary>📜 对话日志</summary>
+      <div id="conv-log" class="conv-log phone-conv-log">
+        <div class="empty-hint">（还没开始说话）</div>
+      </div>
+    </details>
+
+    <!-- 折叠：设置（音色 / 说明） -->
+    <details class="phone-details">
+      <summary>⚙️ 设置</summary>
+      <div class="phone-settings-body">
+        <label class="voice-selector">
+          TTS 音色：
+          <select id="pipeline-voice"><option value="">(加载中...)</option></select>
+        </label>
         <div class="hint">
           浏览器需授权麦克风；点"开始对话"后会持续收音并自动检测句尾。
           说完一句稍作停顿即可（VAD 静音约 600ms）。
           上传录音文件走「📁 ASR→LLM→TTS」tab。
         </div>
-      </section>
-
-      <section class="conversation">
-        <div class="conversation-title">对话日志</div>
-        <div id="conv-log" class="conv-log">
-          <div class="empty-hint">（还没开始说话）</div>
-        </div>
-      </section>
-    </div>
+      </div>
+    </details>
   </section>
 
   <!-- ========== ASR 单能力 ========== -->
@@ -92,6 +139,10 @@
       <div class="hint">输入文本 → POST /admin/tts → 流式音频 chunk → 拼成 WAV 后播放</div>
       <div class="test-controls">
         <textarea id="tts-text" rows="2" placeholder="输入要合成的文本，例如：你好世界"></textarea>
+        <label class="voice-selector">
+          音色：
+          <select id="tts-voice"><option value="">(加载中...)</option></select>
+        </label>
         <button id="tts-run">▶ 跑 TTS</button>
         <span id="tts-status" class="status-text">空闲</span>
       </div>
@@ -112,6 +163,10 @@
       <div class="hint">输入文本 → POST /admin/llm_tts → LLM 流式 + 切句 + TTS 流式 → 拼成 WAV 后播放</div>
       <div class="test-controls">
         <textarea id="llm_tts-text" rows="2" placeholder="输入文本，例如：讲个笑话"></textarea>
+        <label class="voice-selector">
+          音色：
+          <select id="llm_tts-voice"><option value="">(加载中...)</option></select>
+        </label>
         <button id="llm_tts-run">▶ 跑 LLM→TTS</button>
         <span id="llm_tts-status" class="status-text">空闲</span>
       </div>
@@ -131,6 +186,10 @@
       <div class="hint">上传 WAV/裸 PCM 文件 → POST /admin/asr_llm_tts → ASR 识别 → LLM 流式 → 切句 TTS，分阶段 NDJSON 事件</div>
       <div class="test-controls">
         <input id="asr_llm_tts-file-input" type="file" accept=".wav,.raw,.pcm,audio/*" />
+        <label class="voice-selector">
+          音色：
+          <select id="asr_llm_tts-voice"><option value="">(加载中...)</option></select>
+        </label>
         <button id="asr_llm_tts-run" disabled>▶ 跑全链路</button>
         <span id="asr_llm_tts-status" class="status-text">等待选择文件...</span>
       </div>
@@ -154,6 +213,7 @@
 </main>
 
 <script src="ndjson.js"></script>
+<script src="voice_selector.js"></script>
 <script src="tab_asr.js"></script>
 <script src="tab_llm.js"></script>
 <script src="tab_tts.js"></script>

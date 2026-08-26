@@ -55,6 +55,7 @@
 
   btnRun.onclick = async () => {
     if (!selectedFile) return;
+    const voice = window.VoiceSelector.getSelected('asr_llm_tts-voice');
     btnRun.disabled = true;
     fileInput.disabled = true;
     reset();
@@ -64,7 +65,11 @@
       log('upload start:', selectedFile.name, buf.byteLength, 'B');
 
       setStatus('调用 /admin/asr_llm_tts ...');
-      const resp = await fetch('/admin/asr_llm_tts', {
+      // /admin/asr_llm_tts 是裸 PCM body，voice 走 query 参数
+      const url = voice
+        ? `/admin/asr_llm_tts?voice=${encodeURIComponent(voice)}`
+        : '/admin/asr_llm_tts';
+      const resp = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
         body: buf,

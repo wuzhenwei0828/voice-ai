@@ -18,7 +18,7 @@
 //!   - 流中途出错：插一行 {error, code} 然后断流（HTTP 200 已发，不能改 status）
 //!     错误码约定：1001 asr / 1002 llm 调用 / 1003 llm 流 / 1004 tts 调用 / 1005 tts 流
 
-use actix_web::web::{Bytes, Data, Json};
+use actix_web::web::{Bytes, Data, Json, Query};
 use actix_web::HttpResponse;
 use async_stream::{stream, try_stream};
 use futures_util::{Stream, StreamExt};
@@ -29,6 +29,28 @@ use tracing::{debug, info, warn};
 
 use crate::client::{asr::wrap_pcm_as_wav, ArcAsr, ArcLlm, ArcTts, ClientError};
 use crate::session::{next_sentence_end, parse_asr_emotion_tags, AsrEvent, LlmEvent};
+
+/// 把 `ClientError` 转成 actix 响应。
+///
+/// - `ClientError::Api { status, error }`：保留上游 HTTP 状态码 + 渲染 OpenAI 信封 body，
+///   这样下游能看到 `model_not_found` / `file_too_large` / `invalid_value` 等真实错误分类
+///   （而不是被一律降级成 HTTP 500 + reqwest 错误字符串）。
+/// - 其他变体：维持旧行为，HTTP 500 + 错误字符串。
+fn api_err_to_response(e: ClientError) -> actix_web::Error {
+    if let Some((status, body)) = e.render_api_envelope() {
+        let sc = actix_web::http::StatusCode::from_u16(status)
+            .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
+        actix_web::error::InternalError::from_response(
+            e.to_string(),
+            HttpResponse::build(sc)
+                .content_type("application/json")
+                .body(body),
+        )
+        .into()
+    } else {
+        actix_web::error::ErrorInternalServerError(e.to_string())
+    }
+}
 
 // ====== 请求 / 响应结构 ======
 
@@ -44,6 +66,10 @@ pub struct TtsReq {
     pub text: String,
     #[serde(default)]
     pub session_id: Option<String>,
+    /// 端侧选中的音色**短名**（如 `"alex"`）。`None` → 用 `tts.voice` 配置默认。
+    /// 不在白名单时由 HttpTtsClient 返回 `ClientError::Config`。
+    #[serde(default)]
+    pub voice: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,7 +95,28 @@ pub struct TtsLine {
 #[derive(Debug, Serialize)]
 pub struct ErrorLine {
     pub error: String,
+    /// voice-server 内部管线阶段码（1001 asr / 1002 llm / 1003 llm 流 / 1004 tts / 1005 tts 流）
     pub code: u16,
+    /// yapi 兼容：上游 OpenAI 信封原文（如 `{"error":{...}}`）。`None` 表示非 OpenAI 错误。
+    /// 目前只有 `asr_llm_tts` 阶段的 ASR 调用错误会填；其他阶段保留 `None`。
+    /// 前端可以直接 `JSON.parse(type)` 拿上游的 `message/type/param/code`。
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+    /// yapi 兼容：导致错误的字段名。**预留字段**，目前未填充（保留给后续扩展）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub param: Option<String>,
+}
+
+impl ErrorLine {
+    /// 构造一个不带 yapi 上游信封的 ErrorLine（绝大多数 case 走这条）
+    fn new(error: String, code: u16) -> Self {
+        Self {
+            error,
+            code,
+            r#type: None,
+            param: None,
+        }
+    }
 }
 
 // ====== /admin/asr_llm_tts 分阶段事件行 ======
@@ -168,7 +215,7 @@ where
                     yield Bytes::from(line);
                 }
                 Err(e) => {
-                    let err_line = ErrorLine { error: e.to_string(), code: 500 };
+                    let err_line = ErrorLine::new(e.to_string(), 500);
                     let mut line = serde_json::to_vec(&err_line)
                         .map_err(|e2| actix_web::error::ErrorInternalServerError(e2.to_string()))?;
                     line.push(b'\n');
@@ -337,7 +384,7 @@ pub async fn asr(
     let stream = asr
         .recognize(&sid, None, prepared)
         .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
+        .map_err(api_err_to_response)?;
 
     // AsrEvent -> AsrLine
     let line_stream = stream.map(|res| res.map(|e: AsrEvent| AsrLine {
@@ -376,7 +423,7 @@ pub async fn llm(
 }
 
 /// POST /admin/tts
-/// body: `{"text":"...","session_id":"可选"}`
+/// body: `{"text":"...","session_id":"可选","voice":"可选短名"}`
 /// 内部：用 next_sentence_end 按句子切分，逐句调 tts.synthesize，
 ///       句间过 crossfade 消除波形拼接尖刺。
 /// response: NDJSON `{"seq":N,"audio":"<base64>","is_last":false|true}`
@@ -386,22 +433,48 @@ pub async fn tts(
     tts: Data<ArcTts>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let sid = req.session_id.clone().unwrap_or_else(|| gen_sid("tts"));
-    info!(target: "voice_server.admin_api", endpoint = "tts", session_id = %sid, text_len = req.text.chars().count(), "/admin/tts 收到请求");
+    info!(
+        target: "voice_server.admin_api",
+        endpoint = "tts",
+        session_id = %sid,
+        text_len = req.text.chars().count(),
+        voice_override = ?req.voice,
+        "/admin/tts 收到请求"
+    );
 
     let text = req.text.clone();
     let sid_inner = sid.clone();
+    let voice_override = req.voice.clone();
 
+    // voice_override 由端侧（前端的 voice 下拉）提供；None → HttpTtsClient 走配置兜底
     Ok(HttpResponse::Ok()
         .content_type("application/x-ndjson")
-        .streaming(build_tts_sentence_stream(text, sid_inner, tts.get_ref().clone())))
+        .streaming(build_tts_sentence_stream(
+            text,
+            sid_inner,
+            tts.get_ref().clone(),
+            None,
+            voice_override,
+        )))
 }
 
 /// 把一段长文本按 next_sentence_end 切句，逐句调 TTS，过 SentenceCrossfader 后下发。
 /// 与 build_llm_tts_stream 结构对称，只是没有 LLM 阶段。
+///
+/// `sample_rate_override`：端侧 SessionStart 上报的 TTS 输出采样率。
+///   - `Some(n)` —— 覆盖 `TtsConfig.sample_rate`
+///   - `None` —— 走配置兜底
+///   - /admin/llm_tts 与 /admin/asr_llm_tts 没有 SessionStart，传 `None`。
+///
+/// `voice_override`：端侧（前端的 voice 下拉）选中的音色短名（如 `"alex"`）。
+///   - `Some("alex")` —— 用该短名（HttpTtsClient 拼 model 前缀后发给 provider）
+///   - `None` —— 用配置 `TtsConfig.voice` 默认
 fn build_tts_sentence_stream(
     text: String,
     sid: String,
     tts: ArcTts,
+    sample_rate_override: Option<u32>,
+    voice_override: Option<String>,
 ) -> impl Stream<Item = Result<Bytes, actix_web::Error>> + 'static {
     try_stream! {
         let mut buf = text;
@@ -414,11 +487,11 @@ fn build_tts_sentence_stream(
             buf = buf[end..].to_string();
             info!(target: "voice_server.admin_api", endpoint = "tts", session_id = %sid, sentence = %sent, "切出句子送 TTS");
 
-            let mut stream = match tts.synthesize(&sid, &sent).await {
+            let mut stream = match tts.synthesize(&sid, &sent, sample_rate_override, voice_override.clone()).await {
                 Ok(s) => s,
                 Err(e) => {
                     warn!(target: "voice_server.admin_api", endpoint = "tts", session_id = %sid, "TTS 调用失败: {}", e);
-                    let err_line = ErrorLine { error: format!("tts error: {}", e), code: 1102 };
+                    let err_line = ErrorLine::new(format!("tts error: {}", e), 1102);
                     let mut line = serde_json::to_vec(&err_line)
                         .map_err(|e2| actix_web::error::ErrorInternalServerError(e2.to_string()))?;
                     line.push(b'\n');
@@ -433,7 +506,7 @@ fn build_tts_sentence_stream(
                     Ok(e) => e,
                     Err(e) => {
                         warn!(target: "voice_server.admin_api", endpoint = "tts", session_id = %sid, "TTS 流错误: {}", e);
-                        let err_line = ErrorLine { error: format!("tts stream: {}", e), code: 1103 };
+                        let err_line = ErrorLine::new(format!("tts stream: {}", e), 1103);
                         let mut line = serde_json::to_vec(&err_line)
                             .map_err(|e2| actix_web::error::ErrorInternalServerError(e2.to_string()))?;
                         line.push(b'\n');
@@ -459,7 +532,7 @@ fn build_tts_sentence_stream(
         let tail = buf.trim().to_string();
         if !tail.is_empty() {
             info!(target: "voice_server.admin_api", endpoint = "tts", session_id = %sid, sentence = %tail, "TTS 末尾残余句子送 TTS");
-            if let Ok(mut stream) = tts.synthesize(&sid, &tail).await {
+            if let Ok(mut stream) = tts.synthesize(&sid, &tail, sample_rate_override, voice_override.clone()).await {
                 fader.begin_sentence();
                 while let Some(item) = stream.next().await {
                     if let Ok(e) = item {
@@ -512,13 +585,29 @@ pub async fn llm_tts(
     tts: Data<ArcTts>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let sid = req.session_id.clone().unwrap_or_else(|| gen_sid("llm_tts"));
-    info!(target: "voice_server.admin_api", endpoint = "llm_tts", session_id = %sid, text_len = req.text.chars().count(), "/admin/llm_tts 收到请求");
+    info!(
+        target: "voice_server.admin_api",
+        endpoint = "llm_tts",
+        session_id = %sid,
+        text_len = req.text.chars().count(),
+        voice_override = ?req.voice,
+        "/admin/llm_tts 收到请求"
+    );
 
     let prompt = req.text.clone();
     let sid_inner = sid.clone();
+    let voice_override = req.voice.clone();
 
     // /admin/llm_tts 是直接调 LLM，不经过 ASR，没有情绪标签可解析
-    let items = llm_tts_items(prompt, None, sid_inner, llm.get_ref().clone(), tts.get_ref().clone());
+    let items = llm_tts_items(
+        prompt,
+        None,
+        sid_inner,
+        llm.get_ref().clone(),
+        tts.get_ref().clone(),
+        None,
+        voice_override,
+    );
 
     Ok(HttpResponse::Ok()
         .content_type("application/x-ndjson")
@@ -539,7 +628,7 @@ fn llm_tts_lines(
                     yield ndjson_line(&TtsLine { seq, audio, is_last })?;
                 }
                 LlmTtsItem::Failed { error, code } => {
-                    yield ndjson_line(&ErrorLine { error, code })?;
+                    yield ndjson_line(&ErrorLine::new(error, code))?;
                 }
             }
         }
@@ -553,12 +642,24 @@ fn llm_tts_lines(
 ///
 /// `emotion_hint`：从 ASR 文本里解析出来的说话人情绪（参见 `session::parse_asr_emotion_tags`），
 /// 作为 system message 的参考传给 LLM。`None` 表示无情绪（如 `/admin/llm_tts` 直接调用的场景）。
+///
+/// `sample_rate_override`：端侧 SessionStart 上报的 TTS 输出采样率。
+///   - `Some(n)` —— 覆盖 `TtsConfig.sample_rate`
+///   - `None` —— 走配置兜底
+///   - /admin/llm_tts 与 /admin/asr_llm_tts 没有 SessionStart，传 `None`。
+///
+/// `voice_override`：端侧（前端的 voice 下拉）选中的音色短名（如 `"alex"`）。
+///   - `Some("alex")` —— 覆盖 `TtsConfig.voice`
+///   - `None` —— 走配置兜底
+///   - /admin/llm_tts 与 /admin/asr_llm_tts 没有下拉时传 `None`。
 pub fn llm_tts_items(
     prompt: String,
     emotion_hint: Option<String>,
     sid: String,
     llm: ArcLlm,
     tts: ArcTts,
+    sample_rate_override: Option<u32>,
+    voice_override: Option<String>,
 ) -> impl Stream<Item = LlmTtsItem> + 'static {
     stream! {
         // 阶段 1: 拉 LLM 流
@@ -609,7 +710,7 @@ pub fn llm_tts_items(
                 sentence_buf = sentence_buf[end..].to_string();
                 info!(target: "voice_server.admin_api", endpoint = "llm_tts", session_id = %sid, sentence = %sent, "切出句子送 TTS");
 
-                let mut tts_stream = match tts.synthesize(&sid, &sent).await {
+                let mut tts_stream = match tts.synthesize(&sid, &sent, sample_rate_override, voice_override.clone()).await {
                     Ok(s) => s,
                     Err(e) => {
                         warn!(target: "voice_server.admin_api", endpoint = "llm_tts", session_id = %sid, "TTS 调用失败: {}", e);
@@ -647,7 +748,7 @@ pub fn llm_tts_items(
         let tail = sentence_buf.trim().to_string();
         if !tail.is_empty() {
             info!(target: "voice_server.admin_api", endpoint = "llm_tts", session_id = %sid, sentence = %tail, "LLM 末尾残余句子送 TTS");
-            if let Ok(mut tts_stream) = tts.synthesize(&sid, &tail).await {
+            if let Ok(mut tts_stream) = tts.synthesize(&sid, &tail, sample_rate_override, voice_override.clone()).await {
                 fader.begin_sentence();
                 while let Some(tts_item) = tts_stream.next().await {
                     if let Ok(t) = tts_item {
@@ -685,10 +786,19 @@ pub async fn asr_llm_tts(
     asr: Data<ArcAsr>,
     llm: Data<ArcLlm>,
     tts: Data<ArcTts>,
+    // /admin/asr_llm_tts 是裸 PCM body，没法用 JSON 字段传 voice → 用 query 参数
+    query: Query<AsrLlmTtsQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let sid = gen_sid("asr_llm_tts");
     let bytes_len = body.len();
-    info!(target: "voice_server.admin_api", endpoint = "asr_llm_tts", session_id = %sid, bytes = bytes_len, "/admin/asr_llm_tts 收到请求");
+    info!(
+        target: "voice_server.admin_api",
+        endpoint = "asr_llm_tts",
+        session_id = %sid,
+        bytes = bytes_len,
+        voice_override = ?query.voice,
+        "/admin/asr_llm_tts 收到请求"
+    );
 
     // 统一预处理：WAV/裸 PCM 都包成 16kHz mono s16le WAV。失败 → 400 短文本。
     let prepared = match prepare_audio_for_asr(body.to_vec()) {
@@ -708,7 +818,44 @@ pub async fn asr_llm_tts(
             asr.get_ref().clone(),
             llm.get_ref().clone(),
             tts.get_ref().clone(),
+            query.voice.clone(),
         )))
+}
+
+/// /admin/asr_llm_tts 的 query 参数：现在仅 `voice`（短名，可选）。
+#[derive(Debug, serde::Deserialize)]
+pub struct AsrLlmTtsQuery {
+    #[serde(default)]
+    pub voice: Option<String>,
+}
+
+/// GET /admin/voices
+///
+/// 给前端拉"音色列表 + 默认值"，用于填充 voice 下拉框。
+///
+/// response: JSON
+/// ```json
+/// { "voices": ["alex", "anna", ...], "default": "alex" }
+/// ```
+///
+/// 白名单 `SUPPORTED_VOICES` 硬编码在 `client::tts`（与 HttpTtsClient 共享）；
+/// 默认值从 `TtsClient::default_voice_short()` 拿（即 yaml `tts.voice`）。
+pub async fn voices(tts: Data<ArcTts>) -> Result<HttpResponse, actix_web::Error> {
+    use crate::client::tts::SUPPORTED_VOICES;
+
+    let resp = VoicesResp {
+        voices: SUPPORTED_VOICES.iter().map(|s| s.to_string()).collect(),
+        default: tts.get_ref().default_voice_short().to_string(),
+    };
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .json(resp))
+}
+
+#[derive(Debug, Serialize)]
+struct VoicesResp {
+    voices: Vec<String>,
+    default: String,
 }
 
 /// ASR 阶段内联跑完拿到 prompt，LLM→TTS 阶段复用 llm_tts_items，
@@ -719,6 +866,7 @@ fn build_asr_llm_tts_stream(
     asr: ArcAsr,
     llm: ArcLlm,
     tts: ArcTts,
+    voice_override: Option<String>,
 ) -> impl Stream<Item = Result<Bytes, actix_web::Error>> + 'static {
     try_stream! {
         // 阶段 1: ASR —— 转发识别事件，收最终文本作为 LLM prompt
@@ -726,7 +874,15 @@ fn build_asr_llm_tts_stream(
             Ok(s) => s,
             Err(e) => {
                 warn!(target: "voice_server.admin_api", endpoint = "asr_llm_tts", session_id = %sid, "ASR 调用失败: {}", e);
-                yield ndjson_line(&ErrorLine { error: format!("asr error: {}", e), code: 1001 })?;
+                // 如果上游走了 OpenAI 信封，把 code/param 也带出来 —— voice-server NDJSON 的
+                // 内部错误码 (1001) 是管线阶段标识，与 yapi 的 `code` 字符串语义不同，
+                // 这里统一塞进 ErrorLine，message 里能透出上游 `code: param=xxx`。
+                yield ndjson_line(&ErrorLine {
+                    error: format!("asr error: {}", e),
+                    code: 1001,
+                    r#type: e.render_api_envelope().map(|(_, b)| b),
+                    param: None,
+                })?;
                 return;
             }
         };
@@ -736,7 +892,7 @@ fn build_asr_llm_tts_stream(
                 Ok(e) => e,
                 Err(e) => {
                     warn!(target: "voice_server.admin_api", endpoint = "asr_llm_tts", session_id = %sid, "ASR 流错误: {}", e);
-                    yield ndjson_line(&ErrorLine { error: format!("asr stream: {}", e), code: 1001 })?;
+                    yield ndjson_line(&ErrorLine::new(format!("asr stream: {}", e), 1001))?;
                     return;
                 }
             };
@@ -749,14 +905,14 @@ fn build_asr_llm_tts_stream(
 
         let prompt = prompt.trim().to_string();
         if prompt.is_empty() {
-            yield ndjson_line(&ErrorLine { error: "asr result empty".to_string(), code: 1001 })?;
+            yield ndjson_line(&ErrorLine::new("asr result empty".to_string(), 1001))?;
             return;
         }
 
         // 解析 ASR 情绪标签（如 <|zh|><|SAD|><|Speech|>...），情绪作为 system message 传给 LLM
         let parsed = parse_asr_emotion_tags(&prompt);
         if parsed.text.is_empty() {
-            yield ndjson_line(&ErrorLine { error: "asr result empty after stripping tags".to_string(), code: 1001 })?;
+            yield ndjson_line(&ErrorLine::new("asr result empty after stripping tags".to_string(), 1001))?;
             return;
         }
         if parsed.emotion.is_some() {
@@ -769,8 +925,8 @@ fn build_asr_llm_tts_stream(
             );
         }
 
-        // 阶段 2+3: 复用 LLM→TTS 管线
-        let mut items = Box::pin(llm_tts_items(parsed.text, parsed.emotion, sid.clone(), llm, tts));
+        // 阶段 2+3: 复用 LLM→TTS 管线；voice_override 来自 query 参数
+        let mut items = Box::pin(llm_tts_items(parsed.text, parsed.emotion, sid.clone(), llm, tts, None, voice_override));
         while let Some(item) = items.next().await {
             match item {
                 LlmTtsItem::Llm { delta, is_final } => {
@@ -780,7 +936,7 @@ fn build_asr_llm_tts_stream(
                     yield ndjson_line(&StageTtsLine { stage: "tts", seq, audio, is_last })?;
                 }
                 LlmTtsItem::Failed { error, code } => {
-                    yield ndjson_line(&ErrorLine { error, code })?;
+                    yield ndjson_line(&ErrorLine::new(error, code))?;
                 }
             }
         }

@@ -35,6 +35,12 @@ enum Cmd {
         codec: String,
         #[arg(long, default_value = "zh-CN")]
         language: String,
+        /// TTS 输出采样率（Hz）—— 由端侧上报；缺省 = 不带该字段（走服务端配置兜底）
+        #[arg(long)]
+        tts_sample_rate: Option<u32>,
+        /// TTS 音色短名（端侧从下拉选的）；缺省 = 不带该字段（走服务端配置兜底）
+        #[arg(long)]
+        voice: Option<String>,
     },
     /// 编码 AudioChunk
     AudioChunk {
@@ -85,12 +91,16 @@ fn main() -> anyhow::Result<()> {
             channels,
             codec,
             language,
+            tts_sample_rate,
+            voice,
         } => VoicePayload::SessionStart {
             session_id,
             sample_rate,
             channels,
             codec,
             language,
+            tts_sample_rate,
+            voice,
         },
         Cmd::AudioChunk {
             session_id,
@@ -146,6 +156,8 @@ fn print_all(session_id: &str) -> anyhow::Result<()> {
         channels: 1,
         codec: "pcm_s16le".to_string(),
         language: "zh-CN".to_string(),
+        tts_sample_rate: None,
+        voice: None,
     };
     let b = webproto::Indication::<VoicePayload>::encode(p)?;
     println!("hex ({} bytes): {}", b.len(), hex::encode(&b));

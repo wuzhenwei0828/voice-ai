@@ -1,0 +1,72 @@
+# =============================================================================
+# voice-app 反向代理（Caddy）
+# =============================================================================
+#
+# 浏览器要求麦克风权限（getUserMedia）只能在 secure context 下授权：
+#   - https://任意域名
+#   - http://localhost / http://127.0.0.1
+# 直接把 voice_server 的 HTTP 端口（默认 8080）通过局域网 IP 分享给别人时，
+# 浏览器会拒绝授权麦克风。这里用 Caddy 在前面做 TLS 终止，把对外端口变成
+# https:// → 反代到 voice_server 的 http://127.0.0.1:8080。
+#
+# 用法：
+#   1. 安装 Caddy：https://caddyserver.com/docs/install （macOS: brew install caddy）
+#   2. 把下面 {YOUR_DOMAIN} 换成你的域名（或内网 IP 走 self-signed 模式）
+#   3. caddy run --config ./deploy/caddy/Caddyfile
+#   4. 浏览器访问 https://{YOUR_DOMAIN}（self-signed 模式首次需手动信任证书）
+#
+# voice_server 本身仍跑 HTTP，监听 127.0.0.1:8080；Caddy 在 80/443 上对外。
+
+# =============================================================================
+# 场景 A：公网域名（Caddy 自动从 Let's Encrypt 签发证书，最常见）
+# =============================================================================
+# 把 YOUR_DOMAIN 换成实际域名（如 voice.example.com），邮箱换成你的：
+YOUR_DOMAIN {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:8080 {
+        # voice_server 把流量分成 HTTP API + WebSocket（同端口同路径 /ws/...），
+        # Caddy 默认会透传 Upgrade/Connection 头，无需额外配置。
+        # 下面这些显式写出来只是为了便于排障。
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+
+        # 健康检查（voice_server 提供 /health 端点，Caddy 会自动剔除不健康后端）
+        health_uri /health
+        health_interval 5s
+        health_timeout 3s
+    }
+}
+
+# =============================================================================
+# 场景 B：内网 / LAN（无公网域名 → 用 Caddy 的 internal 颁发 self-signed 证书）
+# =============================================================================
+#
+# 把 {LAN_IP} 换成你机器的局域网 IP（如 192.168.1.20），访问者首次打开会看到
+# 证书警告，需要点"高级 → 继续前往"。如果想避免警告，可以：
+#   - 把 self-signed 证书导出（路径见 Caddy data dir）分发给访问者手动信任
+#   - 或换 mkcert 本地签发受信证书（更友好）
+#
+# 用法：把整段 YOUR_DOMAIN 注释掉，把下面这段反注释并改 {LAN_IP}：
+#
+# http://{LAN_IP}, https://{LAN_IP} {
+#     tls internal
+#     reverse_proxy 127.0.0.1:8080
+# }
+
+# =============================================================================
+# 场景 C：纯本地调试（Caddyfile 里什么也不写也可以，浏览器访问 http://localhost）
+# =============================================================================
+#
+# 不需要 Caddy，直接访问 http://localhost:8080 即可。localhost 本身就是
+# secure context，麦克风权限能用。
+
+# =============================================================================
+# 可选：HTTP → HTTPS 强制跳转
+# =============================================================================
+# 如果想强制访问者用 https（推荐），加：
+#
+# :80 {
+#     redir https://{host}{uri} permanent
+# }

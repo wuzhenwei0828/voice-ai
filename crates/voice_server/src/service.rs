@@ -125,6 +125,7 @@ impl ServiceCallback for VoiceService {
                 .app_data(web::Data::new(tts))
                 .service(
                     web::scope("/admin")
+                        .route("/voices", web::get().to(crate::admin_api::voices))
                         .route("/asr", web::post().to(crate::admin_api::asr))
                         .route("/llm", web::post().to(crate::admin_api::llm))
                         .route("/tts", web::post().to(crate::admin_api::tts))

@@ -33,6 +33,7 @@
 //!   voice: "fnlp/MOSS-TTSD-v0.5:alex"
 //!   response_format: "wav"
 //!   stream: true
+//!   # sample_rate: 16000          # Hz，None = 走 provider 默认
 //! ```
 
 use std::collections::HashMap;
@@ -242,6 +243,22 @@ pub struct AsrConfig {
     pub headers: HashMap<String, String>,
     /// 必填：模型 ID
     pub model: String,
+    /// 强制指定语种（auto / zh / en / yue / ja / ko / nospeech）。None = 由模型自动检测
+    #[serde(default)]
+    pub language: Option<String>,
+    /// 响应格式（json | text | verbose_json）。None = 走上游默认（json）
+    #[serde(default)]
+    pub response_format: Option<String>,
+    /// 是否启用 ct-punc 标点后处理（首请求 +~3s 懒加载 ct-punc 模型）
+    #[serde(default)]
+    pub punc: Option<bool>,
+    /// 是否启用说话人分离（首请求 +1~3s 懒加载 cam++ 模型）
+    #[serde(default)]
+    pub spk: Option<bool>,
+    /// 是否在结果文本里保留 `<|zh|><|HAPPY|>` 等 SenseVoice 标签；
+    /// 仅 `punc=false` 时生效 —— `punc=true` 走 ct-punc 后处理会剥掉所有标签
+    #[serde(default)]
+    pub tags: Option<bool>,
 }
 
 impl AsrConfig {
@@ -270,6 +287,11 @@ impl Default for AsrConfig {
             timeout_ms: None,
             headers: HashMap::new(),
             model: String::new(),
+            language: None,
+            response_format: None,
+            punc: None,
+            spk: None,
+            tags: None,
         }
     }
 }
@@ -332,7 +354,13 @@ pub struct TtsConfig {
     #[serde(default)]
     pub headers: HashMap<String, String>,
     pub model: String,
-    /// 必填：voice / 音色
+    /// 必填：默认音色**短名**（如 `"alex"`）。
+    ///
+    /// 白名单见 `client::tts::SUPPORTED_VOICES`（构造 HttpTtsClient 时校验，
+    /// 不在白名单里直接 bail）。
+    ///
+    /// 端侧（前端下拉框 / admin API）可以传另一个短名覆盖默认 —— HttpTtsClient 会
+    /// 在请求时拼上 `"<model>:<short>"` 再发给 TTS provider，所以**这里只填短名**。
     pub voice: String,
     /// 输出格式（mp3/wav/pcm/opus/aac/flac）
     #[serde(default)]
@@ -340,6 +368,14 @@ pub struct TtsConfig {
     /// 是否请求流式输出（部分 provider 即使收到也返回单段 blob，见 client/tts.rs）
     #[serde(default)]
     pub stream: bool,
+    /// 输出采样率（Hz）。None = 走 provider 默认。
+    ///
+    /// 各 `response_format` 的支持范围 / 默认值（见 `client::tts::supported_sample_rates`）：
+    ///   - `opus`             仅 48000
+    ///   - `wav` / `pcm`     8000 / 16000 / 24000 / 32000 / 44100（默认 44100）
+    ///   - `mp3`              32000 / 44100（默认 44100）
+    #[serde(default)]
+    pub sample_rate: Option<u32>,
 }
 
 impl TtsConfig {
@@ -375,6 +411,7 @@ impl Default for TtsConfig {
             voice: String::new(),
             response_format: String::new(),
             stream: false,
+            sample_rate: None,
         }
     }
 }
@@ -387,6 +424,8 @@ impl VoiceConfig {
     ///   - VOICE_PROVIDER_API_KEY                  （provider 段）
     ///   - VOICE_<ASR|LLM|TTS>_API_KEY             （per-section 覆盖）
     ///   - VOICE_<ASR|LLM|TTS>_MODEL               （per-section）
+    ///   - VOICE_TTS_VOICE                          （tts 段）
+    ///   - VOICE_TTS_SAMPLE_RATE                    （tts 段，u32；非法值忽略）
     ///   - VOICE_REDIS_URL                          （redis 顶层段，连接 URL）
     ///   - VOICE_REDIS_DEFAULT_TTL_SECS             （redis 顶层段，默认 TTL）
     ///   - VOICE_AGENT_MEMORY_BACKEND              （agent 段，in_memory | redis）
@@ -449,6 +488,37 @@ fn apply_section_env(c: &mut AsrConfig, prefix: &str) {
     if let Ok(v) = std::env::var(format!("VOICE_{}_MODEL", prefix)) {
         c.model = v;
     }
+    if let Ok(v) = std::env::var(format!("VOICE_{}_LANGUAGE", prefix)) {
+        c.language = Some(v);
+    }
+    if let Ok(v) = std::env::var(format!("VOICE_{}_RESPONSE_FORMAT", prefix)) {
+        c.response_format = Some(v);
+    }
+    if let Ok(v) = std::env::var(format!("VOICE_{}_PUNC", prefix)) {
+        if let Some(b) = parse_env_bool(&v) {
+            c.punc = Some(b);
+        }
+    }
+    if let Ok(v) = std::env::var(format!("VOICE_{}_SPK", prefix)) {
+        if let Some(b) = parse_env_bool(&v) {
+            c.spk = Some(b);
+        }
+    }
+    if let Ok(v) = std::env::var(format!("VOICE_{}_TAGS", prefix)) {
+        if let Some(b) = parse_env_bool(&v) {
+            c.tags = Some(b);
+        }
+    }
+}
+
+/// 解析环境变量里的 bool —— 容错 `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`（大小写不敏感）；
+/// 无法识别返回 None（保留 yaml 里的值，不静默覆盖为 false）
+fn parse_env_bool(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 fn apply_section_env_llm(c: &mut LlmConfig, prefix: &str) {
     if let Ok(v) = std::env::var(format!("VOICE_{}_API_KEY", prefix)) {
@@ -468,6 +538,18 @@ fn apply_section_env_tts(c: &mut TtsConfig, prefix: &str) {
     if let Ok(v) = std::env::var(format!("VOICE_{}_VOICE", prefix)) {
         c.voice = v;
     }
+    if let Ok(v) = std::env::var(format!("VOICE_{}_SAMPLE_RATE", prefix)) {
+        if let Ok(n) = v.trim().parse() {
+            c.sample_rate = Some(n);
+        } else {
+            tracing::warn!(
+                target: "voice_server.config",
+                env = format!("VOICE_{}_SAMPLE_RATE", prefix),
+                raw = %v,
+                "TTS sample_rate 环境变量无法解析为 u32，忽略"
+            );
+        }
+    }
 }
 
 impl Default for VoiceConfig {
@@ -486,10 +568,9 @@ impl Default for VoiceConfig {
 }
 
 // ===== 辅助：让 ASR/LLM client 拿到 OpenAIConfig =====
+// 注：ASR 已切到手搓 reqwest（multipart/form-data），不再需要 OpenAIConfig 桥接；
+// 仅 LLM 仍走 async-openai SDK，保留 llm_openai / tts_parts。
 
-pub fn asr_openai(cfg: &AsrConfig, provider: Option<&ProviderConfig>) -> OpenAIConfig {
-    cfg.resolved(provider).to_openai_config()
-}
 pub fn llm_openai(cfg: &LlmConfig, provider: Option<&ProviderConfig>) -> OpenAIConfig {
     cfg.resolved(provider).to_openai_config()
 }
@@ -523,6 +604,7 @@ mod tests {
               voice: "fnlp/MOSS-TTSD-v0.5:alex"
               response_format: "wav"
               stream: true
+              sample_rate: 16000
         "#;
         let cfg: VoiceConfig = serde_yaml::from_str(yaml).unwrap();
         let p = cfg.provider.as_ref().unwrap();
@@ -530,5 +612,38 @@ mod tests {
         let resolved = cfg.asr.resolved(Some(p));
         assert_eq!(resolved.api_base, p.api_base);
         assert!(resolved.headers.contains_key("X-Region"));
+        assert_eq!(cfg.tts.sample_rate, Some(16000));
+        assert!(cfg.tts.stream);
+    }
+
+    #[test]
+    fn parse_tts_without_sample_rate_defaults_to_none() {
+        // sample_rate 是可选字段 —— 缺省 = None
+        let yaml = r#"
+            tts:
+              model: "m"
+              voice: "v"
+        "#;
+        let cfg: VoiceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.tts.sample_rate, None);
+    }
+
+    #[test]
+    fn apply_env_tts_sample_rate_override_and_invalid() {
+        // 单线程顺序执行两个场景 —— VOICE_TTS_SAMPLE_RATE 是进程级环境变量，
+        // 并发跑会和别的 env 测试相互覆盖。
+        // 场景 1：合法 u32 覆盖 yaml 默认值（None → Some(24000)）
+        std::env::set_var("VOICE_TTS_SAMPLE_RATE", "24000");
+        let mut cfg = VoiceConfig::default();
+        cfg.apply_env_overrides();
+        assert_eq!(cfg.tts.sample_rate, Some(24000));
+        std::env::remove_var("VOICE_TTS_SAMPLE_RATE");
+
+        // 场景 2：非法字符串走 warn-忽略路径，sample_rate 保持 None
+        std::env::set_var("VOICE_TTS_SAMPLE_RATE", "not-a-number");
+        let mut cfg = VoiceConfig::default();
+        cfg.apply_env_overrides();
+        assert_eq!(cfg.tts.sample_rate, None);
+        std::env::remove_var("VOICE_TTS_SAMPLE_RATE");
     }
 }

@@ -25,15 +25,18 @@
       status.textContent = '⚠️ 请先输入文本';
       return;
     }
+    const voice = window.VoiceSelector.getSelected('llm_tts-voice');
     btnRun.disabled = true;
     textEl.disabled = true;
     reset();
     try {
       status.textContent = '调用 /admin/llm_tts ...';
+      const body = { text };
+      if (voice) body.voice = voice;
       const resp = await fetch('/admin/llm_tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify(body),
       });
 
       const chunks = [];

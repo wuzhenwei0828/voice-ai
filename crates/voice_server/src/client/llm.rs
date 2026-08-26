@@ -19,9 +19,9 @@ use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{info, warn};
 
-use crate::client::error::ClientError;
+use crate::client::error::{parse_openai_error, ClientError};
 use crate::config::{LlmConfig, ProviderConfig};
 use crate::session::LlmEvent;
 
@@ -226,7 +226,41 @@ impl LlmClient for HttpLlmClient {
             .map_err(|e| ClientError::Http(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(ClientError::Status(status.as_u16()));
+            let status_u16 = status.as_u16();
+            // 抓 body 一次：log + 尝试解析 OpenAI 信封
+            let body = match resp.text().await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(
+                        target: "voice_server.llm.err",
+                        session_id,
+                        status = status_u16,
+                        error = %e,
+                        "LLM 非 2xx body 读取失败"
+                    );
+                    return Err(ClientError::Status(status_u16));
+                }
+            };
+            let body_preview: String = if body.chars().count() > 2048 {
+                let s: String = body.chars().take(2048).collect();
+                format!("{}…<truncated, total {} chars>", s, body.chars().count())
+            } else {
+                body.clone()
+            };
+            warn!(
+                target: "voice_server.llm.err",
+                session_id,
+                status = status_u16,
+                body = %body_preview,
+                "LLM 返回非 2xx"
+            );
+            if let Some(api_err) = parse_openai_error(&body) {
+                return Err(ClientError::Api {
+                    status: status_u16,
+                    error: api_err,
+                });
+            }
+            return Err(ClientError::Status(status_u16));
         }
         info!(
             target: "voice_server.llm",
@@ -321,13 +355,6 @@ impl LlmClient for HttpLlmClient {
                         let delta = choice.delta.content.unwrap_or_default();
                         let is_final = choice.finish_reason.is_some();
                         Box::pin(stream! {
-                            debug!(
-                                target: "voice_server.llm",
-                                session_id = %session,
-                                delta_len = delta.chars().count(),
-                                is_final,
-                                "LLM 非 SSE 单段响应"
-                            );
                             yield Ok(LlmEvent { delta, is_final });
                         })
                     } else {

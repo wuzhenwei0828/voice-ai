@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module type="EMPTY_MODULE" version="4">
+  <component name="NewModuleRootManager">
+    <content url="file://$MODULE_DIR$">
+      <sourceFolder url="file://$MODULE_DIR$/crates/voice-proto/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/voice-providers/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/voice-vad/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/voice_server/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/ws_payload_helper/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/voice-providers/tests" isTestSource="true" />
+      <excludeFolder url="file://$MODULE_DIR$/target" />
+    </content>
+    <orderEntry type="inheritedJdk" />
+    <orderEntry type="sourceFolder" forTests="false" />
+  </component>
+</module>
