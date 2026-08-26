@@ -107,9 +107,11 @@
   let stateTimer = null;
 
   function setPhoneState(next, opts = {}) {
-    if (phoneState === next && !opts.force) return;
+    // 注意：state 相同时也要更新文案 —— idle→idle 也常常要切"未连接 / 对话进行中"。
+    // 只有 avatar data-state 属性在相同时跳过（避免无谓的 CSS 重新评估）。
+    const stateChanged = phoneState !== next;
     phoneState = next;
-    if (avatarWrap) avatarWrap.dataset.state = next;
+    if (avatarWrap && stateChanged) avatarWrap.dataset.state = next;
     if (opts.status !== undefined) phoneStatus.textContent = opts.status;
     if (opts.substatus !== undefined) phoneSubstatus.textContent = opts.substatus;
   }

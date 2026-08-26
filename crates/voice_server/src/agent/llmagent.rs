@@ -3,7 +3,7 @@
 //! ## 设计要点
 //! - 每次 `chat()` 时从 [`MemoryStore`] 拉 session 的最近 N 条历史，拼到 messages 头部送上游
 //! - 流收尾时（`is_final = true`）把 `user prompt` + 完整 `assistant 回复` 写入 store
-//! - emotion_hint 作为 system message 放在 messages 最前面
+//! - emotion_hint 作为 system message 放在 messages 最前面（模板在 `prompts.yaml` 里，可改）
 //! - 记忆后端可换：默认 [`InMemoryStore`]（单进程），集群可换 [`RedisStore`]（跨进程）
 //! - 滑动窗口默认 20 条（见 [`crate::agent::memory::DEFAULT_WINDOW`]）
 //!
@@ -23,6 +23,7 @@ use futures_util::StreamExt;
 use tracing::info;
 
 use crate::agent::memory::{InMemoryStore, MemoryStore, Message, Role, DEFAULT_WINDOW};
+use crate::agent::prompts::AgentPrompts;
 use crate::client::error::ClientError;
 use crate::client::llm::{ArcLlm, ChatMessage, LlmClient};
 use crate::session::LlmEvent;
@@ -33,10 +34,11 @@ type BoxStream<T> = Pin<Box<dyn futures_util::Stream<Item = T> + Send>>;
 pub struct LlmAgent {
     llm: ArcLlm,
     store: Arc<dyn MemoryStore>,
+    prompts: Arc<AgentPrompts>,
 }
 
 impl LlmAgent {
-    /// 默认后端 = [`InMemoryStore`]，窗口 = 20
+    /// 默认后端 = [`InMemoryStore`]，窗口 = 20，提示词 = `prompts.yaml` 编译期嵌入
     pub fn new(llm: ArcLlm) -> Self {
         Self::with_store(llm, Arc::new(InMemoryStore::new(DEFAULT_WINDOW)))
     }
@@ -46,9 +48,23 @@ impl LlmAgent {
         Self::with_store(llm, Arc::new(InMemoryStore::new(window_size)))
     }
 
-    /// 通用入口：注入任意 store（InMemory / Redis / 自定义 mock）
+    /// 通用入口：注入任意 store（InMemory / Redis / 自定义 mock）。
+    /// 提示词走默认 yaml —— 想换提示词用 [`Self::with_prompts`]。
     pub fn with_store(llm: ArcLlm, store: Arc<dyn MemoryStore>) -> Self {
-        Self { llm, store }
+        Self {
+            llm,
+            store,
+            prompts: crate::agent::prompts::default_prompts(),
+        }
+    }
+
+    /// 完整注入：自定义 store + 自定义提示词模板（测试 / 灰度用）。
+    pub fn with_prompts(
+        llm: ArcLlm,
+        store: Arc<dyn MemoryStore>,
+        prompts: Arc<AgentPrompts>,
+    ) -> Self {
+        Self { llm, store, prompts }
     }
 
     /// 主动清空某会话的短期记忆（外部触发，如 session 结束 / 用户主动重置）
@@ -64,37 +80,47 @@ impl LlmAgent {
     pub fn store(&self) -> &Arc<dyn MemoryStore> {
         &self.store
     }
+
+    pub fn prompts(&self) -> &Arc<AgentPrompts> {
+        &self.prompts
+    }
 }
 
 #[async_trait]
 impl LlmClient for LlmAgent {
-    /// 主入口：拼 emotion system + 历史 + 当前 user prompt → 调底层 LLM → 流收尾后写记忆。
+    /// 主入口：拼 static system + emotion system + 历史 + 当前 user prompt → 调底层 LLM → 流收尾后写记忆。
     async fn chat(
         &self,
         session_id: &str,
         prompt: &str,
         emotion_hint: Option<&str>,
     ) -> Result<BoxStream<Result<LlmEvent, ClientError>>, ClientError> {
-        // ===== 1. 构造 messages：emotion system → 历史 → 当前 user =====
+        // ===== 1. 构造 messages：static system → emotion system → 历史 → 当前 user =====
         let history: Vec<Message> = self.store.history(session_id).await;
 
-        let mut messages: Vec<ChatMessage> = Vec::with_capacity(2 + history.len());
-        if let Some(e) = emotion_hint {
+        let mut messages: Vec<ChatMessage> = Vec::with_capacity(3 + history.len());
+        // 1a. 静态提示词（每次 chat 都注入；role + guidelines 拼成一条 system message）
+        if let Some(static_msg) = self.prompts.static_system_message() {
             messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: format!(
-                    "[情绪参考] 请据此调整回复的语气和措辞，但**不要在回复中提及、复述或暗示用户当前的情绪**，\
-                     也不要解释你是如何判断的；直接、自然地回答用户的问题即可。\
-                     （用户当前说话的情绪可能是：{e}，仅供你参考，可能不准确）"
-                ),
+                content: static_msg,
             });
         }
+        // 1b. 动态提示词（emotion_hint 非空时插入）
+        if let Some(emotion_text) = emotion_hint.and_then(|e| self.prompts.render_emotion_hint(e)) {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: emotion_text,
+            });
+        }
+        // 1c. 历史
         for h in &history {
             messages.push(ChatMessage {
                 role: h.role.as_str().to_string(),
                 content: h.content.clone(),
             });
         }
+        // 1d. 当前 user prompt
         let prompt_owned = prompt.to_string();
         let history_len = history.len();
         messages.push(ChatMessage {
@@ -107,6 +133,7 @@ impl LlmClient for LlmAgent {
             session_id,
             history_len,
             has_emotion_hint = emotion_hint.is_some(),
+            has_static_prompts = self.prompts.static_system_message().is_some(),
             total_messages = messages.len(),
             prompt_chars = prompt_owned.chars().count(),
             "Agent 拼装 messages，调底层 LLM"
@@ -262,12 +289,14 @@ mod tests {
         let captured = cap.captured.lock().await;
         assert_eq!(captured.len(), 2);
         let msgs = &captured[1];
-        assert!(msgs.len() >= 3);
-        assert_eq!(msgs[0].role, "user");
-        assert_eq!(msgs[0].content, "first");
-        assert_eq!(msgs[1].role, "assistant");
-        assert_eq!(msgs[2].role, "user");
-        assert_eq!(msgs[2].content, "second");
+        // 期望：[static system] [user "first"] [assistant "ok"] [user "second"]
+        assert!(msgs.len() >= 4);
+        assert_eq!(msgs[0].role, "system", "第 0 条必须是静态 system prompt");
+        assert_eq!(msgs[1].role, "user");
+        assert_eq!(msgs[1].content, "first");
+        assert_eq!(msgs[2].role, "assistant");
+        assert_eq!(msgs[3].role, "user");
+        assert_eq!(msgs[3].content, "second");
     }
 
     #[tokio::test]
@@ -284,10 +313,98 @@ mod tests {
 
         let captured = cap.captured.lock().await;
         let msgs = &captured[0];
+        // 期望：[static system] [emotion system] [user "你说啥"]
+        assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0].role, "system");
-        assert!(msgs[0].content.contains("开心"));
-        assert_eq!(msgs[1].role, "user");
-        assert_eq!(msgs[1].content, "你说啥");
+        assert!(
+            !msgs[0].content.contains("情绪") && !msgs[0].content.contains("{emotion}"),
+            "第 0 条应是静态提示词，不应包含 emotion_hint 内容，实际：{}",
+            msgs[0].content
+        );
+        assert_eq!(msgs[1].role, "system");
+        assert!(msgs[1].content.contains("开心"));
+        assert!(!msgs[1].content.contains("{emotion}"), "占位符必须已被替换");
+        assert_eq!(msgs[2].role, "user");
+        assert_eq!(msgs[2].content, "你说啥");
+    }
+
+    /// 验证静态提示词在每次 chat 都注入到 messages 最前面（早于 emotion_hint 和 history）
+    #[tokio::test]
+    async fn static_prompts_injected_first_on_every_chat() {
+        let cap = Arc::new(CaptureLlm {
+            captured: tokio::sync::Mutex::new(Vec::new()),
+        });
+        let agent = LlmAgent::new(cap.clone());
+
+        // 第一次 chat：没 emotion_hint，没 history
+        let mut s1 = agent.chat("sid-sp", "hi", None).await.unwrap();
+        while let Some(_) = s1.next().await {}
+
+        // 第二次 chat：有 history
+        let mut s2 = agent.chat("sid-sp", "again", Some("焦虑")).await.unwrap();
+        while let Some(_) = s2.next().await {}
+
+        let captured = cap.captured.lock().await;
+        assert_eq!(captured.len(), 2);
+
+        // 第一次：[static system] [user "hi"]
+        let msgs1 = &captured[0];
+        assert_eq!(msgs1[0].role, "system", "静态提示词必须在最前");
+        // 静态提示词内容应包含 role + guidelines
+        assert!(
+            msgs1[0].content.contains("语音助手") || msgs1[0].content.contains("助手"),
+            "static system 应包含 role 内容，实际：{}",
+            msgs1[0].content
+        );
+        assert!(
+            msgs1[0].content.contains("简洁")
+                || msgs1[0].content.contains("自然")
+                || msgs1[0].content.contains("准确"),
+            "static system 应包含 guidelines 内容，实际：{}",
+            msgs1[0].content
+        );
+        assert_eq!(msgs1.len(), 2);
+
+        // 第二次：[static system] [emotion system] [history user "hi"] [history assistant "ok"] [user "again"]
+        let msgs2 = &captured[1];
+        assert_eq!(msgs2[0].role, "system");
+        assert_eq!(msgs2[1].role, "system");
+        assert!(msgs2[1].content.contains("焦虑"));
+        assert_eq!(msgs2[2].role, "user");
+        assert_eq!(msgs2[2].content, "hi");
+        assert_eq!(msgs2[3].role, "assistant");
+        assert_eq!(msgs2[4].role, "user");
+        assert_eq!(msgs2[4].content, "again");
+    }
+
+    /// 验证：当 static 字段全为空时，不插入空 system message（保证消息数量最小化）
+    #[tokio::test]
+    async fn no_empty_static_system_message_when_disabled() {
+        let cap = Arc::new(CaptureLlm {
+            captured: tokio::sync::Mutex::new(Vec::new()),
+        });
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new(5));
+        let custom = crate::agent::prompts::AgentPrompts::from_yaml(
+            "llmagent:\n  \
+             chat:\n    \
+             systemprompts:\n      \
+             role: \"\"\n      \
+             guidelines: \"\"\n      \
+             emotion_hint: |\n        \
+             [情绪] {emotion}\n",
+        )
+        .unwrap();
+        let agent = LlmAgent::with_prompts(cap.clone(), store, Arc::new(custom));
+
+        let mut s = agent.chat("sid-empty", "x", None).await.unwrap();
+        while let Some(_) = s.next().await {}
+
+        let captured = cap.captured.lock().await;
+        let msgs = &captured[0];
+        // 没 emotion_hint、没 history 时应只有一条 user 消息
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[0].content, "x");
     }
 
     #[tokio::test]
@@ -316,5 +433,47 @@ mod tests {
         while let Some(_) = s.next().await {}
 
         assert_eq!(store.len("custom").await, 2);
+    }
+
+    /// 注入自定义 prompts，确认模板真的被替换 —— 验证 yaml → AgentPrompts → chat 的链路
+    #[tokio::test]
+    async fn custom_prompts_replace_emotion_template() {
+        let cap = Arc::new(CaptureLlm {
+            captured: tokio::sync::Mutex::new(Vec::new()),
+        });
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new(5));
+        let custom = crate::agent::prompts::AgentPrompts::from_yaml(
+            "llmagent:\n  \
+             chat:\n    \
+             systemprompts:\n      \
+             role: \"test-role\"\n      \
+             guidelines: \"test-guidelines\"\n      \
+             emotion_hint: |\n        \
+             [TEST-MARKER] 情绪={emotion}\n",
+        )
+        .unwrap();
+        let agent = LlmAgent::with_prompts(cap.clone(), store, Arc::new(custom));
+
+        let mut s = agent.chat("sid-cp", "hi", Some("开心")).await.unwrap();
+        while let Some(_) = s.next().await {}
+
+        let captured = cap.captured.lock().await;
+        let msgs = &captured[0];
+        // 期望：[static system (role+guidelines)] [emotion system] [user "hi"]
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].role, "system");
+        assert!(
+            msgs[0].content.contains("test-role") && msgs[0].content.contains("test-guidelines"),
+            "static system 应注入自定义 role+guidelines，实际：{}",
+            msgs[0].content
+        );
+        assert_eq!(msgs[1].role, "system");
+        assert!(
+            msgs[1].content.contains("[TEST-MARKER]") && msgs[1].content.contains("情绪=开心"),
+            "自定义 emotion_hint 应注入到第 1 条 system message，实际：{}",
+            msgs[1].content
+        );
+        assert_eq!(msgs[2].role, "user");
+        assert_eq!(msgs[2].content, "hi");
     }
 }
