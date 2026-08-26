@@ -177,7 +177,7 @@ impl ServiceCallback for VoiceService {
                 // live-asr 业务：复用 webhttp 路由 + voice-providers WsConnPool 跨会话复用
                 // （公共协议：fun-asr / qwen-audio-3.0 / paraformer，docs L3289）
                 if business == "live-asr" {
-                    crate::live_asr_api::handle_message(addr, session_id, payload);
+                    crate::live_asr::handle_message(addr, session_id, payload);
                     return Ok(ActorMsg::Ok);
                 }
 

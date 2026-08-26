@@ -8,7 +8,7 @@
 //!   - `service`      VoiceService: 实现 webhttp::ServiceCallback
 //!   - `pipeline`     共享 LLM→切句→TTS→crossfade→emit 流水线（admin_api 与 session 共用）
 //!   - `admin_api`    单能力验证 HTTP 接口（/admin/asr 等 5 个端点）
-//!   - `live_asr_api` FunASR 实时流式 ASR WebSocket 端点
+//!   - `live_asr`    FunASR 实时流式 ASR WebSocket 端点
 //!   - `config`       VoiceConfig：从 YAML 加载并应用环境变量覆盖
 //!   - `bin/voice_server.rs` 启动入口
 
@@ -17,7 +17,7 @@ pub mod agent;
 pub mod client;
 pub mod config;
 pub mod events;
-pub mod live_asr_api;
+pub mod live_asr;
 pub mod logging;
 pub mod pipeline;
 pub mod service;

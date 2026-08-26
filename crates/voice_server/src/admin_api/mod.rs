@@ -12,11 +12,17 @@
 //!
 //! 设计要点：
 //!   - 复用现有 AsrClient / LlmClient / TtsClient trait，不重新实现
-//!   - 切句复用 session::next_sentence_end（已从 fn 提升为 pub）
-//!   - LLM→TTS 管线抽成 llm_tts_items()，/admin/llm_tts、/admin/asr_llm_tts 与
-//!     session.rs 的 WS pipeline 共用（句间 crossfade / 全局 seq / 结束标记）
+//!   - 切句复用 session::text::next_sentence_end
+//!   - LLM→TTS 管线由 [`crate::pipeline::llm_tts_items`] 提供，/admin/llm_tts、/admin/asr_llm_tts
+//!     与 session.rs 的 WS pipeline 共用（句间 crossfade / 全局 seq / 结束标记）
 //!   - 流中途出错：插一行 {error, code} 然后断流（HTTP 200 已发，不能改 status）
 //!     错误码约定：1001 asr / 1002 llm 调用 / 1003 llm 流 / 1004 tts 调用 / 1005 tts 流
+//!
+//! ## 模块拆分
+//! - [`audio`] WAV 头解析 / 包成 16kHz mono s16le WAV 给 ASR
+//! - [`mod`]    HTTP 路由 + DTO + NDJSON 序列化 + 错误处理
+
+pub mod audio;
 
 use actix_web::web::{Bytes, Data, Json, Query};
 use actix_web::HttpResponse;
@@ -27,10 +33,11 @@ use std::fmt::Display;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
-use crate::client::{asr::wrap_pcm_as_wav, ArcAsr, ArcLlm, ArcTts, ClientError};
+use audio::prepare_audio_for_asr;
+use crate::client::{ArcAsr, ArcLlm, ArcTts, ClientError};
 use crate::events::{AsrEvent, LlmEvent};
 use crate::pipeline::{llm_tts_items, LlmTtsItem, SentenceCrossfader};
-use crate::session::{next_sentence_end, parse_asr_emotion_tags};
+use crate::session::text::{next_sentence_end, parse_asr_emotion_tags};
 
 /// 把 `ClientError` 转成 actix 响应。
 ///
@@ -144,42 +151,6 @@ struct StageTtsLine {
     seq: u32,
     audio: String,
     is_last: bool,
-}
-
-// ====== 音频预处理：strip WAV 头 / 包成 16kHz mono s16le WAV ======
-
-/// 在 WAV 里找 data chunk 的偏移和大小（兼容非标准 fmt 长度）。
-fn find_wav_data(bytes: &[u8]) -> Option<(usize, usize)> {
-    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-        return None;
-    }
-    let mut pos = 12usize;
-    while pos + 8 <= bytes.len() {
-        let id = &bytes[pos..pos + 4];
-        let size = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().ok()?) as usize;
-        if id == b"data" {
-            let avail = bytes.len() - (pos + 8);
-            return Some((pos + 8, size.min(avail)));
-        }
-        let advance = 8 + size + (size & 1);
-        if advance == 0 { break; }
-        pos += advance;
-    }
-    None
-}
-
-/// 把上传音频统一转成"16kHz mono s16le WAV 字节流"给 ASR。
-/// - 如果上传的就是 WAV：找 data chunk 取出 PCM（要求原文件已是 16kHz mono s16le）
-/// - 否则：按裸 PCM 处理（前端约定 16kHz mono s16le）
-/// 返回 None 表示输入不是合法 WAV / 长度不够；前端在 UI 上把这种情况当错误显示。
-fn prepare_audio_for_asr(bytes: Vec<u8>) -> Option<Vec<u8>> {
-    let pcm: &[u8] = if let Some((off, size)) = find_wav_data(&bytes) {
-        &bytes[off..off + size]
-    } else {
-        &bytes[..]
-    };
-    if pcm.is_empty() { return None; }
-    Some(wrap_pcm_as_wav(pcm, 16000, 1))
 }
 
 // ====== NDJSON 流序列化 helper ======

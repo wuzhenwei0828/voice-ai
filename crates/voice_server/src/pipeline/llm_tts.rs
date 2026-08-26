@@ -1,27 +1,28 @@
-//! 共享 LLM→TTS 流水线
+//! LLM→TTS 流水线
 //!
-//! 把 LLM 流式输出 → 切句 → TTS 流式合成 → 句间 crossfade → 统一 seq 编号 → emit
-//! 这一整条链路抽到这里，被 `admin_api.rs` 的 `/admin/llm_tts` / `/admin/asr_llm_tts`
-//! 端点和 `session.rs` 的 WS pipeline 共用。
+//! 流程：`llm.chat()` 流式 → 按句末标点切句 → 逐句 `tts.synthesize()` 流式
+//! → 句间 [`SentenceCrossfader`] 混合 → 统一 seq 编号 → 结束标记（空 audio + is_last:true）
 //!
-//! 之前这两条调用链走的是 `admin_api::llm_tts_items` —— `session.rs` 反向依赖
-//! `admin_api.rs` 形成反向边。本模块翻转方向：`admin_api.rs` 和 `session.rs` 都
-//! 依赖 `crate::pipeline::llm_tts_items`，方向变成正。
+//! 与 session::pipeline::run_pipeline 同源（WS pipeline 也用同一个函数）：
+//! 两边走同一条 LLM→TTS 链路，只是 wire 侧不同（HTTP NDJSON / WS msgpack）。
 //!
-//! 同时承载 [`SentenceCrossfader`] + [`crossfade`] 这两个工具：`llm_tts_items` 用，
-//! `admin_api::build_tts_sentence_stream`（仅 TTS、无 LLM 的版本）也用。放在一起避免
-//! `pipeline → admin_api` 反向引用。
+//! 错误流：阶段内出错时 yield 一条 [`LlmTtsItem::Failed`] 后立即 return（HTTP 200 已发，
+//! 不能改 status，靠 error code 1001~1005 区分）。
 
 use async_stream::stream;
 use futures_util::{Stream, StreamExt};
 use tracing::{debug, info, warn};
 
 use crate::client::{ArcLlm, ArcTts};
-use crate::session::next_sentence_end;
+
+use super::crossfade::SentenceCrossfader;
+use super::sentence::next_sentence_end;
 
 /// `llm_tts_items()` 的输出事件，由各消费方映射成自己的 wire 格式
 /// （NDJSON 行 / WS VoicePayload）。`Failed` 是终端事件（产出后流即结束）。
-/// `pub`：session.rs 的 WS pipeline 也要消费。
+///
+/// `pub`：session 的 WS pipeline 也要消费。
+#[derive(Debug)]
 pub enum LlmTtsItem {
     /// LLM 文本 delta（/admin/llm_tts 不透出，/admin/asr_llm_tts 与 WS 侧透出）
     Llm { delta: String, is_final: bool },
@@ -31,111 +32,12 @@ pub enum LlmTtsItem {
     Failed { error: String, code: u16 },
 }
 
-// ====== 句间 crossfade 工具 ======
-
-/// 把上一句末尾 FADE_BYTES 与下一句开头 FADE_BYTES 线性混合可消除。
-const FADE_BYTES: usize = 320;
-
-/// 句间 crossfade 状态机。按句使用：begin_sentence → feed* → end_sentence。
-/// 当前句结尾的 FADE_BYTES 先扣着不发（tail），等下一句开头到了做混合后再发。
-#[derive(Default)]
-pub struct SentenceCrossfader {
-    /// 上一句结尾扣下的、尚未下发的字节（≤ FADE_BYTES）
-    tail: Vec<u8>,
-    /// 当前句开头的缓冲（攒够 FADE_BYTES 后与 tail 混合）
-    head: Vec<u8>,
-    /// 当前句的滚动保留区（始终是当前句最近 ≤ FADE_BYTES 未发字节）
-    hold: Vec<u8>,
-    /// 当前句开头是否已完成混合（完成后再喂的数据走滚动保留）
-    head_done: bool,
-}
-
-impl SentenceCrossfader {
-    pub fn begin_sentence(&mut self) {
-        self.head.clear();
-        self.hold.clear();
-        // 上一句没有遗留 tail（如第一句）时，本句开头无需混合
-        self.head_done = self.tail.is_empty();
-    }
-
-    /// 喂入当前句一段 PCM，返回可立即下发的字节
-    pub fn feed(&mut self, mut bytes: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        if !self.head_done {
-            let need = FADE_BYTES - self.head.len();
-            let take = need.min(bytes.len());
-            self.head.extend_from_slice(&bytes[..take]);
-            bytes = &bytes[take..];
-            if self.head.len() >= FADE_BYTES {
-                out.extend_from_slice(&crossfade(&self.tail, &self.head[..FADE_BYTES]));
-                out.extend_from_slice(&self.head[FADE_BYTES..]);
-                self.tail.clear();
-                self.head.clear();
-                self.head_done = true;
-            }
-        }
-        if self.head_done && !bytes.is_empty() {
-            // 滚动扣留句尾 FADE_BYTES，其余下发
-            self.hold.extend_from_slice(bytes);
-            if self.hold.len() > FADE_BYTES {
-                let emit = self.hold.len() - FADE_BYTES;
-                out.extend_from_slice(&self.hold[..emit]);
-                self.hold.drain(..emit);
-            }
-        }
-        out
-    }
-
-    /// 当前句结束：句尾保留区转存为 tail，留给下一句混合
-    pub fn end_sentence(&mut self) -> Vec<u8> {
-        if self.head_done {
-            self.tail = std::mem::take(&mut self.hold);
-            Vec::new()
-        } else {
-            // 整句比一个淡化区还短：按实际长度混合后全部下发
-            let n = (self.tail.len().min(self.head.len())) & !1; // 对齐到采样边界
-            let mut out = crossfade(&self.tail[..n], &self.head[..n]);
-            out.extend_from_slice(&self.head[n..]);
-            self.tail.clear();
-            self.head.clear();
-            self.head_done = true;
-            out
-        }
-    }
-
-    /// 整条流结束：最后一句扣留的句尾不再需要留给别人，原样下发
-    pub fn finish(&mut self) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.append(&mut self.tail);
-        out.append(&mut self.hold);
-        out.append(&mut self.head);
-        out
-    }
-}
-
-/// 等长两段 s16le PCM 线性混合：a 淡出、b 淡入。长度需为偶数（采样对齐）。
-fn crossfade(a: &[u8], b: &[u8]) -> Vec<u8> {
-    debug_assert_eq!(a.len(), b.len());
-    debug_assert_eq!(a.len() % 2, 0);
-    let n = a.len() / 2;
-    let mut out = Vec::with_capacity(a.len());
-    for i in 0..n {
-        let t = (i + 1) as f32 / (n + 1) as f32;
-        let sa = i16::from_le_bytes([a[2 * i], a[2 * i + 1]]) as f32;
-        let sb = i16::from_le_bytes([b[2 * i], b[2 * i + 1]]) as f32;
-        out.extend_from_slice(&((sa * (1.0 - t) + sb * t) as i16).to_le_bytes());
-    }
-    out
-}
-
-// ====== LLM→TTS 流水线 ======
-
 /// 把 llm + sentence-split + tts 三个阶段串成一条事件流，
 /// 供 /admin/llm_tts、/admin/asr_llm_tts 与 session.rs 的 WS pipeline 共用
 /// （后两者额外透出 Llm 文本事件）。
 /// 接受 Arc 而非 &Arc 是因为 actix-web 的 streaming() 要求 `Stream + 'static`，Arc 便宜 clone。
 ///
-/// `emotion_hint`：从 ASR 文本里解析出来的说话人情绪（参见 `session::parse_asr_emotion_tags`），
+/// `emotion_hint`：从 ASR 文本里解析出来的说话人情绪（参见 `session::text::parse_asr_emotion_tags`），
 /// 作为 system message 的参考传给 LLM。`None` 表示无情绪（如 `/admin/llm_tts` 直接调用的场景）。
 ///
 /// `sample_rate_override`：端侧 SessionStart 上报的 TTS 输出采样率。

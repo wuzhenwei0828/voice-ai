@@ -23,8 +23,7 @@ pub mod tts;
 pub use asr::{build_asr_client, ArcAsr, AsrClient, HttpAsrClient};
 pub use error::ClientError;
 pub use funasr::{
-    build_funasr_client, ArcFunasr, FunasrClient, FunasrConfig, FunasrMode, FunasrResponse,
-    FunasrResponseMode, FunasrSession,
+    build_funasr_client, ArcFunasr, FunasrClient, FunasrConfig, FunasrMode, FunasrSession,
 };
 pub use llm::{build_llm_client, ArcLlm, LlmClient, HttpLlmClient};
 pub use tts::{build_tts_client, ArcTts, TtsClient, HttpTtsClient};
