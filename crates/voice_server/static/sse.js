@@ -1,26 +1,54 @@
-// voice-app frontend — NDJSON 流解析 helper
-// 把 fetch response 的 body 流按 \n 切成 JSON 对象逐个 yield
-// 用于消费 /admin/asr /admin/llm /admin/tts /admin/llm_tts 的 NDJSON 响应
+// voice-app frontend — SSE 流解析 helper
+// 把 fetch response 的 body 流按 SSE 空行边界切成 JSON data 事件逐个 yield。
+// 用于消费 /admin/asr /admin/llm /admin/tts /admin/llm_tts /admin/asr_llm_tts。
 
-window.parseNdjson = async function* parseNdjson(response) {
+window.parseSse = async function* parseSse(response) {
   if (!response.ok) {
     throw new Error(`HTTP ${response.status} ${response.statusText}`);
   }
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
+  let dataLines = [];
+
+  function* emitEvent(block) {
+    const lines = block.split(/\r?\n/);
+    const data = lines
+      .filter((line) => line.startsWith('data:'))
+      .map((line) => line.slice(5).replace(/^ /, ''))
+      .join('\n');
+    if (data) yield JSON.parse(data);
+  }
+
+  function* flushBlock() {
+    const block = dataLines.join('\n');
+    dataLines = [];
+    yield* emitEvent(block);
+  }
+
   for (;;) {
     const { value, done } = await reader.read();
-    if (done) break;
+    if (done) {
+      buf += decoder.decode();
+      break;
+    }
     buf += decoder.decode(value, { stream: true });
-    let i;
-    while ((i = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, i).trim();
-      buf = buf.slice(i + 1);
-      if (line) yield JSON.parse(line);
+    let newline;
+    while ((newline = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, newline).replace(/\r$/, '');
+      buf = buf.slice(newline + 1);
+      if (line === '') {
+        yield* flushBlock();
+      } else if (!line.startsWith(':')) {
+        dataLines.push(line);
+      }
     }
   }
-  if (buf.trim()) yield JSON.parse(buf);
+  if (buf) {
+    const line = buf.replace(/\r$/, '');
+    if (line && !line.startsWith(':')) dataLines.push(line);
+  }
+  if (dataLines.length) yield* flushBlock();
 };
 
 // 把 Uint8Array 拼成完整 WAV（s16le 16kHz mono），返回 Blob URL

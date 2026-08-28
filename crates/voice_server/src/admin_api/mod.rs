@@ -1,11 +1,11 @@
 //! 单能力验证 HTTP 接口
 //!
 //! 5 个独立 REST endpoint，方便 curl / Postman / 前端 tab 单点验证：
-//!   POST /admin/asr         raw PCM body → NDJSON {text, is_final}
-//!   POST /admin/llm         JSON {prompt}  → NDJSON {delta, is_final}
-//!   POST /admin/tts         JSON {text}    → NDJSON {seq, audio(base64), is_last}
-//!   POST /admin/llm_tts     JSON {text}    → NDJSON {seq, audio(base64), is_last}（复用切句逻辑）
-//!   POST /admin/asr_llm_tts raw PCM body   → NDJSON 分阶段事件（前端按 stage 分发）：
+//!   POST /admin/asr         raw PCM body → SSE data events `{text, is_final}`
+//!   POST /admin/llm         JSON {prompt}  → SSE data events `{delta, is_final}`
+//!   POST /admin/tts         JSON {text}    → SSE data events `{seq, audio(base64), is_last}`
+//!   POST /admin/llm_tts     JSON {text}    → SSE data events `{seq, audio(base64), is_last}`（复用切句逻辑）
+//!   POST /admin/asr_llm_tts raw PCM body   → SSE 分阶段事件（前端按 stage 分发）：
 //!       {"stage":"asr","text":..,"is_final":..}
 //!       {"stage":"llm","delta":..,"is_final":..}
 //!       {"stage":"tts","seq":..,"audio":base64,"is_last":..}（末尾补 audio 空、is_last:true 结束标记）
@@ -15,12 +15,12 @@
 //!   - 切句复用 session::text::next_sentence_end
 //!   - LLM→TTS 管线由 [`crate::pipeline::llm_tts_items`] 提供，/admin/llm_tts、/admin/asr_llm_tts
 //!     与 session.rs 的 WS pipeline 共用（句间 crossfade / 全局 seq / 结束标记）
-//!   - 流中途出错：插一行 {error, code} 然后断流（HTTP 200 已发，不能改 status）
+//!   - 流中途出错：插一个 `{error, code}` SSE data event 然后断流（HTTP 200 已发，不能改 status）
 //!     错误码约定：1001 asr / 1002 llm 调用 / 1003 llm 流 / 1004 tts 调用 / 1005 tts 流
 //!
 //! ## 模块拆分
 //! - [`audio`] WAV 头解析 / 包成 16kHz mono s16le WAV 给 ASR
-//! - [`mod`]    HTTP 路由 + DTO + NDJSON 序列化 + 错误处理
+//! - [`mod`]    HTTP 路由 + DTO + SSE 序列化 + 错误处理
 
 pub mod audio;
 
@@ -37,7 +37,10 @@ use audio::prepare_audio_for_asr;
 use crate::client::{ArcAsr, ArcLlm, ArcTts, ClientError};
 use crate::events::{AsrEvent, LlmEvent};
 use crate::pipeline::{llm_tts_items, LlmTtsItem, SentenceCrossfader};
-use crate::session::text::{next_sentence_end, parse_asr_emotion_tags};
+use crate::session::text::next_sentence_end;
+use crate::utils::postprocess_utils::{
+    format_asr_hint, parse_asr_text, rich_transcription_postprocess,
+};
 
 /// 把 `ClientError` 转成 actix 响应。
 ///
@@ -153,11 +156,11 @@ struct StageTtsLine {
     is_last: bool,
 }
 
-// ====== NDJSON 流序列化 helper ======
+// ====== SSE 流序列化 helper ======
 
-/// 把 `Stream<Item = Result<T, ClientError>>` 序列化成 NDJSON 字节流。
-/// 出错时插入 `{error, code}` 一行 + break 流。
-fn ndjson_stream<T, E, S>(inner: S) -> impl Stream<Item = Result<Bytes, actix_web::Error>>
+/// 把 `Stream<Item = Result<T, ClientError>>` 序列化成 SSE data event 字节流。
+/// 每个事件遵循 `data: <JSON>\n\n` framing；出错时插入 `{error, code}` 事件后结束流。
+fn sse_stream<T, E, S>(inner: S) -> impl Stream<Item = Result<Bytes, actix_web::Error>>
 where
     T: Serialize,
     E: Display,
@@ -168,17 +171,11 @@ where
         while let Some(item) = inner.next().await {
             match item {
                 Ok(v) => {
-                    let mut line = serde_json::to_vec(&v)
-                        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
-                    line.push(b'\n');
-                    yield Bytes::from(line);
+                    yield sse_line(&v)?;
                 }
                 Err(e) => {
                     let err_line = ErrorLine::new(e.to_string(), 500);
-                    let mut line = serde_json::to_vec(&err_line)
-                        .map_err(|e2| actix_web::error::ErrorInternalServerError(e2.to_string()))?;
-                    line.push(b'\n');
-                    yield Bytes::from(line);
+                    yield sse_line(&err_line)?;
                     break;
                 }
             }
@@ -193,25 +190,25 @@ where
 // `llm_tts_items`（共享 LLM→TTS 管线）本身已搬到 pipeline.rs。
 
 
-/// 把一段 PCM 包成 NDJSON 行（不附加 is_last）。空 PCM 调用方应跳过。
+/// 把一段 PCM 包成 SSE data event（不附加 is_last）。空 PCM 调用方应跳过。
 fn serialize_pcm_line(seq: u32, pcm: &[u8]) -> Result<Bytes, actix_web::Error> {
     let line = TtsLine {
         seq,
         audio: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pcm),
         is_last: false,
     };
-    let mut json = serde_json::to_vec(&line)
-        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
-    json.push(b'\n');
-    Ok(Bytes::from(json))
+    sse_line(&line)
 }
 
-/// 序列化任意一行 NDJSON（含结尾换行）
-fn ndjson_line<T: Serialize>(v: &T) -> Result<Bytes, actix_web::Error> {
-    let mut json = serde_json::to_vec(v)
+/// 序列化任意一条 SSE data event。
+fn sse_line<T: Serialize>(v: &T) -> Result<Bytes, actix_web::Error> {
+    let json = serde_json::to_vec(v)
         .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
-    json.push(b'\n');
-    Ok(Bytes::from(json))
+    let mut event = Vec::with_capacity(6 + json.len() + 2);
+    event.extend_from_slice(b"data: ");
+    event.extend_from_slice(&json);
+    event.extend_from_slice(b"\n\n");
+    Ok(Bytes::from(event))
 }
 
 // ====== Session id 生成 ======
@@ -230,7 +227,7 @@ fn gen_sid(prefix: &str) -> String {
 /// body: 整段音频字节（前端直接转发，服务端统一包成 16kHz mono s16le WAV 喂给 ASR）
 ///   - 输入是 WAV：自动 strip header，取 data chunk 的 PCM 包回标准 WAV 头
 ///   - 输入是裸 PCM（约定 s16le 16kHz mono）：直接包 WAV 头
-/// response: NDJSON `{"text":"...","is_final":false|true}`
+/// response: SSE data events carrying `{"text":"...","is_final":false|true}`
 pub async fn asr(
     body: Bytes,
     asr: Data<ArcAsr>,
@@ -260,13 +257,14 @@ pub async fn asr(
     }));
 
     Ok(HttpResponse::Ok()
-        .content_type("application/x-ndjson")
-        .streaming(ndjson_stream::<AsrLine, ClientError, _>(line_stream)))
+        .content_type("text/event-stream")
+        .insert_header((actix_web::http::header::CACHE_CONTROL, "no-cache"))
+        .streaming(sse_stream::<AsrLine, ClientError, _>(line_stream)))
 }
 
 /// POST /admin/llm
 /// body: `{"prompt":"...","session_id":"可选"}`
-/// response: NDJSON `{"delta":"...","is_final":false|true}`
+/// response: SSE data events carrying `{"delta":"...","is_final":false|true}`
 pub async fn llm(
     req: Json<LlmReq>,
     llm: Data<ArcLlm>,
@@ -285,15 +283,16 @@ pub async fn llm(
     }));
 
     Ok(HttpResponse::Ok()
-        .content_type("application/x-ndjson")
-        .streaming(ndjson_stream::<LlmLine, ClientError, _>(line_stream)))
+        .content_type("text/event-stream")
+        .insert_header((actix_web::http::header::CACHE_CONTROL, "no-cache"))
+        .streaming(sse_stream::<LlmLine, ClientError, _>(line_stream)))
 }
 
 /// POST /admin/tts
 /// body: `{"text":"...","session_id":"可选","voice":"可选短名"}`
 /// 内部：用 next_sentence_end 按句子切分，逐句调 tts.synthesize，
 ///       句间过 crossfade 消除波形拼接尖刺。
-/// response: NDJSON `{"seq":N,"audio":"<base64>","is_last":false|true}`
+/// response: SSE data events carrying `{"seq":N,"audio":"<base64>","is_last":false|true}`
 ///           最后补一条 `{"seq":N+1,"audio":"","is_last":true}` 作为结束标记
 pub async fn tts(
     req: Json<TtsReq>,
@@ -315,7 +314,8 @@ pub async fn tts(
 
     // voice_override 由端侧（前端的 voice 下拉）提供；None → HttpTtsClient 走配置兜底
     Ok(HttpResponse::Ok()
-        .content_type("application/x-ndjson")
+        .content_type("text/event-stream")
+        .insert_header((actix_web::http::header::CACHE_CONTROL, "no-cache"))
         .streaming(build_tts_sentence_stream(
             text,
             sid_inner,
@@ -359,10 +359,7 @@ fn build_tts_sentence_stream(
                 Err(e) => {
                     warn!(target: "voice_server.admin_api", endpoint = "tts", session_id = %sid, "TTS 调用失败: {}", e);
                     let err_line = ErrorLine::new(format!("tts error: {}", e), 1102);
-                    let mut line = serde_json::to_vec(&err_line)
-                        .map_err(|e2| actix_web::error::ErrorInternalServerError(e2.to_string()))?;
-                    line.push(b'\n');
-                    yield Bytes::from(line);
+                    yield sse_line(&err_line)?;
                     return;
                 }
             };
@@ -374,10 +371,7 @@ fn build_tts_sentence_stream(
                     Err(e) => {
                         warn!(target: "voice_server.admin_api", endpoint = "tts", session_id = %sid, "TTS 流错误: {}", e);
                         let err_line = ErrorLine::new(format!("tts stream: {}", e), 1103);
-                        let mut line = serde_json::to_vec(&err_line)
-                            .map_err(|e2| actix_web::error::ErrorInternalServerError(e2.to_string()))?;
-                        line.push(b'\n');
-                        yield Bytes::from(line);
+                        yield sse_line(&err_line)?;
                         return;
                     }
                 };
@@ -431,10 +425,7 @@ fn build_tts_sentence_stream(
         // 结束标记
         global_seq += 1;
         let line = TtsLine { seq: global_seq, audio: String::new(), is_last: true };
-        let mut json = serde_json::to_vec(&line)
-            .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
-        json.push(b'\n');
-        yield Bytes::from(json);
+        yield sse_line(&line)?;
 
         debug!(target: "voice_server.admin_api", endpoint = "tts", session_id = %sid, "/admin/tts 全部完成");
     }
@@ -443,7 +434,7 @@ fn build_tts_sentence_stream(
 /// POST /admin/llm_tts
 /// body: `{"text":"...","session_id":"可选"}`
 /// 内部：LLM 流式 → 切句 → 逐句 TTS 流式 → 拼接成统一 seq
-/// response: NDJSON `{"seq":N,"audio":"<base64>","is_last":false|true}`
+/// response: SSE data events carrying `{"seq":N,"audio":"<base64>","is_last":false|true}`
 ///           最后补一条 `{"seq":N+1,"audio":"","is_last":true}` 作为结束标记
 /// （LLM 文本 delta 不透出、服务端日志可见；/admin/asr_llm_tts 会透出）
 pub async fn llm_tts(
@@ -477,7 +468,8 @@ pub async fn llm_tts(
     );
 
     Ok(HttpResponse::Ok()
-        .content_type("application/x-ndjson")
+        .content_type("text/event-stream")
+        .insert_header((actix_web::http::header::CACHE_CONTROL, "no-cache"))
         .streaming(llm_tts_lines(items)))
 }
 
@@ -492,10 +484,10 @@ fn llm_tts_lines(
             match item {
                 LlmTtsItem::Llm { .. } => {} // 现有 wire 格式不含 LLM 文本行
                 LlmTtsItem::Tts { seq, audio, is_last } => {
-                    yield ndjson_line(&TtsLine { seq, audio, is_last })?;
+                    yield sse_line(&TtsLine { seq, audio, is_last })?;
                 }
                 LlmTtsItem::Failed { error, code } => {
-                    yield ndjson_line(&ErrorLine::new(error, code))?;
+                    yield sse_line(&ErrorLine::new(error, code))?;
                 }
             }
         }
@@ -509,8 +501,8 @@ fn llm_tts_lines(
 
 /// POST /admin/asr_llm_tts
 /// body: 整段音频字节（前端直接转发，服务端统一包成 16kHz mono s16le WAV 喂给 ASR）
-/// 内部：ASR → LLM 流式 → 切句 → 逐句 TTS 流式，全链路串成一条 NDJSON 流
-/// response: NDJSON 分阶段事件（stage 字段区分）：
+/// 内部：ASR → LLM 流式 → 切句 → 逐句 TTS 流式，全链路串成一条 SSE 流
+/// response: SSE 分阶段事件（stage 字段区分）：
 ///   `{"stage":"asr","text":..,"is_final":..}`
 ///   `{"stage":"llm","delta":..,"is_final":..}`
 ///   `{"stage":"tts","seq":..,"audio":base64,"is_last":..}`（末尾 audio 空、is_last:true 结束标记）
@@ -545,7 +537,8 @@ pub async fn asr_llm_tts(
     };
 
     Ok(HttpResponse::Ok()
-        .content_type("application/x-ndjson")
+        .content_type("text/event-stream")
+        .insert_header((actix_web::http::header::CACHE_CONTROL, "no-cache"))
         .streaming(build_asr_llm_tts_stream(
             prepared,
             sid,
@@ -572,13 +565,13 @@ pub struct AsrLlmTtsQuery {
 /// { "voices": ["alex", "anna", ...], "default": "alex" }
 /// ```
 ///
-/// 白名单 `SUPPORTED_VOICES` 硬编码在 `client::tts`（与 HttpTtsClient 共享）；
+/// 白名单 `SUPPORTED_VOICES` 硬编码在 `client::tts`（HashMap 形式，与 HttpTtsClient 共享）；
 /// 默认值从 `TtsClient::default_voice_short()` 拿（即 yaml `tts.voice`）。
 pub async fn voices(tts: Data<ArcTts>) -> Result<HttpResponse, actix_web::Error> {
-    use crate::client::tts::SUPPORTED_VOICES;
+    use crate::client::tts::supported_voice_shorts;
 
     let resp = VoicesResp {
-        voices: SUPPORTED_VOICES.iter().map(|s| s.to_string()).collect(),
+        voices: supported_voice_shorts().into_iter().map(|s| s.to_string()).collect(),
         default: tts.get_ref().default_voice_short().to_string(),
     };
     Ok(HttpResponse::Ok()
@@ -593,7 +586,7 @@ struct VoicesResp {
 }
 
 /// ASR 阶段内联跑完拿到 prompt，LLM→TTS 阶段复用 llm_tts_items，
-/// 统一映射成带 stage 标记的 NDJSON 行。
+/// 统一映射成带 stage 标记的 SSE data event。
 fn build_asr_llm_tts_stream(
     pcm: Vec<u8>,
     sid: String,
@@ -608,10 +601,10 @@ fn build_asr_llm_tts_stream(
             Ok(s) => s,
             Err(e) => {
                 warn!(target: "voice_server.admin_api", endpoint = "asr_llm_tts", session_id = %sid, "ASR 调用失败: {}", e);
-                // 如果上游走了 OpenAI 信封，把 code/param 也带出来 —— voice-server NDJSON 的
+                // 如果上游走了 OpenAI 信封，把 code/param 也带出来 —— voice-server SSE 的
                 // 内部错误码 (1001) 是管线阶段标识，与 yapi 的 `code` 字符串语义不同，
                 // 这里统一塞进 ErrorLine，message 里能透出上游 `code: param=xxx`。
-                yield ndjson_line(&ErrorLine {
+                yield sse_line(&ErrorLine {
                     error: format!("asr error: {}", e),
                     code: 1001,
                     r#type: e.render_api_envelope().map(|(_, b)| b),
@@ -626,55 +619,77 @@ fn build_asr_llm_tts_stream(
                 Ok(e) => e,
                 Err(e) => {
                     warn!(target: "voice_server.admin_api", endpoint = "asr_llm_tts", session_id = %sid, "ASR 流错误: {}", e);
-                    yield ndjson_line(&ErrorLine::new(format!("asr stream: {}", e), 1001))?;
+                    yield sse_line(&ErrorLine::new(format!("asr stream: {}", e), 1001))?;
                     return;
                 }
             };
-            // 取最新非空识别文本；非流式 ASR 客户端只发一个 is_final=true 的完整结果
-            if !evt.text.is_empty() {
-                prompt = evt.text.clone();
+            // 先清洗 ASR 标签并把 rich 结果下发；最终 rich 文本随后交给 parse_asr_text。
+            let cleaned = rich_transcription_postprocess(&evt.text);
+            if !cleaned.is_empty() {
+                prompt = cleaned.clone();
             }
-            yield ndjson_line(&StageAsrLine { stage: "asr", text: evt.text, is_final: evt.is_final })?;
+            yield sse_line(&StageAsrLine { stage: "asr", text: cleaned, is_final: evt.is_final })?;
         }
 
         let prompt = prompt.trim().to_string();
         if prompt.is_empty() {
-            yield ndjson_line(&ErrorLine::new("asr result empty".to_string(), 1001))?;
+            yield sse_line(&ErrorLine::new("asr result empty".to_string(), 1001))?;
             return;
         }
 
         // 解析 ASR 情绪标签（如 <|zh|><|SAD|><|Speech|>...），情绪作为 system message 传给 LLM
-        let parsed = parse_asr_emotion_tags(&prompt);
+        let parsed = parse_asr_text(&prompt);
+        let asr_hint = format_asr_hint(parsed.emotion.as_deref(), &parsed.event);
         if parsed.text.is_empty() {
-            yield ndjson_line(&ErrorLine::new("asr result empty after stripping tags".to_string(), 1001))?;
+            yield sse_line(&ErrorLine::new("asr result empty after stripping tags".to_string(), 1001))?;
             return;
         }
-        if parsed.emotion.is_some() {
+        if asr_hint.is_some() {
             info!(
                 target: "voice_server.admin_api",
                 endpoint = "asr_llm_tts",
                 session_id = %sid,
                 emotion = ?parsed.emotion,
-                "ASR 文本含情绪标签"
+                events = ?parsed.event,
+                "ASR 文本含情绪/事件信号"
             );
         }
 
         // 阶段 2+3: 复用 LLM→TTS 管线；voice_override 来自 query 参数
-        let mut items = Box::pin(llm_tts_items(parsed.text, parsed.emotion, sid.clone(), llm, tts, None, voice_override));
+        let mut items = Box::pin(llm_tts_items(parsed.text, asr_hint, sid.clone(), llm, tts, None, voice_override));
         while let Some(item) = items.next().await {
             match item {
                 LlmTtsItem::Llm { delta, is_final } => {
-                    yield ndjson_line(&StageLlmLine { stage: "llm", delta, is_final })?;
+                    yield sse_line(&StageLlmLine { stage: "llm", delta, is_final })?;
                 }
                 LlmTtsItem::Tts { seq, audio, is_last } => {
-                    yield ndjson_line(&StageTtsLine { stage: "tts", seq, audio, is_last })?;
+                    yield sse_line(&StageTtsLine { stage: "tts", seq, audio, is_last })?;
                 }
                 LlmTtsItem::Failed { error, code } => {
-                    yield ndjson_line(&ErrorLine::new(error, code))?;
+                    yield sse_line(&ErrorLine::new(error, code))?;
                 }
             }
         }
 
         debug!(target: "voice_server.admin_api", endpoint = "asr_llm_tts", session_id = %sid, "/admin/asr_llm_tts 全部完成");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sse_line_wraps_json_as_data_event() {
+        let line = sse_line(&AsrLine {
+            text: "你好".to_string(),
+            is_final: true,
+        })
+        .expect("serialize SSE event");
+
+        assert_eq!(
+            String::from_utf8(line.to_vec()).expect("UTF-8 SSE event"),
+            "data: {\"text\":\"你好\",\"is_final\":true}\n\n"
+        );
     }
 }

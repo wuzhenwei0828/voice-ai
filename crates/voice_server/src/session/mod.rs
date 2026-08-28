@@ -11,7 +11,8 @@
 //! ## 模块拆分
 //! - [`state`]    状态机枚举（`SessionState` / `TriggerReason`）
 //! - [`audio`]    音频缓冲（`AudioAccumulator` + 触发阈值常量）
-//! - [`text`]     文本处理（`next_sentence_end` / `parse_asr_emotion_tags` / `Emotion`）
+//! - [`text`]     文本处理（`next_sentence_end`）。ASR 标签解析见
+//!                [`crate::utils::postprocess_utils::parse_asr_text`]
 //! - [`pipeline`] 完整 pipeline 编排（`run_pipeline` / `send_down` / `CurrentCancelGuard`）
 //!
 //! ## Pipeline 并发策略：**打断旧的**（auto-interrupt on new utterance），但只在新句真有内容时
@@ -98,7 +99,11 @@ pub struct VoiceSession {
     /// 最近一个进入 LLM/TTS 阶段的 pipeline 的 cancel token（auto-interrupt 用）；
     /// 空文本 pipeline 不注册，不影响正在跑的 LLM/TTS
     current_real_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    /// 单会话内的 pipeline 请求序号；0 保留给没有请求序列的兼容事件。
+    next_request_id: u64,
     audio_buf: AudioAccumulator,
+    /// 最近一次通过最短时长校验的语音请求，供显式 Retry 重放。
+    last_request_audio: Option<Vec<u8>>,
     /// 从 SessionStart 记下，用于包 WAV 头给 ASR（siliconflow 等 provider 按文件后缀选解码器）
     sample_rate: u32,
     channels: u16,
@@ -134,7 +139,9 @@ impl VoiceSession {
             closed: false,
             global_cancel: CancellationToken::new(),
             current_real_cancel: Arc::new(Mutex::new(None)),
+            next_request_id: 0,
             audio_buf: AudioAccumulator::new(),
+            last_request_audio: None,
             sample_rate: 0,
             channels: 0,
             client_tts_sample_rate: None,
@@ -262,12 +269,38 @@ impl VoiceSession {
                 self.global_cancel = CancellationToken::new();
                 *self.current_real_cancel.lock() = None;
                 self.transition(SessionState::Listening);
-                send_down(&self.down_addr, VoicePayload::LlmDelta {
-                    session_id: self.session_id.clone(),
-                    delta: "[已打断]".to_string(),
-                    is_final: true,
-                });
+                send_down(
+                    &self.down_addr,
+                    VoicePayload::LlmDelta {
+                        session_id: self.session_id.clone(),
+                        delta: "[已打断]".to_string(),
+                        is_final: true,
+                        request_id: 0,
+                    },
+                );
                 None
+            }
+            VoicePayload::Retry { .. } => {
+                let Some(audio) = self.last_request_audio.clone() else {
+                    warn!(
+                        target: "voice_server.session",
+                        session_id = %self.session_id,
+                        "收到 Retry，但没有可重放的有效请求"
+                    );
+                    return None;
+                };
+                info!(
+                    target: "voice_server.session",
+                    session_id = %self.session_id,
+                    bytes = audio.len(),
+                    "收到 Retry，重放最近一次有效请求"
+                );
+                self.global_cancel.cancel();
+                self.global_cancel = CancellationToken::new();
+                *self.current_real_cancel.lock() = None;
+                let _ = self.audio_buf.drain();
+                self.audio_buf.push(audio);
+                self.trigger_pipeline(TriggerReason::Retry)
             }
             VoicePayload::SessionEnd { reason, .. } => {
                 info!(
@@ -292,6 +325,9 @@ impl VoiceSession {
     }
 
     fn trigger_pipeline(&mut self, reason: TriggerReason) -> Option<JoinHandle<()>> {
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        let request_id = self.next_request_id;
+
         // 先把"耗时"取出来再 drain（drain 后 audio_buf 计时会被下次 push 重置）
         let bytes_before = self.audio_buf.len();
         let elapsed_before = self.audio_buf.elapsed_ms();
@@ -308,6 +344,7 @@ impl VoiceSession {
             );
             return None;
         }
+        self.last_request_audio = Some(audio.clone());
         info!(
             target: "voice_server.session",
             session_id = %self.session_id,
@@ -343,6 +380,7 @@ impl VoiceSession {
         let handle = tokio::spawn(async move {
             run_pipeline(
                 session_id,
+                request_id,
                 audio,
                 sample_rate,
                 channels,
@@ -381,4 +419,172 @@ fn _assert_voice_session_send_sync()
 where
     VoiceSession: Send + Sync,
 {
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use actix::{Actor, Context, Handler};
+    use async_trait::async_trait;
+    use futures_util::{stream, Stream};
+    use tokio::sync::mpsc;
+    use voice_proto::{decode_payload, AgentPhase};
+
+    use crate::client::error::ClientError;
+    use crate::client::llm::{BoxStream as LlmStream, ChatMessage};
+    use crate::client::{LlmClient, TtsClient};
+    use crate::events::{AsrEvent, LlmEvent, TtsEvent};
+
+    use super::*;
+
+    struct CountingFailingAsr {
+        calls: Arc<AtomicUsize>,
+        wav_inputs: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    #[async_trait]
+    impl AsrClient for CountingFailingAsr {
+        async fn recognize(
+            &self,
+            _session_id: &str,
+            _filename: Option<&str>,
+            audio: Vec<u8>,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<AsrEvent, ClientError>> + Send>>, ClientError>
+        {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.wav_inputs.lock().push(audio);
+            Err(ClientError::Http("temporary ASR failure".to_string()))
+        }
+    }
+
+    struct UnusedLlm;
+
+    #[async_trait]
+    impl LlmClient for UnusedLlm {
+        async fn chat(
+            &self,
+            _session_id: &str,
+            _prompt: &str,
+            _emotion_hint: Option<&str>,
+        ) -> Result<LlmStream<Result<LlmEvent, ClientError>>, ClientError> {
+            Ok(Box::pin(stream::empty()))
+        }
+
+        async fn chat_with_messages(
+            &self,
+            _session_id: &str,
+            _messages: &[ChatMessage],
+        ) -> Result<LlmStream<Result<LlmEvent, ClientError>>, ClientError> {
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    struct UnusedTts;
+
+    #[async_trait]
+    impl TtsClient for UnusedTts {
+        async fn synthesize(
+            &self,
+            _session_id: &str,
+            _text: &str,
+            _sample_rate_override: Option<u32>,
+            _voice_override: Option<String>,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<TtsEvent, ClientError>> + Send>>, ClientError>
+        {
+            Ok(Box::pin(stream::empty()))
+        }
+
+        fn default_voice_short(&self) -> &str {
+            "unused"
+        }
+    }
+
+    struct CaptureActor {
+        tx: mpsc::UnboundedSender<VoicePayload>,
+    }
+
+    impl Actor for CaptureActor {
+        type Context = Context<Self>;
+    }
+
+    impl Handler<OutMessage> for CaptureActor {
+        type Result = ();
+
+        fn handle(&mut self, msg: OutMessage, _ctx: &mut Self::Context) {
+            let (_, payload) = decode_payload(&msg.data).expect("downlink payload should decode");
+            self.tx.send(payload).expect("test receiver should be open");
+        }
+    }
+
+    #[actix::test]
+    async fn retry_replays_the_last_valid_request_with_a_new_request_id() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let wav_inputs = Arc::new(Mutex::new(Vec::new()));
+        let asr = Arc::new(CountingFailingAsr {
+            calls: calls.clone(),
+            wav_inputs: wav_inputs.clone(),
+        });
+        let llm = Arc::new(LlmAgent::new(Arc::new(UnusedLlm)));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let down_addr = CaptureActor { tx }.start().recipient();
+        let mut session = VoiceSession::new(
+            "session-1".to_string(),
+            asr,
+            llm,
+            Arc::new(UnusedTts),
+            down_addr,
+        );
+        session.on_payload(VoicePayload::SessionStart {
+            session_id: "session-1".to_string(),
+            sample_rate: 16_000,
+            channels: 1,
+            codec: "pcm_s16le".to_string(),
+            language: "zh-CN".to_string(),
+            tts_sample_rate: None,
+            voice: None,
+        });
+
+        let first = session
+            .on_payload(VoicePayload::AudioChunk {
+                session_id: "session-1".to_string(),
+                seq: 1,
+                timestamp_ms: 0,
+                data: vec![0; MIN_UTTERANCE_BYTES],
+                is_last: true,
+            })
+            .expect("the first valid request should spawn a pipeline");
+        first.await.expect("the first pipeline should finish");
+
+        let retry = session
+            .on_payload(VoicePayload::Retry {
+                session_id: "session-1".to_string(),
+            })
+            .expect("retry should spawn a pipeline for the saved request");
+        retry.await.expect("the retry pipeline should finish");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let inputs = wav_inputs.lock();
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0], inputs[1]);
+        drop(inputs);
+
+        let mut request_ids = Vec::new();
+        while request_ids.len() < 2 {
+            let payload = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("retry statuses should arrive")
+                .expect("capture actor should remain available");
+            if let VoicePayload::AgentStatus {
+                phase: AgentPhase::Transcribing,
+                request_id,
+                ..
+            } = payload
+            {
+                request_ids.push(request_id);
+            }
+        }
+        assert_eq!(request_ids, [1, 2]);
+    }
 }

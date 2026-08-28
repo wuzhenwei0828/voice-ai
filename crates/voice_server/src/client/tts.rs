@@ -17,8 +17,9 @@ use base64::Engine;
 use futures_util::StreamExt;
 use reqwest::header::HeaderMap;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -61,7 +62,8 @@ pub struct HttpTtsClient {
     path: String,
     api_key: Option<String>, // None = 不发 Authorization
     model: String,
-    /// 配置默认音色的**短名**（如 `"alex"`）。HttpTtsClient 内部会拼成 `"{model}:{voice_short}"`。
+    /// 配置默认音色的**短名**（如 `"alex"`，必须命中 [`SUPPORTED_VOICES`]）。
+    /// 发请求时由 [`SUPPORTED_VOICES`] 表里对应条目的 [`VoiceEntry::wire_voice`] 给出完整 voice 字符串。
     voice_short: String,
     response_format: String,
     stream: bool,
@@ -94,7 +96,7 @@ impl HttpTtsClient {
             anyhow::bail!(
                 "TTS 默认音色 '{}' 不在白名单 {:?} 中；请修改 yaml tts.voice",
                 voice_short,
-                SUPPORTED_VOICES
+                supported_voice_shorts()
             );
         }
         let client = reqwest::Client::builder()
@@ -115,10 +117,10 @@ impl HttpTtsClient {
         })
     }
 
-    /// 拼出完整的 voice 字符串（`"{model}:{short}"`）—— 内部 helper，单元测试与 synthesize 都用。
-    fn full_voice(&self, short_name: &str) -> String {
-        format!("{}:{}", self.model, short_name)
-    }
+    // 注：发请求时的完整 voice 字符串由 [`synthesize`] 直接查 [`SUPPORTED_VOICES`]
+    // 取 [`VoiceEntry::wire_voice`]，不再用 `format!("{}:{}", model, short)` 之类的硬拼接。
+    // 不同 provider 命名空间不同时（有的 `<model_id>:<voice>`、有的直接 `<voice_id>`），
+    // 调整 / 加音色都只需要改 [`SUPPORTED_VOICES`] 一处，不需要改拼接逻辑。
 }
 
 #[derive(Deserialize)]
@@ -150,19 +152,22 @@ impl TtsClient for HttpTtsClient {
         // 配置 fallback 已在 build_tts_client 时校验过，这里不重复）。
         validate_sample_rate_override(sample_rate_override, &self.response_format)?;
 
-        // ===== 解析 effective voice（短名 → 拼 model 前缀成全名）=====
+        // ===== 解析 effective voice（短名 → 查 SUPPORTED_VOICES 取 entry.wire_voice）=====
         // 优先级：端侧 override 短名 > 配置默认短名
         let effective_voice_short = voice_override.as_deref().unwrap_or(&self.voice_short);
-        // 短名校验：端侧 override 必须命中白名单；配置 fallback 已在 HttpTtsClient::new 校验过
-        if let Some(short) = voice_override.as_deref() {
-            if !is_supported_voice(short) {
+        // 查表：配置 fallback 已在 HttpTtsClient::new 时校验过（构造期 bail），
+        // 所以这里 None 只可能是端侧 override 不在白名单
+        let entry = match lookup_voice(effective_voice_short) {
+            Some(e) => e,
+            None => {
                 return Err(ClientError::Config(format!(
                     "TTS voice '{}' 不在白名单 {:?} 中",
-                    short, SUPPORTED_VOICES
+                    effective_voice_short,
+                    supported_voice_shorts()
                 )));
             }
-        }
-        let effective_voice = self.full_voice(effective_voice_short);
+        };
+        let effective_voice = entry.wire_voice;
 
         let url = if self.path.is_empty() {
             self.base_url.clone()
@@ -188,7 +193,7 @@ impl TtsClient for HttpTtsClient {
         let body = Req {
             input: Some(text),
             model: if self.model.is_empty() { None } else { Some(self.model.clone()) },
-            voice: if effective_voice.is_empty() { None } else { Some(effective_voice.clone()) },
+            voice: if effective_voice.is_empty() { None } else { Some(effective_voice.to_string()) },
             response_format: if self.response_format.is_empty() {
                 None
             } else {
@@ -457,7 +462,7 @@ pub fn build_tts_client(
         path = %path,
         model = %cfg.model,
         voice_short = %cfg.voice,
-        full_voice_default = %format!("{}:{}", cfg.model, cfg.voice),
+        full_voice_default = %lookup_voice(&cfg.voice).map(|e| e.wire_voice).unwrap_or(""),
         response_format = %cfg.response_format,
         sample_rate = ?cfg.sample_rate,
         "构造 HttpTtsClient"
@@ -499,26 +504,90 @@ pub fn default_sample_rate(format: &str) -> Option<u32> {
     }
 }
 
-/// 支持的 TTS 音色短名列表（**不**含模型前缀）。
+/// TTS 音色元数据。
 ///
-/// 短名在请求时由端侧（前端 / admin API 调用方）传入；HttpTtsClient 会拼上
-/// `model + ":" + 短名` 后再发给 TTS provider。
+/// - `short`：外部 API（前端下拉框 / admin API / yaml 默认）用的 key。
+/// - `wire_voice`：**原样**发给 TTS provider 的字符串（**已含** provider
+///   期望的全部前缀/路径，例如 `"fnlp/MOSS-TTSD-v0.5:alex"`）—— 不要再做任何
+///   `format!` / `+ ":" +` 之类的拼接，命名本身就是为了挡住这种"简化"。
 ///
-/// 改这张表时，记得同步检查 `config.rs::TtsConfig.voice` 默认值仍是合法短名。
-pub const SUPPORTED_VOICES: &[&str] = &[
-    "alex",
-    "anna",
-    "bella",
-    "benjamin",
-    "charles",
-    "claire",
-    "david",
-    "diana",
-];
+/// 之前 HttpTtsClient 写死 `format!("{}:{}", model, short)` 拼 full —— 改成在
+/// 条目里直接给 `wire_voice`，不同 provider 命名空间不同时（有的 `<model_id>:<voice>`、
+/// 有的直接 `<voice_id>`）调整 / 加音色都只需要改这张表，不需要动拼接逻辑。
+///
+/// 后续可在此结构体上加 `gender` / `language` / 默认 `sample_rate` 等字段，
+/// 调用方按需读取；不会破坏 `HashMap<&str, VoiceEntry>` 的 key 类型。
+/// 新加字段时建议用 required（而不是 `Option<...>`），backfill 所有条目比
+/// 半填充状态好维护。
+#[derive(Debug, Clone, Copy)]
+pub struct VoiceEntry {
+    pub short: &'static str,
+    pub wire_voice: &'static str,
+}
+
+/// 全部支持的 TTS 音色 → 元数据映射。
+///
+/// 用 `HashMap` 而非数组，便于：
+///   - O(1) 短名校验 / 查 entry
+///   - 后续给 `VoiceEntry` 加字段（gender / language / 默认 sample_rate 等），
+///     调整 / 扩展一条即可，不需要同步改拼接 / 序列化逻辑
+///
+/// `LazyLock` 里一次性 build，启动后只读；外部可直接 `SUPPORTED_VOICES.get("alex")`。
+///
+/// 改这张表时，记得同步检查 `config.rs::TtsConfig.voice` 默认值仍是合法 short。
+pub static SUPPORTED_VOICES: LazyLock<HashMap<&'static str, VoiceEntry>> =
+    LazyLock::new(|| {
+        HashMap::from([
+            (
+                "alex",
+                VoiceEntry { short: "alex", wire_voice: "fnlp/MOSS-TTSD-v0.5:alex" },
+            ),
+            (
+                "anna",
+                VoiceEntry { short: "anna", wire_voice: "fnlp/MOSS-TTSD-v0.5:anna" },
+            ),
+            (
+                "bella",
+                VoiceEntry { short: "bella", wire_voice: "fnlp/MOSS-TTSD-v0.5:bella" },
+            ),
+            (
+                "benjamin",
+                VoiceEntry { short: "benjamin", wire_voice: "fnlp/MOSS-TTSD-v0.5:benjamin" },
+            ),
+            (
+                "charles",
+                VoiceEntry { short: "charles", wire_voice: "fnlp/MOSS-TTSD-v0.5:charles" },
+            ),
+            (
+                "claire",
+                VoiceEntry { short: "claire", wire_voice: "fnlp/MOSS-TTSD-v0.5:claire" },
+            ),
+            (
+                "david",
+                VoiceEntry { short: "david", wire_voice: "fnlp/MOSS-TTSD-v0.5:david" },
+            ),
+            (
+                "diana",
+                VoiceEntry { short: "diana", wire_voice: "fnlp/MOSS-TTSD-v0.5:diana" },
+            ),
+        ])
+    });
 
 /// 校验短名是否在 [`SUPPORTED_VOICES`] 白名单里。大小写敏感 —— 短名都是小写。
 pub fn is_supported_voice(short_name: &str) -> bool {
-    SUPPORTED_VOICES.contains(&short_name)
+    SUPPORTED_VOICES.contains_key(short_name)
+}
+
+/// 查 short 对应的 entry；找不到返回 `None`。
+pub fn lookup_voice(short_name: &str) -> Option<&'static VoiceEntry> {
+    SUPPORTED_VOICES.get(short_name)
+}
+
+/// 给 `/admin/voices` 用：按 short 排序的短名列表（保证 API 输出稳定）。
+pub fn supported_voice_shorts() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = SUPPORTED_VOICES.keys().copied().collect();
+    v.sort();
+    v
 }
 
 /// 校验端侧 `sample_rate_override` 与 `response_format` 的兼容性。
@@ -754,30 +823,56 @@ mod tests {
         assert!(validate_sample_rate_override(Some(12345), "aac").is_ok());
     }
 
-    // ===== SUPPORTED_VOICES / is_supported_voice =====
+    // ===== SUPPORTED_VOICES / is_supported_voice / lookup_voice =====
 
     #[test]
     fn supported_voices_matches_doc_list() {
         // 与用户提供的图片一致：alex / anna / bella / benjamin / charles / claire / david / diana
-        assert_eq!(
-            SUPPORTED_VOICES,
-            &[
-                "alex",
-                "anna",
-                "bella",
-                "benjamin",
-                "charles",
-                "claire",
-                "david",
-                "diana",
-            ]
-        );
+        let expected = vec![
+            "alex", "anna", "bella", "benjamin", "charles", "claire", "david", "diana",
+        ];
+        let actual = supported_voice_shorts();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn lookup_voice_returns_wire_voice_for_known_shorts() {
+        for (short, wire_voice) in [
+            ("alex", "fnlp/MOSS-TTSD-v0.5:alex"),
+            ("anna", "fnlp/MOSS-TTSD-v0.5:anna"),
+            ("diana", "fnlp/MOSS-TTSD-v0.5:diana"),
+        ] {
+            let entry = lookup_voice(short).unwrap_or_else(|| panic!("{short} missing"));
+            assert_eq!(entry.short, short);
+            assert_eq!(entry.wire_voice, wire_voice);
+        }
+    }
+
+    #[test]
+    fn lookup_voice_unknown_returns_none() {
+        assert!(lookup_voice("snake_oil").is_none());
+        assert!(lookup_voice("nobody").is_none());
+        assert!(lookup_voice("").is_none());
+        assert!(lookup_voice("ALEX").is_none()); // 大小写敏感
+        assert!(lookup_voice("fnlp/MOSS-TTSD-v0.5:alex").is_none()); // 全名不是 short
+    }
+
+    #[test]
+    fn supported_voice_shorts_is_sorted() {
+        // /admin/voices 输出必须稳定 —— 同一份 SUPPORTED_VOICES 跑两次顺序一致
+        let first = supported_voice_shorts();
+        let second = supported_voice_shorts();
+        assert_eq!(first, second);
+        // 且已排好序
+        let mut sorted = first.clone();
+        sorted.sort();
+        assert_eq!(first, sorted);
     }
 
     #[test]
     fn is_supported_voice_accepts_whitelist_and_rejects_others() {
-        for v in SUPPORTED_VOICES {
-            assert!(is_supported_voice(v), "{v} should be supported");
+        for (short, _) in SUPPORTED_VOICES.iter() {
+            assert!(is_supported_voice(short), "{short} should be supported");
         }
         // 一些典型拒绝 case
         assert!(!is_supported_voice(""));

@@ -65,7 +65,7 @@ voice-app/
 |------|------|------|------|
 | 1. VoicePayload 协议 | ✅ | `voice-proto/src/lib.rs` | `enum VoicePayload`，2 个单测 |
 | 2. wav 流式上传 | ✅（CLI 已停用） | 历史上 `voice_terminal.rs::push_from_wav` | 20ms 一帧，模拟采集节奏；当前由浏览器前端 AudioWorklet 采集替代 |
-| 3. ASR HTTP 客户端 + 文本流 | ✅ | `clients.rs::HttpAsrClient` | POST /recognize，NDJSON 流 |
+| 3. ASR HTTP 客户端 + 文本流 | ✅ | `clients.rs::HttpAsrClient` | POST /recognize，SSE 流 |
 | 4. 客户端打印 ASR | ✅（CLI 已停用） | 历史上 `voice_client/src/callback.rs` | `DefaultVoiceCallback.on_payload`；浏览器侧由 `app.js` 替代 |
 
 ---
@@ -74,7 +74,7 @@ voice-app/
 
 | 步骤 | 状态 | 文件 | 备注 |
 |------|------|------|------|
-| 5. LLM 流式接入 | ✅ | `clients.rs::HttpLlmClient` | POST /chat/completions，NDJSON 流 |
+| 5. LLM 流式接入 | ✅ | `clients.rs::HttpLlmClient` | POST /chat/completions，SSE 流 |
 | **6. TTS 流式 + 存盘验证** | ❌ | （无 Rust 客户端） | 当前浏览器前端「TTS」tab 已能下载 WAV 验证音质；CLI 路径随 voice-client 移除而停用 |
 | 7. 终端 TTS 本地播放 | ✅（前端） | `crates/voice-server/static/app.js` `playTtsAudio` | 浏览器 `<audio>` + blob URL 队列；CLI 端随 voice-client 移除而停用 |
 

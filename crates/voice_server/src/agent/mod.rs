@@ -7,11 +7,15 @@
 //!
 //! 当前默认窗口 = 20（见 [`memory::DEFAULT_WINDOW`]），可调 [`llmagent::LlmAgent::with_window`]。
 
+pub mod knowledge_search;
 pub mod llmagent;
 pub mod memory;
 pub mod prompts;
 pub mod redis_store;
 
+pub use knowledge_search::{
+    KnowledgeSearch, NoopKnowledgeSearch, SearchError, SearchResult, Source,
+};
 pub use llmagent::LlmAgent;
 pub use memory::{InMemoryStore, MemoryStore, Message, Role, ShortTermMemory, DEFAULT_WINDOW};
 pub use prompts::AgentPrompts;

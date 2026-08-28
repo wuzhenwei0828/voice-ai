@@ -83,7 +83,7 @@
       let asrLineEl = null;
       let llmPlaceholderRemoved = false;
 
-      for await (const evt of window.parseNdjson(resp)) {
+      for await (const evt of window.parseSse(resp)) {
         if (evt.error) {
           err('stream error line:', evt);
           setError(`[code ${evt.code}] ${evt.error}`);
@@ -126,9 +126,9 @@
       let off = 0;
       for (const c of chunks) { pcmAll.set(c, off); off += c.length; }
 
-      const url = window.pcmChunksToWavUrl(pcmAll);
-      audio.src = url;
-      download.href = url;
+      const wavUrl = window.pcmChunksToWavUrl(pcmAll);
+      audio.src = wavUrl;
+      download.href = wavUrl;
       download.download = `asr-llm-tts-${Date.now()}.wav`;
       download.hidden = false;
       audio.play().catch(() => {});

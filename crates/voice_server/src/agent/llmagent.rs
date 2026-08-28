@@ -3,7 +3,7 @@
 //! ## 设计要点
 //! - 每次 `chat()` 时从 [`MemoryStore`] 拉 session 的最近 N 条历史，拼到 messages 头部送上游
 //! - 流收尾时（`is_final = true`）把 `user prompt` + 完整 `assistant 回复` 写入 store
-//! - emotion_hint 作为 system message 放在 messages 最前面（模板在 `prompts.yaml` 里，可改）
+//! - ASR 参考信号（情绪 / 事件）作为 system message 放在 messages 最前面（模板在 `prompts.yaml` 里，可改）
 //! - 记忆后端可换：默认 [`InMemoryStore`]（单进程），集群可换 [`RedisStore`]（跨进程）
 //! - 滑动窗口默认 20 条（见 [`crate::agent::memory::DEFAULT_WINDOW`]）
 //!
@@ -106,7 +106,7 @@ impl LlmClient for LlmAgent {
                 content: static_msg,
             });
         }
-        // 1b. 动态提示词（emotion_hint 非空时插入）
+        // 1b. 动态提示词（ASR 参考信号非空时插入）
         if let Some(emotion_text) = emotion_hint.and_then(|e| self.prompts.render_emotion_hint(e)) {
             messages.push(ChatMessage {
                 role: "system".to_string(),
@@ -132,7 +132,7 @@ impl LlmClient for LlmAgent {
             target: "voice_server.agent",
             session_id,
             history_len,
-            has_emotion_hint = emotion_hint.is_some(),
+            has_asr_hint = emotion_hint.is_some(),
             has_static_prompts = self.prompts.static_system_message().is_some(),
             total_messages = messages.len(),
             prompt_chars = prompt_owned.chars().count(),

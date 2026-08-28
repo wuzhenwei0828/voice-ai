@@ -4,7 +4,7 @@
 //! → 句间 [`SentenceCrossfader`] 混合 → 统一 seq 编号 → 结束标记（空 audio + is_last:true）
 //!
 //! 与 session::pipeline::run_pipeline 同源（WS pipeline 也用同一个函数）：
-//! 两边走同一条 LLM→TTS 链路，只是 wire 侧不同（HTTP NDJSON / WS msgpack）。
+//! 两边走同一条 LLM→TTS 链路，只是 wire 侧不同（HTTP SSE / WS msgpack）。
 //!
 //! 错误流：阶段内出错时 yield 一条 [`LlmTtsItem::Failed`] 后立即 return（HTTP 200 已发，
 //! 不能改 status，靠 error code 1001~1005 区分）。
@@ -19,7 +19,7 @@ use super::crossfade::SentenceCrossfader;
 use super::sentence::next_sentence_end;
 
 /// `llm_tts_items()` 的输出事件，由各消费方映射成自己的 wire 格式
-/// （NDJSON 行 / WS VoicePayload）。`Failed` 是终端事件（产出后流即结束）。
+/// （SSE data event / WS VoicePayload）。`Failed` 是终端事件（产出后流即结束）。
 ///
 /// `pub`：session 的 WS pipeline 也要消费。
 #[derive(Debug)]
@@ -37,8 +37,9 @@ pub enum LlmTtsItem {
 /// （后两者额外透出 Llm 文本事件）。
 /// 接受 Arc 而非 &Arc 是因为 actix-web 的 streaming() 要求 `Stream + 'static`，Arc 便宜 clone。
 ///
-/// `emotion_hint`：从 ASR 文本里解析出来的说话人情绪（参见 `session::text::parse_asr_emotion_tags`），
-/// 作为 system message 的参考传给 LLM。`None` 表示无情绪（如 `/admin/llm_tts` 直接调用的场景）。
+/// `emotion_hint`：从 ASR 文本里解析出的情绪与事件参考（参见
+/// `crate::utils::postprocess_utils::parse_asr_text`），作为 system message 传给 LLM。
+/// `None` 表示没有 ASR 参考信号（如 `/admin/llm_tts` 直接调用的场景）。
 ///
 /// `sample_rate_override`：端侧 SessionStart 上报的 TTS 输出采样率。
 ///   - `Some(n)` —— 覆盖 `TtsConfig.sample_rate`

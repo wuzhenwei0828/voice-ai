@@ -161,8 +161,12 @@ mod tests {
     #[test]
     fn render_substitutes_emotion() {
         let p = AgentPrompts::from_embedded().unwrap();
-        let out = p.render_emotion_hint("开心").unwrap();
+        let out = p
+            .render_emotion_hint("情绪：开心；事件：背景音乐、掌声")
+            .unwrap();
         assert!(out.contains("开心"));
+        assert!(out.contains("背景音乐"));
+        assert!(out.contains("事件"));
         assert!(!out.contains("{emotion}"));
     }
 

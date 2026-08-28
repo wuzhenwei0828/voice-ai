@@ -10,10 +10,99 @@
 //        - AsrPartial    → 在 user bubble 里显示/替换
 //        - LlmDelta      → 追加到 assistant bubble
 //        - TtsAudio      → 累积 s16le 字节 + WAV 头 → Blob URL → Audio() 播放
-//        - Error         → 在 system 区显示
+//        - Error         → 在用户状态区显示安全提示
+
+// ====== 可测试的用户状态辅助 ======
+(function initVoiceAgentUi(root) {
+  const PHASE_COPY = Object.freeze({
+    listening: { label: '正在听', substatus: '请直接说话', state: 'listening' },
+    transcribing: { label: '正在理解', substatus: '', state: 'thinking' },
+    searching: { label: '正在查资料', substatus: '我查一下相关信息', state: 'thinking' },
+    composing: { label: '正在组织答案', substatus: '我整理一下', state: 'thinking' },
+    speaking: { label: '正在回答', substatus: '可随时打断', state: 'speaking' },
+    error: { label: '暂时遇到问题', substatus: '请稍后再试', state: 'error' },
+  });
+
+  function phaseCopy(phase) {
+    return PHASE_COPY[phase] || { label: '正在处理', substatus: '', state: 'thinking' };
+  }
+
+  function agentStatusLabel(phase) {
+    return phaseCopy(phase).label;
+  }
+
+  function agentStatusSubstatus(phase) {
+    return phaseCopy(phase).substatus;
+  }
+
+  function normalizeRequestId(requestId) {
+    const value = Number(requestId || 0);
+    return Number.isSafeInteger(value) && value > 0 ? value : 0;
+  }
+
+  function createRequestTracker() {
+    let currentRequestId = 0;
+    let highestRequestId = 0;
+
+    return {
+      considerRequest(requestId) {
+        const id = normalizeRequestId(requestId);
+        if (id === 0) return highestRequestId === 0 ? 'current' : 'stale';
+        if (id < highestRequestId) return 'stale';
+        if (id === highestRequestId) return currentRequestId === id ? 'current' : 'stale';
+        highestRequestId = id;
+        currentRequestId = id;
+        return 'new';
+      },
+      isCurrentRequest(requestId) {
+        const id = normalizeRequestId(requestId);
+        if (id === 0) return highestRequestId === 0 && currentRequestId === 0;
+        return id === currentRequestId;
+      },
+      invalidateCurrent() {
+        currentRequestId = 0;
+      },
+      reset() {
+        currentRequestId = 0;
+        highestRequestId = 0;
+      },
+      currentRequestId() {
+        return currentRequestId;
+      },
+    };
+  }
+
+  function executeRetry({
+    canRetry,
+    socketOpen,
+    stopPlayback,
+    invalidateRequest,
+    sendRetry,
+  }) {
+    if (!canRetry || !socketOpen) return false;
+    stopPlayback();
+    invalidateRequest();
+    sendRetry();
+    return true;
+  }
+
+  const api = {
+    PHASE_COPY,
+    agentStatusLabel,
+    agentStatusSubstatus,
+    createRequestTracker,
+    executeRetry,
+  };
+  root.VoiceAgentUi = api;
+  if (typeof module === 'object' && module.exports) module.exports = api;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+// ====== 浏览器应用 ======
 
 (function () {
   'use strict';
+
+  if (typeof document === 'undefined') return;
 
   // ====== 配置 ======
   const SAMPLE_RATE = 16000;
@@ -45,6 +134,12 @@
   const speakerStatus = $('speaker-status');
   const btnMicMute = $('btn-mic-mute');
   const btnSpeakerMute = $('btn-speaker-mute');
+  const retryAction = $('retry-action');
+  const sourceDetails = $('source-details');
+  const sourceList = $('source-list');
+  const agentUi = window.VoiceAgentUi;
+  const requestTracker = agentUi.createRequestTracker();
+  let canRetryLastRequest = false;
 
   // ====== 麦/喇叭手动静音 ======
   // micMuted = true 时：worklet 帧不上送（保持 WS 连接，不打断对话）
@@ -97,11 +192,13 @@
 
   // ====== 豆包式 avatar 状态机 ======
   const avatarWrap = $('phone-avatar-wrap');
-  const phoneStatus = $('phone-status');
-  const phoneSubstatus = $('phone-substatus');
+  const phoneStatus = $('agent-phase');
+  const phoneSubstatus = $('agent-substatus');
   const phoneVoiceName = $('phone-voice-name');
   // 语音管道状态：idle / listening / thinking / speaking
   let phoneState = 'idle';
+  let activeAgentPhase = null;
+  let safeErrorShown = false;
   // 上一帧各路输入信号；状态机按"speaking > listening > thinking > idle"优先级合成
   let signals = { wsOpen: false, micBusy: false, speakerBusy: false, thinkingUntil: 0 };
   let stateTimer = null;
@@ -119,6 +216,15 @@
   // 重新合成 avatar 状态：speaking 优先 > listening > thinking(短窗) > idle
   function recomputePhoneState() {
     const now = performance.now();
+    if (activeAgentPhase) {
+      const copy = agentUi.PHASE_COPY[activeAgentPhase] || {
+        label: agentUi.agentStatusLabel(activeAgentPhase),
+        substatus: '',
+        state: 'thinking',
+      };
+      setPhoneState(copy.state, { status: copy.label, substatus: copy.substatus });
+      return;
+    }
     if (!signals.wsOpen) {
       setPhoneState('idle', { status: '未连接', substatus: '点下方按钮开始对话' });
       return;
@@ -137,6 +243,25 @@
       return;
     }
     setPhoneState('idle', { status: '对话进行中', substatus: '等你开口' });
+  }
+
+  function setAgentPhase(phase) {
+    activeAgentPhase = phase || null;
+    if (phase !== 'error') safeErrorShown = false;
+    if (retryAction) {
+      retryAction.hidden = phase !== 'error';
+      retryAction.disabled = phase !== 'error' || !canRetryLastRequest ||
+        !ws || ws.readyState !== WebSocket.OPEN;
+    }
+    recomputePhoneState();
+  }
+
+  function clearAgentPhase({ invalidate = false } = {}) {
+    activeAgentPhase = null;
+    safeErrorShown = false;
+    if (invalidate) requestTracker.invalidateCurrent();
+    if (retryAction) retryAction.hidden = true;
+    recomputePhoneState();
   }
 
   // 包装 setStatus：在更新状态徽标同时驱动 avatar 状态机
@@ -170,8 +295,11 @@
   // ====== Tab 切换 ======
   // 不影响现有 WS pipeline 状态；切换 tab 只显示/隐藏对应 section
   const TABS = ['pipeline', 'asr', 'llm', 'tts', 'llm_tts', 'asr_llm_tts'];
+  let appMode = 'user';
+  let developerTab = 'pipeline';
   function activateTab(name) {
     if (!TABS.includes(name)) name = 'pipeline';
+    if (appMode === 'developer') developerTab = name;
     document.querySelectorAll('.tab-btn').forEach((b) => {
       b.classList.toggle('active', b.dataset.tab === name);
     });
@@ -179,7 +307,9 @@
       const el = document.getElementById('tab-' + t);
       if (el) el.hidden = (t !== name);
     });
-    try { localStorage.setItem('voice-app.activeTab', name); } catch (_) {}
+    if (appMode === 'developer') {
+      try { localStorage.setItem('voice-app.activeTab', name); } catch (_) {}
+    }
   }
   document.querySelectorAll('.tab-btn').forEach((b) => {
     b.onclick = () => activateTab(b.dataset.tab);
@@ -189,7 +319,45 @@
     const saved = localStorage.getItem('voice-app.activeTab');
     if (saved && TABS.includes(saved)) initialTab = saved;
   } catch (_) {}
-  activateTab(initialTab);
+  developerTab = initialTab;
+
+  // ====== 界面模式 ======
+  // 仅切换 DOM 可见性和 hash；不触碰 WS、麦克风或调试脚本状态。
+  const developerTools = $('developer-tools');
+  const devModeLink = $('dev-mode-link');
+  const userModeLink = $('user-mode-link');
+
+  function modeFromHash(hash) {
+    return String(hash || '').replace(/^#/, '').toLowerCase() === 'developer'
+      ? 'developer' : 'user';
+  }
+
+  function setMode(nextMode, { updateHash = true } = {}) {
+    const mode = nextMode === 'developer' ? 'developer' : 'user';
+    appMode = mode;
+    document.body.dataset.mode = mode;
+    if (developerTools) developerTools.hidden = mode !== 'developer';
+    if (devModeLink) devModeLink.hidden = mode === 'developer';
+    if (userModeLink) userModeLink.hidden = mode !== 'developer';
+    if (mode === 'developer') activateTab(developerTab);
+    else activateTab('pipeline');
+    if (updateHash) {
+      const desiredHash = mode === 'developer' ? '#developer' : '#user';
+      if (window.location.hash !== desiredHash) window.history.replaceState(null, '', desiredHash);
+    }
+  }
+
+  window.VoiceAppMode = { modeFromHash, setMode };
+  if (devModeLink) devModeLink.onclick = (event) => {
+    event.preventDefault();
+    setMode('developer');
+  };
+  if (userModeLink) userModeLink.onclick = (event) => {
+    event.preventDefault();
+    setMode('user');
+  };
+  window.addEventListener('hashchange', () => setMode(modeFromHash(window.location.hash), { updateHash: false }));
+  setMode(modeFromHash(window.location.hash), { updateHash: false });
 
   // ====== 状态 ======
   let ws = null;
@@ -219,6 +387,7 @@
   let startedAtMs = null;
   let lastAsrStartMs = null;
   let lastTtsFirstByteMs = null;
+  let sendingUtterance = false;
 
   // ====== MessagePack 编解码（native，不用 msgpack-lite）======
   // 浏览器版 msgpack-lite（Buffer polyfill）行为不一致，干脆自己写 ~110 行 encoder/decoder
@@ -483,6 +652,110 @@
     div.classList.remove('partial');
   }
 
+  // 来源只渲染经过白名单筛选的纯文本字段，预留给后续来源事件接入。
+  function renderSources(sources) {
+    if (!sourceList || !sourceDetails) return;
+    sourceList.replaceChildren();
+    const safeSources = Array.isArray(sources) ? sources : [];
+    safeSources.forEach((source) => {
+      if (!source || typeof source !== 'object') return;
+      const item = document.createElement('li');
+      const title = document.createElement('div');
+      title.className = 'source-title';
+      title.textContent = String(source.title || '未命名来源');
+      item.appendChild(title);
+
+      const metaParts = [];
+      if (source.publisher) metaParts.push(String(source.publisher));
+      if (source.updated_at) metaParts.push(`更新于 ${String(source.updated_at)}`);
+      if (metaParts.length > 0) {
+        const meta = document.createElement('div');
+        meta.className = 'source-meta';
+        meta.textContent = metaParts.join(' · ');
+        item.appendChild(meta);
+      }
+      sourceList.appendChild(item);
+    });
+    sourceDetails.hidden = sourceList.childElementCount === 0;
+  }
+  window.renderAgentSources = renderSources;
+
+  let progressUtterance = null;
+  const progressSpokenFor = new Set();
+
+  function stopProgressSpeech() {
+    if (!progressUtterance || !('speechSynthesis' in window)) return;
+    window.speechSynthesis.cancel();
+    progressUtterance = null;
+  }
+
+  function maybeSpeakProgress(payload) {
+    const requestId = Number(payload.request_id || 0);
+    if (payload.phase !== 'searching' || payload.speak_progress !== true ||
+        !requestId || progressSpokenFor.has(requestId) ||
+        !('speechSynthesis' in window) || !('SpeechSynthesisUtterance' in window)) {
+      return;
+    }
+    progressSpokenFor.add(requestId);
+    progressUtterance = new window.SpeechSynthesisUtterance('我查一下');
+    progressUtterance.lang = 'zh-CN';
+    progressUtterance.onend = () => { progressUtterance = null; };
+    progressUtterance.onerror = () => { progressUtterance = null; };
+    window.speechSynthesis.speak(progressUtterance);
+  }
+
+  function prepareForNewRequest() {
+    activeAgentPhase = null;
+    safeErrorShown = false;
+    if (retryAction) retryAction.hidden = true;
+    if (currentAssistantBubble) finalizeMessage(currentAssistantBubble);
+    currentAssistantBubble = null;
+    renderSources([]);
+    stopTtsPlayback();
+  }
+
+  function handleAgentStatus(payload) {
+    const relation = requestTracker.considerRequest(payload.request_id);
+    if (relation === 'stale') return;
+    if (relation === 'new') prepareForNewRequest();
+    setAgentPhase(payload.phase);
+    maybeSpeakProgress(payload);
+    if (payload.done && payload.phase !== 'error') setAgentPhase('listening');
+  }
+
+  function showSafeError() {
+    setAgentPhase('error');
+    if (!safeErrorShown) {
+      safeErrorShown = true;
+      addMessage('error', '服务暂时不可用，请稍后再试。');
+    }
+  }
+
+  function beginLocalUtterance() {
+    requestTracker.invalidateCurrent();
+    activeAgentPhase = null;
+    safeErrorShown = false;
+    if (currentAssistantBubble) finalizeMessage(currentAssistantBubble);
+    currentAssistantBubble = null;
+    renderSources([]);
+    stopTtsPlayback();
+    setAgentPhase('listening');
+  }
+
+  function resetAgentSessionUi() {
+    requestTracker.reset();
+    progressSpokenFor.clear();
+    activeAgentPhase = null;
+    safeErrorShown = false;
+    currentUserBubble = null;
+    currentAssistantBubble = null;
+    sendingUtterance = false;
+    canRetryLastRequest = false;
+    renderSources([]);
+    if (retryAction) retryAction.hidden = true;
+    recomputePhoneState();
+  }
+
   // ====== TTS 播放：拼 WAV + Audio() 顺序播放队列 ======
   // 同一个 TTS 句子的多个 chunk 必须顺序播完（不能互相打断），否则像
   // "你好！有什么问题或需要帮助解决的事情吗？" 只会听到最后一个 chunk；
@@ -522,6 +795,7 @@
   }
 
   function stopTtsPlayback() {
+    stopProgressSpeech();
     ttsQueue.forEach(URL.revokeObjectURL);
     ttsQueue.length = 0;
     ttsPlaying = false;
@@ -592,13 +866,15 @@
         const detail = e && e.message ? e.message :
                        (e && e.reason ? `reason=${e.reason}` :
                         'unknown（请检查 URL 路径、token、跨域）');
-        addMessage('error', 'WebSocket 连接失败：' + detail + '；URL=' + buildWsUrl(sessionId));
+        console.error('WebSocket 连接失败:', detail);
+        showSafeError();
         reject(new Error(detail));
       };
 
       ws.onclose = () => {
         setStatus(connStatus, 'WS：断开', 'badge-offline');
         addMessage('system', 'WS 已断开');
+        clearAgentPhase({ invalidate: true });
         stopMic();
       };
 
@@ -610,6 +886,7 @@
 
           switch (payload.type) {
             case 'asr_partial':
+              if (!requestTracker.isCurrentRequest(payload.request_id)) break;
               if (!currentUserBubble) {
                 currentUserBubble = addMessage('user', '', { partial: true });
               }
@@ -626,7 +903,11 @@
                 }
               }
               break;
+            case 'agent_status':
+              handleAgentStatus(payload);
+              break;
             case 'llm_delta':
+              if (!requestTracker.isCurrentRequest(payload.request_id)) break;
               if (!currentAssistantBubble) {
                 currentAssistantBubble = addMessage('assistant', '', { partial: true });
               }
@@ -637,6 +918,7 @@
               }
               break;
             case 'tts_audio':
+              if (!requestTracker.isCurrentRequest(payload.request_id)) break;
               if (payload.data && payload.data.length > 0) {
                 // 下行：服务端用 #[serde(with="serde_bytes")] 走 msgpack bin，JS 解码后已是 Uint8Array
                 playTtsAudio(payload.data, payload.is_last);
@@ -647,7 +929,10 @@
               }
               break;
             case 'error':
-              addMessage('error', `[${payload.code}] ${payload.message}`);
+              console.error(`服务端错误 [${payload.code}]`, payload.message);
+              if (activeAgentPhase === 'error' || requestTracker.currentRequestId() === 0) {
+                showSafeError();
+              }
               break;
             case 'interrupt':
               // 服务端主动中断（来自另一端 Interrupt payload push），忽略
@@ -657,7 +942,7 @@
           }
         } catch (e) {
           console.error('onmessage 解析失败:', e);
-          addMessage('error', '解析下行 payload 失败：' + e.message);
+          showSafeError();
         }
       };
     });
@@ -673,6 +958,8 @@
     addMessage('system', '已发送 Interrupt');
     // 立即停止正在播放的 TTS，并清空队列里未播的 chunk
     stopTtsPlayback();
+    clearAgentPhase({ invalidate: true });
+    setAgentPhase('listening');
   }
 
   function sendSessionEnd(reason) {
@@ -818,7 +1105,8 @@
         },
       });
     } catch (e) {
-      addMessage('error', '无法访问麦克风：' + e.message);
+      console.error('无法访问麦克风:', e);
+      addMessage('error', '暂时无法访问麦克风，请检查浏览器权限后重试。');
       throw e;
     }
 
@@ -854,6 +1142,10 @@
       // —— worklet 仍然跑着，恢复时无需重新初始化
       if (micMuted) return;
       if (ws && ws.readyState === WebSocket.OPEN) {
+        if (!sendingUtterance) {
+          sendingUtterance = true;
+          beginLocalUtterance();
+        }
         // timestamp_ms = 本句内时间（isLast 后归零，下一句重新计时）
         if (startedAtMs === null) startedAtMs = Date.now();
         const payload = {
@@ -868,6 +1160,8 @@
         // 与服务端"收到 AudioChunk"日志逐字段对齐，便于两端对比
         console.log(`[发送] AudioChunk session_id=${sessionId} seq=${seq} bytes=${bytes.length} timestamp_ms=${payload.timestamp_ms} is_last=${isLast}`);
         if (isLast) {
+          sendingUtterance = false;
+          canRetryLastRequest = true;
           startedAtMs = null;
           // 重置首字延迟
           lastAsrStartMs = null;
@@ -912,6 +1206,7 @@
     btnStart.disabled = true;
     // 开启新一轮对话：先清掉旧 TTS 队列和正在播的内容，避免残留
     stopTtsPlayback();
+    resetAgentSessionUi();
     // 重新生成 sessionId → URL 路径尾段变化 → 服务端 entry() 拿到全新 session
     // 否则 Stop 后再 Start 会撞上旧 session 的 closed=true，所有上行被静默丢弃
     sessionId = newSessionId();
@@ -928,7 +1223,8 @@
       addMessage('system', '准备就绪。说一句试试。');
     } catch (e) {
       btnStart.disabled = false;
-      addMessage('error', '启动失败：' + e.message);
+      console.error('启动失败:', e);
+      showSafeError();
     }
   };
 
@@ -952,13 +1248,38 @@
     sendInterrupt();
   };
 
+  retryAction.onclick = () => {
+    const sent = agentUi.executeRetry({
+      canRetry: canRetryLastRequest,
+      socketOpen: !!ws && ws.readyState === WebSocket.OPEN,
+      stopPlayback: stopTtsPlayback,
+      invalidateRequest: () => requestTracker.invalidateCurrent(),
+      sendRetry: () => ws.send(encodeIndication({
+        type: 'retry',
+        session_id: sessionId,
+      })),
+    });
+    if (!sent) return;
+
+    canRetryLastRequest = false;
+    safeErrorShown = false;
+    retryAction.hidden = true;
+    retryAction.disabled = true;
+    if (currentAssistantBubble) finalizeMessage(currentAssistantBubble);
+    currentAssistantBubble = null;
+    renderSources([]);
+    setAgentPhase('transcribing');
+  };
+
   btnStop.onclick = () => {
     sendSessionEnd('user stopped');
+    stopTtsPlayback();
     stopMic();
     if (ws) ws.close();
     btnStart.disabled = false;
     btnStop.disabled = true;
     btnInterrupt.disabled = true;
+    clearAgentPhase({ invalidate: true });
     addMessage('system', '已结束');
   };
 
@@ -972,7 +1293,8 @@
       addMessage('system', '麦克风权限已获得。点"开始对话"连接服务。');
     } catch (e) {
       setStatus(micStatus, '麦克风：拒绝', 'badge-offline');
-      addMessage('error', '麦克风权限被拒绝：' + e.message + '。请在浏览器地址栏左侧允许后刷新页面。');
+      console.error('麦克风权限被拒绝:', e);
+      addMessage('error', '麦克风权限未开启，请在浏览器中允许后重试。');
     }
   }
 

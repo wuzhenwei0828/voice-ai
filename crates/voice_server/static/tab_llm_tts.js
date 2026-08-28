@@ -42,7 +42,7 @@
       const chunks = [];
       let totalBytes = 0;
       let chunkCount = 0;
-      for await (const evt of window.parseNdjson(resp)) {
+      for await (const evt of window.parseSse(resp)) {
         if (evt.error) {
           status.textContent = '❌ ' + evt.error;
           return;

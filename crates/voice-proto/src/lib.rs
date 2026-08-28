@@ -20,6 +20,18 @@
 
 use serde::{Deserialize, Serialize};
 
+/// 服务端向客户端报告的语音智能体处理阶段。
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPhase {
+    Listening,
+    Transcribing,
+    Searching,
+    Composing,
+    Speaking,
+    Error,
+}
+
 /// 语音链路所有消息的统一业务数据类型。
 /// 客户端/服务端在 WS 二进制帧里就传这个。
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -49,6 +61,10 @@ pub enum VoicePayload {
     },
     /// 用户打断当前 TTS 播放（半双工 → 重新 Listening）
     Interrupt {
+        session_id: String,
+    },
+    /// 重放本会话最近一次有效语音请求。服务端为其分配新的 request_id。
+    Retry {
         session_id: String,
     },
 
@@ -86,11 +102,17 @@ pub enum VoicePayload {
         /// 其它情况为 false。#[serde(default)] 保证旧客户端 / 旧消息可正常解析。
         #[serde(default)]
         replace_last: bool,
+        /// 关联一轮用户请求；旧客户端不带该字段时按 0 处理。
+        #[serde(default)]
+        request_id: u64,
     },
     LlmDelta {
         session_id: String,
         delta: String,
         is_final: bool,
+        /// 关联一轮用户请求；旧客户端不带该字段时按 0 处理。
+        #[serde(default)]
+        request_id: u64,
     },
     TtsAudio {
         session_id: String,
@@ -98,6 +120,20 @@ pub enum VoicePayload {
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
         is_last: bool,
+        /// 关联一轮用户请求；旧客户端不带该字段时按 0 处理。
+        #[serde(default)]
+        request_id: u64,
+    },
+
+    // ---- 下行：服务端 → 客户端（智能体阶段状态）----
+    AgentStatus {
+        session_id: String,
+        phase: AgentPhase,
+        label: String,
+        #[serde(default)]
+        tool: Option<String>,
+        request_id: u64,
+        done: bool,
     },
     Error {
         code: u32,
@@ -112,10 +148,12 @@ impl VoicePayload {
             VoicePayload::SessionStart { session_id, .. }
             | VoicePayload::SessionEnd { session_id, .. }
             | VoicePayload::Interrupt { session_id }
+            | VoicePayload::Retry { session_id }
             | VoicePayload::AudioChunk { session_id, .. }
             | VoicePayload::AsrPartial { session_id, .. }
             | VoicePayload::LlmDelta { session_id, .. }
             | VoicePayload::TtsAudio { session_id, .. }
+            | VoicePayload::AgentStatus { session_id, .. }
             | VoicePayload::SessionAck { session_id, .. } => Some(session_id),
             VoicePayload::Error { .. } => None,
         }
@@ -163,13 +201,34 @@ mod tests {
         let (kind, decoded) = decode_payload(&bytes).unwrap();
         assert_eq!(kind, PayloadKind::Indication);
         match decoded {
-            VoicePayload::AudioChunk { session_id, seq, data, .. } => {
+            VoicePayload::AudioChunk {
+                session_id,
+                seq,
+                data,
+                ..
+            } => {
                 assert_eq!(session_id, "abc");
                 assert_eq!(seq, 1);
                 assert_eq!(data, vec![1, 2, 3, 4]);
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn round_trip_retry_request() {
+        let payload = VoicePayload::Retry {
+            session_id: "retry-session".to_string(),
+        };
+
+        let bytes = encode_indication(&payload).expect("retry should encode");
+        let (kind, decoded) = decode_payload(&bytes).expect("retry should decode");
+
+        assert_eq!(kind, PayloadKind::Indication);
+        assert!(matches!(
+            decoded,
+            VoicePayload::Retry { session_id } if session_id == "retry-session"
+        ));
     }
 
     #[test]
@@ -185,7 +244,10 @@ mod tests {
         };
         assert_eq!(p.session_id(), Some("x"));
 
-        let e = VoicePayload::Error { code: 1, message: "x".into() };
+        let e = VoicePayload::Error {
+            code: 1,
+            message: "x".into(),
+        };
         assert_eq!(e.session_id(), None);
     }
 
@@ -205,7 +267,11 @@ mod tests {
         let bytes = encode_indication(&p).unwrap();
         let (_, decoded) = decode_payload(&bytes).unwrap();
         match decoded {
-            VoicePayload::SessionStart { tts_sample_rate, voice, .. } => {
+            VoicePayload::SessionStart {
+                tts_sample_rate,
+                voice,
+                ..
+            } => {
                 assert_eq!(tts_sample_rate, None);
                 assert_eq!(voice, None);
             }
@@ -238,8 +304,15 @@ mod tests {
         let raw = rmp_serde::to_vec_named(&old).unwrap();
         let v: VoicePayload = rmp_serde::from_slice(&raw).unwrap();
         match v {
-            VoicePayload::SessionStart { tts_sample_rate, voice, .. } => {
-                assert_eq!(tts_sample_rate, None, "缺省字段应通过 #[serde(default)] 解为 None");
+            VoicePayload::SessionStart {
+                tts_sample_rate,
+                voice,
+                ..
+            } => {
+                assert_eq!(
+                    tts_sample_rate, None,
+                    "缺省字段应通过 #[serde(default)] 解为 None"
+                );
                 assert_eq!(voice, None, "缺省字段应通过 #[serde(default)] 解为 None");
             }
             _ => panic!("wrong variant"),
@@ -261,7 +334,11 @@ mod tests {
         let bytes = encode_indication(&p).unwrap();
         let (_, decoded) = decode_payload(&bytes).unwrap();
         match decoded {
-            VoicePayload::SessionStart { tts_sample_rate, voice, .. } => {
+            VoicePayload::SessionStart {
+                tts_sample_rate,
+                voice,
+                ..
+            } => {
                 assert_eq!(tts_sample_rate, Some(24000));
                 assert_eq!(voice.as_deref(), Some("alex"));
             }
@@ -279,7 +356,11 @@ mod tests {
         let bytes = encode_indication(&p).unwrap();
         let (_kind, decoded) = decode_payload(&bytes).unwrap();
         match decoded {
-            VoicePayload::SessionAck { session_id, success, message } => {
+            VoicePayload::SessionAck {
+                session_id,
+                success,
+                message,
+            } => {
                 assert_eq!(session_id, "abc");
                 assert!(success);
                 assert_eq!(message, "");
@@ -296,12 +377,73 @@ mod tests {
         let bytes = encode_indication(&p_fail).unwrap();
         let (_kind, decoded) = decode_payload(&bytes).unwrap();
         match decoded {
-            VoicePayload::SessionAck { session_id, success, message } => {
+            VoicePayload::SessionAck {
+                session_id,
+                success,
+                message,
+            } => {
                 assert_eq!(session_id, "abc");
                 assert!(!success);
                 assert_eq!(message, "missing api_key");
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn round_trip_agent_status() {
+        let payload = VoicePayload::AgentStatus {
+            session_id: "s".into(),
+            phase: AgentPhase::Searching,
+            label: "正在查资料".into(),
+            tool: Some("knowledge_search".into()),
+            request_id: 7,
+            done: false,
+        };
+        let bytes = encode_indication(&payload).unwrap();
+        let (kind, decoded) = decode_payload(&bytes).unwrap();
+        assert_eq!(kind, PayloadKind::Indication);
+        match decoded {
+            VoicePayload::AgentStatus {
+                session_id,
+                phase,
+                label,
+                tool,
+                request_id,
+                done,
+            } => {
+                assert_eq!(session_id, "s");
+                assert!(matches!(phase, AgentPhase::Searching));
+                assert_eq!(label, "正在查资料");
+                assert_eq!(tool.as_deref(), Some("knowledge_search"));
+                assert_eq!(request_id, 7);
+                assert!(!done);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_stream_event_without_request_id_decodes() {
+        #[derive(serde::Serialize)]
+        struct OldWire<'a> {
+            #[serde(rename = "type")]
+            t: &'a str,
+            session_id: &'a str,
+            delta: &'a str,
+            is_final: bool,
+        }
+        let raw = rmp_serde::to_vec_named(&OldWire {
+            t: "llm_delta",
+            session_id: "s",
+            delta: "你好",
+            is_final: true,
+        })
+        .unwrap();
+        let decoded: VoicePayload = rmp_serde::from_slice(&raw).unwrap();
+        match decoded {
+            VoicePayload::LlmDelta { request_id, .. } => assert_eq!(request_id, 0),
+            other => panic!("unexpected payload: {other:?}"),
         }
     }
 }

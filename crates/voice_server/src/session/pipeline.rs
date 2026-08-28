@@ -1,7 +1,7 @@
 //! 完整 pipeline：ASR → LLM → 切句 → TTS（复用 crate::pipeline::llm_tts_items）。
 //!
 //! 与 /admin/asr_llm_tts 结构对称，差异仅在 wire 侧：
-//!   - 下行推 VoicePayload（msgpack 信封）而非 NDJSON
+//!   - 下行推 VoicePayload（msgpack 信封）而非 HTTP SSE
 //!   - 全程受 CancellationToken 约束（用户打断）
 //!   - Tts chunk 直接带原始 PCM 字节（不做 base64）
 
@@ -12,14 +12,17 @@ use futures_util::StreamExt;
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-use voice_proto::VoicePayload;
+use voice_proto::{AgentPhase, VoicePayload};
 use webhttp::websocket::OutMessage;
 
 use crate::client::{asr::wrap_pcm_as_wav, AsrClient, LlmClient, TtsClient};
 use crate::events::AsrEvent;
 use crate::pipeline::{llm_tts_items, LlmTtsItem};
+use crate::utils::postprocess_utils::{
+    format_asr_hint, parse_asr_text, rich_transcription_postprocess,
+};
 
-use super::text::parse_asr_emotion_tags;
+const SAFE_PIPELINE_ERROR_MESSAGE: &str = "服务暂时不可用，请稍后再试。";
 
 /// pipeline 退出时兜底清掉自己在 `current_real_cancel` 中的注册（M4 part B）。
 ///
@@ -43,6 +46,7 @@ impl Drop for CurrentCancelGuard {
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_pipeline(
     session_id: String,
+    request_id: u64,
     audio: Vec<u8>,
     sample_rate: u32,
     channels: u16,
@@ -60,6 +64,17 @@ pub(super) async fn run_pipeline(
     info!(target: "voice_server.session", session_id = %session_id, "pipeline 开始");
 
     // ===== 阶段 1: ASR —— 转发识别事件，收最终文本作为 LLM prompt =====
+    if !send_agent_status(
+        &down_addr,
+        &session_id,
+        request_id,
+        &cancel,
+        AgentPhase::Transcribing,
+        false,
+    ) {
+        return;
+    }
+
     // 浏览器 / WS pipeline 攒的是裸 PCM 字节；上游 siliconflow / OpenAI 兼容 ASR
     // 按 multipart 文件后缀选解码器，包成 RIFF/WAVE（44 字节头 + data chunk）才能解析
     let wav = wrap_pcm_as_wav(&audio, sample_rate, channels);
@@ -91,9 +106,19 @@ pub(super) async fn run_pipeline(
                         timeout_secs = asr_timeout.as_secs(),
                         "ASR recognize 超时"
                     );
+                    if !send_agent_status(
+                        &down_addr,
+                        &session_id,
+                        request_id,
+                        &cancel,
+                        AgentPhase::Error,
+                        true,
+                    ) {
+                        return;
+                    }
                     send_down(&down_addr, VoicePayload::Error {
                         code: 1001,
-                        message: format!("asr timeout after {}s", asr_timeout.as_secs()),
+                        message: SAFE_PIPELINE_ERROR_MESSAGE.to_string(),
                     });
                     return;
                 }
@@ -103,10 +128,23 @@ pub(super) async fn run_pipeline(
         Ok(s) => s,
         Err(e) => {
             error!(target: "voice_server.session", session_id = %session_id, "ASR 调用失败: {}", e);
-            send_down(&down_addr, VoicePayload::Error {
-                code: 1001,
-                message: format!("asr error: {}", e),
-            });
+            if !send_agent_status(
+                &down_addr,
+                &session_id,
+                request_id,
+                &cancel,
+                AgentPhase::Error,
+                true,
+            ) {
+                return;
+            }
+            send_down(
+                &down_addr,
+                VoicePayload::Error {
+                    code: 1001,
+                    message: SAFE_PIPELINE_ERROR_MESSAGE.to_string(),
+                },
+            );
             return;
         }
     };
@@ -124,20 +162,31 @@ pub(super) async fn run_pipeline(
             evt = asr_stream.next() => {
                 match evt {
                     Some(Ok(e)) => {
-                        // 取最新非空识别文本；非流式 ASR 客户端只发一个 is_final=true 的完整结果
-                        if !e.text.is_empty() {
-                            prompt = e.text.clone();
+                        // 先统一清洗 ASR 标签；非流式 ASR 客户端只发一个完整结果
+                        let cleaned = rich_transcription_postprocess(&e.text);
+                        if !cleaned.is_empty() {
+                            prompt = cleaned.clone();
                         }
-                        asr_events.push(e);
+                        asr_events.push(AsrEvent { text: cleaned, ..e });
                         if let Some(last) = asr_events.last() {
                             if last.is_final { break; }
                         }
                     }
                     Some(Err(e)) => {
                         error!(target: "voice_server.session", session_id = %session_id, "ASR 流错误: {}", e);
+                        if !send_agent_status(
+                            &down_addr,
+                            &session_id,
+                            request_id,
+                            &cancel,
+                            AgentPhase::Error,
+                            true,
+                        ) {
+                            return;
+                        }
                         send_down(&down_addr, VoicePayload::Error {
                             code: 1001,
-                            message: format!("asr stream: {}", e),
+                            message: SAFE_PIPELINE_ERROR_MESSAGE.to_string(),
                         });
                         return;
                     }
@@ -164,15 +213,17 @@ pub(super) async fn run_pipeline(
         return;
     }
 
-    // 解析情绪标签：Qwen 等 ASR 会在末尾附加 <|zh|><|SAD|><|Speech|><|woitn|> 这种 token，
-    // 第二个 token 是说话人情绪，剥掉标签后纯文本送 LLM，情绪作为参考放进 system prompt。
-    let parsed = parse_asr_emotion_tags(&prompt);
-    if parsed.emotion.is_some() {
+    // ASR 文本已在接收阶段经过 rich 后处理；这里从 rich 输出的 emoji 中提取
+    // 情绪/事件，剥掉 emoji 后的正文送 LLM。
+    let parsed = parse_asr_text(&prompt);
+    let asr_hint = format_asr_hint(parsed.emotion.as_deref(), &parsed.event);
+    if asr_hint.is_some() {
         info!(
             target: "voice_server.session",
             session_id = %session_id,
             emotion = ?parsed.emotion,
-            "ASR 文本含情绪标签"
+            events = ?parsed.event,
+            "ASR 文本含情绪/事件信号"
         );
     }
     let prompt = parsed.text;
@@ -190,13 +241,19 @@ pub(super) async fn run_pipeline(
     // 非空：把缓冲的 ASR 事件按顺序推给前端 —— 用剥掉 `<|...|>` 标签后的纯文本，
     // 前端不需要关心 ASR 的内部控制 token
     for e in asr_events {
-        let cleaned = parse_asr_emotion_tags(&e.text).text;
-        send_down(&down_addr, VoicePayload::AsrPartial {
-            session_id: session_id.clone(),
-            text: cleaned,
-            is_final: e.is_final,
-            replace_last: false,
-        });
+        if cancel.is_cancelled() {
+            return;
+        }
+        send_down(
+            &down_addr,
+            VoicePayload::AsrPartial {
+                session_id: session_id.clone(),
+                text: e.text,
+                is_final: e.is_final,
+                replace_last: false,
+                request_id,
+            },
+        );
     }
 
     // ===== 注册为 current real 并 cancel 上一个 real pipeline（auto-interrupt on new utterance）=====
@@ -218,19 +275,31 @@ pub(super) async fn run_pipeline(
         prev.cancel();
     }
 
+    if !send_agent_status(
+        &down_addr,
+        &session_id,
+        request_id,
+        &cancel,
+        AgentPhase::Composing,
+        false,
+    ) {
+        return;
+    }
+
     // ===== 阶段 2+3: LLM → 切句 → TTS（共享管线，含句间 crossfade / 全局 seq / 结束标记）=====
     // sample_rate_override：把端侧 SessionStart 上报的值原样透传 —— HttpTtsClient 内部决定
     // 用 override 还是配置兜底（sample_rate_override.or(self.sample_rate)）。
     // voice_override：同理，原样透传 → HttpTtsClient 拼 model 前缀后发给 provider。
     let mut items = Box::pin(llm_tts_items(
         prompt,
-        parsed.emotion,
+        asr_hint,
         session_id.clone(),
         llm,
         tts,
         client_tts_sample_rate,
         client_voice,
     ));
+    let mut speaking_sent = false;
     while let Some(item) = {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -243,37 +312,150 @@ pub(super) async fn run_pipeline(
         match item {
             LlmTtsItem::Llm { delta, is_final } => {
                 if !delta.is_empty() || is_final {
-                    send_down(&down_addr, VoicePayload::LlmDelta {
-                        session_id: session_id.clone(),
-                        delta,
-                        is_final,
-                    });
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    send_down(
+                        &down_addr,
+                        VoicePayload::LlmDelta {
+                            session_id: session_id.clone(),
+                            delta,
+                            is_final,
+                            request_id,
+                        },
+                    );
                 }
             }
-            LlmTtsItem::Tts { seq, audio, is_last } => {
-                send_down(&down_addr, VoicePayload::TtsAudio {
-                    session_id: session_id.clone(),
+            LlmTtsItem::Tts {
+                seq,
+                audio,
+                is_last,
+            } => {
+                if !speaking_sent {
+                    if !send_agent_status(
+                        &down_addr,
+                        &session_id,
+                        request_id,
+                        &cancel,
+                        AgentPhase::Speaking,
+                        false,
+                    ) {
+                        return;
+                    }
+                    speaking_sent = true;
+                }
+                if !send_tts_audio(
+                    &down_addr,
+                    &session_id,
+                    request_id,
+                    &cancel,
                     seq,
-                    // admin_api 侧是 base64 字符串（NDJSON 需要），WS 侧还原为原始字节
-                    data: base64::Engine::decode(
-                        &base64::engine::general_purpose::STANDARD,
-                        &audio,
-                    )
-                    .unwrap_or_default(),
+                    audio,
                     is_last,
-                });
+                ) {
+                    return;
+                }
+                if is_last
+                    && !send_agent_status(
+                        &down_addr,
+                        &session_id,
+                        request_id,
+                        &cancel,
+                        AgentPhase::Speaking,
+                        true,
+                    )
+                {
+                    return;
+                }
             }
             LlmTtsItem::Failed { error, code } => {
                 error!(target: "voice_server.session", session_id = %session_id, code, %error, "pipeline 失败");
-                send_down(&down_addr, VoicePayload::Error {
-                    code: code as u32,
-                    message: error,
-                });
+                if !send_agent_status(
+                    &down_addr,
+                    &session_id,
+                    request_id,
+                    &cancel,
+                    AgentPhase::Error,
+                    true,
+                ) {
+                    return;
+                }
+                send_down(
+                    &down_addr,
+                    VoicePayload::Error {
+                        code: code as u32,
+                        message: SAFE_PIPELINE_ERROR_MESSAGE.to_string(),
+                    },
+                );
                 return;
             }
         }
     }
     info!(target: "voice_server.session", session_id = %session_id, "pipeline 全部完成");
+}
+
+fn agent_label(phase: AgentPhase) -> &'static str {
+    match phase {
+        AgentPhase::Listening => "正在聆听",
+        AgentPhase::Transcribing => "正在理解",
+        AgentPhase::Searching => "正在查资料",
+        AgentPhase::Composing => "正在组织答案",
+        AgentPhase::Speaking => "正在回答",
+        AgentPhase::Error => "暂时遇到问题",
+    }
+}
+
+fn send_agent_status(
+    addr: &Recipient<OutMessage>,
+    session_id: &str,
+    request_id: u64,
+    cancel: &CancellationToken,
+    phase: AgentPhase,
+    done: bool,
+) -> bool {
+    if cancel.is_cancelled() {
+        return false;
+    }
+    let label = agent_label(phase.clone()).to_string();
+    send_down(
+        addr,
+        VoicePayload::AgentStatus {
+            session_id: session_id.to_string(),
+            phase,
+            label,
+            tool: None,
+            request_id,
+            done,
+        },
+    );
+    true
+}
+
+fn send_tts_audio(
+    addr: &Recipient<OutMessage>,
+    session_id: &str,
+    request_id: u64,
+    cancel: &CancellationToken,
+    seq: u32,
+    audio: String,
+    is_last: bool,
+) -> bool {
+    if cancel.is_cancelled() {
+        return false;
+    }
+    send_down(
+        addr,
+        VoicePayload::TtsAudio {
+            session_id: session_id.to_string(),
+            seq,
+            // admin_api 侧是 base64 字符串（SSE 需要），WS 侧还原为原始字节
+            data: base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &audio)
+                .unwrap_or_default(),
+            is_last,
+            request_id,
+        },
+    );
+    true
 }
 
 /// 下行推送：msgpack 编码后用 Recipient::try_send；弱网/客户端断连时吞错。
@@ -296,5 +478,328 @@ pub(super) fn send_down(addr: &Recipient<OutMessage>, p: VoicePayload) {
             session_id = ?p.session_id(),
             "下行编码失败: {}", e
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+
+    use actix::{Actor, Context, Handler};
+    use async_trait::async_trait;
+    use futures_util::{stream, Stream};
+    use tokio::sync::mpsc;
+    use voice_proto::{decode_payload, AgentPhase};
+
+    use crate::client::error::ClientError;
+    use crate::client::llm::{BoxStream as LlmStream, ChatMessage};
+    use crate::client::{AsrClient, LlmClient, TtsClient};
+    use crate::events::{AsrEvent, LlmEvent, TtsEvent};
+
+    use super::*;
+
+    struct MockAsr;
+
+    #[async_trait]
+    impl AsrClient for MockAsr {
+        async fn recognize(
+            &self,
+            _session_id: &str,
+            _filename: Option<&str>,
+            _audio: Vec<u8>,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<AsrEvent, ClientError>> + Send>>, ClientError>
+        {
+            Ok(Box::pin(stream::iter([Ok(AsrEvent {
+                text: "你好".to_string(),
+                is_final: true,
+                ..AsrEvent::default()
+            })])))
+        }
+    }
+
+    struct FailingAsr;
+
+    #[async_trait]
+    impl AsrClient for FailingAsr {
+        async fn recognize(
+            &self,
+            _session_id: &str,
+            _filename: Option<&str>,
+            _audio: Vec<u8>,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<AsrEvent, ClientError>> + Send>>, ClientError>
+        {
+            Err(ClientError::Http(
+                "provider-secret-detail https://provider.invalid".to_string(),
+            ))
+        }
+    }
+
+    struct MockLlm;
+
+    impl MockLlm {
+        fn response() -> LlmStream<Result<LlmEvent, ClientError>> {
+            Box::pin(stream::iter([Ok(LlmEvent {
+                delta: "你好。".to_string(),
+                is_final: true,
+            })]))
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for MockLlm {
+        async fn chat(
+            &self,
+            _session_id: &str,
+            _prompt: &str,
+            _emotion_hint: Option<&str>,
+        ) -> Result<LlmStream<Result<LlmEvent, ClientError>>, ClientError> {
+            Ok(Self::response())
+        }
+
+        async fn chat_with_messages(
+            &self,
+            _session_id: &str,
+            _messages: &[ChatMessage],
+        ) -> Result<LlmStream<Result<LlmEvent, ClientError>>, ClientError> {
+            Ok(Self::response())
+        }
+    }
+
+    struct MockTts;
+
+    #[async_trait]
+    impl TtsClient for MockTts {
+        async fn synthesize(
+            &self,
+            _session_id: &str,
+            _text: &str,
+            _sample_rate_override: Option<u32>,
+            _voice_override: Option<String>,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<TtsEvent, ClientError>> + Send>>, ClientError>
+        {
+            Ok(Box::pin(stream::iter([Ok(TtsEvent {
+                seq: 1,
+                data: vec![1, 0, 2, 0],
+                is_last: true,
+            })])))
+        }
+
+        fn default_voice_short(&self) -> &str {
+            "mock"
+        }
+    }
+
+    struct CaptureActor {
+        tx: mpsc::UnboundedSender<VoicePayload>,
+    }
+
+    impl Actor for CaptureActor {
+        type Context = Context<Self>;
+    }
+
+    impl Handler<OutMessage> for CaptureActor {
+        type Result = ();
+
+        fn handle(&mut self, msg: OutMessage, _ctx: &mut Self::Context) {
+            let (_, payload) = decode_payload(&msg.data).expect("downlink payload should decode");
+            self.tx.send(payload).expect("test receiver should be open");
+        }
+    }
+
+    #[test]
+    fn agent_labels_are_fixed_user_safe_copy() {
+        assert_eq!(agent_label(AgentPhase::Transcribing), "正在理解");
+        assert_eq!(agent_label(AgentPhase::Composing), "正在组织答案");
+        assert_eq!(agent_label(AgentPhase::Speaking), "正在回答");
+        assert_eq!(agent_label(AgentPhase::Error), "暂时遇到问题");
+    }
+
+    #[actix::test]
+    async fn normal_request_emits_safe_phases_and_one_request_id() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let down_addr = CaptureActor { tx }.start().recipient();
+        let request_id = 42;
+
+        run_pipeline(
+            "session-1".to_string(),
+            request_id,
+            vec![0; 6400],
+            16_000,
+            1,
+            None,
+            None,
+            Arc::new(MockAsr),
+            Arc::new(MockLlm),
+            Arc::new(MockTts),
+            down_addr,
+            CancellationToken::new(),
+            Arc::new(Mutex::new(None)),
+        )
+        .await;
+
+        let mut payloads = Vec::new();
+        loop {
+            let payload = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("pipeline events should arrive")
+                .expect("capture actor should remain available");
+            let is_terminal_status = matches!(
+                payload,
+                VoicePayload::AgentStatus {
+                    phase: AgentPhase::Speaking,
+                    done: true,
+                    ..
+                }
+            );
+            payloads.push(payload);
+            if is_terminal_status {
+                break;
+            }
+        }
+
+        let phases: Vec<&str> = payloads
+            .iter()
+            .filter_map(|payload| match payload {
+                VoicePayload::AgentStatus { phase, .. } => Some(match phase {
+                    AgentPhase::Listening => "listening",
+                    AgentPhase::Transcribing => "transcribing",
+                    AgentPhase::Searching => "searching",
+                    AgentPhase::Composing => "composing",
+                    AgentPhase::Speaking => "speaking",
+                    AgentPhase::Error => "error",
+                }),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            phases,
+            ["transcribing", "composing", "speaking", "speaking"]
+        );
+
+        let ids: Vec<u64> = payloads
+            .iter()
+            .filter_map(|payload| match payload {
+                VoicePayload::AgentStatus { request_id, .. }
+                | VoicePayload::AsrPartial { request_id, .. }
+                | VoicePayload::LlmDelta { request_id, .. }
+                | VoicePayload::TtsAudio { request_id, .. } => Some(*request_id),
+                _ => None,
+            })
+            .collect();
+        assert!(!ids.is_empty());
+        assert!(ids.iter().all(|id| *id == request_id && *id != 0));
+
+        let speaking_index = payloads
+            .iter()
+            .position(|payload| {
+                matches!(
+                    payload,
+                    VoicePayload::AgentStatus {
+                        phase: AgentPhase::Speaking,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let first_audio_index = payloads
+            .iter()
+            .position(|payload| matches!(payload, VoicePayload::TtsAudio { .. }))
+            .unwrap();
+        assert_eq!(speaking_index + 1, first_audio_index);
+
+        let last_audio_index = payloads
+            .iter()
+            .rposition(|payload| matches!(payload, VoicePayload::TtsAudio { is_last: true, .. }))
+            .unwrap();
+        assert!(matches!(
+            payloads.get(last_audio_index + 1),
+            Some(VoicePayload::AgentStatus {
+                phase: AgentPhase::Speaking,
+                done: true,
+                request_id: 42,
+                ..
+            })
+        ));
+    }
+
+    #[actix::test]
+    async fn provider_error_details_are_not_sent_to_clients() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let down_addr = CaptureActor { tx }.start().recipient();
+
+        run_pipeline(
+            "session-1".to_string(),
+            9,
+            vec![0; 6400],
+            16_000,
+            1,
+            None,
+            None,
+            Arc::new(FailingAsr),
+            Arc::new(MockLlm),
+            Arc::new(MockTts),
+            down_addr,
+            CancellationToken::new(),
+            Arc::new(Mutex::new(None)),
+        )
+        .await;
+
+        let mut payloads = Vec::new();
+        while let Ok(Some(payload)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            payloads.push(payload);
+        }
+
+        let message = payloads
+            .iter()
+            .find_map(|payload| match payload {
+                VoicePayload::Error {
+                    code: 1001,
+                    message,
+                } => Some(message.as_str()),
+                _ => None,
+            })
+            .expect("a safe ASR error should be sent");
+        assert_eq!(message, "服务暂时不可用，请稍后再试。");
+        assert!(!message.contains("provider-secret-detail"));
+        assert!(!message.contains("provider.invalid"));
+    }
+
+    #[actix::test]
+    async fn cancellation_between_speaking_and_audio_suppresses_tts() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let down_addr = CaptureActor { tx }.start().recipient();
+        let cancel = CancellationToken::new();
+
+        assert!(send_agent_status(
+            &down_addr,
+            "session-1",
+            7,
+            &cancel,
+            AgentPhase::Speaking,
+            false,
+        ));
+        cancel.cancel();
+        assert!(!send_tts_audio(
+            &down_addr,
+            "session-1",
+            7,
+            &cancel,
+            1,
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [1_u8, 0, 2, 0],),
+            false,
+        ));
+
+        let status = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("speaking status should arrive")
+            .expect("capture actor should remain available");
+        assert!(matches!(status, VoicePayload::AgentStatus { .. }));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
+                .await
+                .is_err()
+        );
     }
 }

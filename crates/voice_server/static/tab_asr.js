@@ -68,7 +68,7 @@
       output.appendChild(lineEl);
 
       let chunkCount = 0;
-      for await (const evt of window.parseNdjson(resp)) {
+      for await (const evt of window.parseSse(resp)) {
         if (evt.error) {
           err('ASR error line:', evt);
           setError(evt.error);

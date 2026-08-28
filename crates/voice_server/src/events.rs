@@ -4,7 +4,7 @@
 //! - `client/{asr,llm,tts}.rs` 各客户端的 stream 输出类型
 //! - `agent/llmagent.rs` 透传到下游的事件
 //! - `session.rs` 的 WS pipeline 编排
-//! - `admin_api.rs` 的 HTTP NDJSON 输出
+//! - `admin_api.rs` 的 HTTP SSE 输出
 //! - `pipeline.rs` 的 LLM→TTS 共享流水线
 //!
 //! 统一在一个地方避免反向依赖：以前这些类型定义在 `session.rs`，被 `client/` 和

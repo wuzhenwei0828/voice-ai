@@ -668,6 +668,7 @@ async fn drive_recv_loop(
                     text,
                     is_final,
                     replace_last,
+                    request_id: 0,
                 };
                 send_down(&addr, payload);
             }
@@ -705,6 +706,7 @@ fn send_error<E: std::fmt::Display>(addr: &Recipient<OutMessage>, session_id: &s
         text: format!("[error] {}", message),
         is_final: true,
         replace_last: false,
+        request_id: 0,
     };
     send_down(addr, payload);
 }

@@ -37,8 +37,8 @@ pub struct ChatMessage {
 
 #[async_trait]
 pub trait LlmClient: Send + Sync {
-    /// 便利方法：单轮对话。`emotion_hint` 会作为 system message 拼到 prompt 前面。
-    /// 内部会构造 `[emotion_system?, user]` 两/一条消息后转给 [`chat_with_messages`]。
+    /// 便利方法：单轮对话。`emotion_hint`（可包含情绪和事件）会作为 system message
+    /// 拼到 prompt 前面。内部会构造 `[hint_system?, user]` 两/一条消息后转给 [`chat_with_messages`]。
     async fn chat(
         &self,
         session_id: &str,
@@ -117,22 +117,22 @@ struct ChatDelta {
 
 #[async_trait]
 impl LlmClient for HttpLlmClient {
-    /// 便利方法：单轮对话。构造 emotion system + user 两条消息后转给 [`chat_with_messages`]。
+    /// 便利方法：单轮对话。构造 ASR 参考 system + user 两条消息后转给 [`chat_with_messages`]。
     async fn chat(
         &self,
         session_id: &str,
         prompt: &str,
         emotion_hint: Option<&str>,
     ) -> Result<BoxStream<Result<LlmEvent, ClientError>>, ClientError> {
-        // 情绪提示：仅用于调整回复的语气/措辞，禁止 LLM 主动告诉用户情绪是什么
+        // ASR 参考：仅用于辅助理解语气/场景，禁止 LLM 主动泄露识别结果
         let mut messages: Vec<ChatMessage> = Vec::with_capacity(2);
         if let Some(e) = emotion_hint {
             messages.push(ChatMessage {
                 role: "system".to_string(),
                 content: format!(
-                    "[情绪参考] 请据此调整回复的语气和措辞，但**不要在回复中提及、复述或暗示用户当前的情绪**，\
-                     也不要解释你是如何判断的；直接、自然地回答用户的问题即可。\
-                     （用户当前说话的情绪可能是：{e}，仅供你参考，可能不准确）"
+                    "[ASR参考信号] 以下内容由语音识别模型推断，仅供理解语气和场景参考，可能不准确：\n{e}\n\
+                     请自然回答用户，不要在回复中提及、复述或暗示这些信号，\
+                     不要把事件当作用户明确说出的事实，也不要解释判断过程。"
                 ),
             });
         }

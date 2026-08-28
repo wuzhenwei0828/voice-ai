@@ -356,11 +356,12 @@ pub struct TtsConfig {
     pub model: String,
     /// 必填：默认音色**短名**（如 `"alex"`）。
     ///
-    /// 白名单见 `client::tts::SUPPORTED_VOICES`（构造 HttpTtsClient 时校验，
-    /// 不在白名单里直接 bail）。
+    /// 白名单见 `client::tts::SUPPORTED_VOICES`（HashMap 形式，构造 HttpTtsClient 时
+    /// 校验，不在表里直接 bail）。
     ///
-    /// 端侧（前端下拉框 / admin API）可以传另一个短名覆盖默认 —— HttpTtsClient 会
-    /// 在请求时拼上 `"<model>:<short>"` 再发给 TTS provider，所以**这里只填短名**。
+    /// 端侧（前端下拉框 / admin API）可以传另一个 short 覆盖。HttpTtsClient 在
+    /// 请求时查 `SUPPORTED_VOICES` 取对应条目的 `VoiceEntry::wire_voice` 原样
+    /// 发给 TTS provider —— **这里只填 short**；不要在 yaml 里手写 `<model>:<short>`。
     pub voice: String,
     /// 输出格式（mp3/wav/pcm/opus/aac/flac）
     #[serde(default)]

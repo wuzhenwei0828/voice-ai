@@ -22,8 +22,12 @@ pub mod logging;
 pub mod pipeline;
 pub mod service;
 pub mod session;
+pub mod utils;
 
-pub use agent::{LlmAgent, RedisStore, InMemoryStore, MemoryStore};
+pub use agent::{
+    InMemoryStore, KnowledgeSearch, LlmAgent, MemoryStore, NoopKnowledgeSearch, RedisStore,
+    SearchError, SearchResult, Source,
+};
 pub use client::{
     build_asr_client, build_llm_client, build_tts_client, AsrClient, HttpAsrClient,
     HttpLlmClient, HttpTtsClient, LlmClient, TtsClient,

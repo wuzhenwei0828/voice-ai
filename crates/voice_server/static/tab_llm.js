@@ -30,7 +30,7 @@
       let text = '';
       let chunkCount = 0;
       let finalEl = null;
-      for await (const evt of window.parseNdjson(resp)) {
+      for await (const evt of window.parseSse(resp)) {
         if (evt.error) {
           output.innerHTML += `<div class="final" style="color:#f87171">❌ ${evt.error}</div>`;
           continue;

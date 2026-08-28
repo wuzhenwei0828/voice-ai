@@ -117,7 +117,7 @@ impl ServiceCallback for VoiceService {
     }
 
     fn api_init(&self, web_app: &mut ServiceConfig) {
-        // 单能力 admin 接口 /admin/* （HTTP REST + NDJSON 流）
+        // 单能力 admin 接口 /admin/* （HTTP REST + SSE 流）
         // 注意：必须先于 static files 注册，否则 Files 服务会优先匹配 /admin/* 路径
         let (asr, llm, tts) = self.arcs();
         web_app.app_data(web::Data::new(asr))

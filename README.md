@@ -104,26 +104,31 @@ INFO voice_server.service: WS 断开，移除 session
 
 ## 单能力验证接口
 
-`voice-server` 暴露了 4 个 HTTP REST + NDJSON 流接口，方便单点验证 ASR / LLM / TTS：
+`voice-server` 暴露了 5 个 HTTP REST + SSE 流接口，方便单点验证 ASR / LLM / TTS：
 
 | 路径 | 输入 | 输出 |
 |------|------|------|
-| `POST /test/asr` | raw PCM body | NDJSON `{text, is_final}` |
-| `POST /test/llm` | JSON `{prompt}` | NDJSON `{delta, is_final}` |
-| `POST /test/tts` | JSON `{text}` | NDJSON `{seq, audio(base64), is_last}` |
-| `POST /test/llm_tts` | JSON `{text}` | NDJSON TTS chunks（LLM 切句后串 TTS） |
+| `POST /admin/asr` | raw PCM body | SSE `{text, is_final}` |
+| `POST /admin/llm` | JSON `{prompt}` | SSE `{delta, is_final}` |
+| `POST /admin/tts` | JSON `{text}` | SSE `{seq, audio(base64), is_last}` |
+| `POST /admin/llm_tts` | JSON `{text}` | SSE TTS chunks（LLM 切句后串 TTS） |
+| `POST /admin/asr_llm_tts` | raw PCM body | SSE 分阶段事件 |
 
 前端页面默认 5 个 tab：全流程对话 / ASR / LLM / TTS / LLM→TTS，可以分别跑每个能力。
 
+上述 5 个流式接口均返回 `Content-Type: text/event-stream`，每条事件采用 `data: <JSON>\n\n` 格式；`/admin/voices` 仍返回一次性 JSON。
+
 ```bash
 # curl 示例
-curl -sN -X POST http://localhost:8080/test/llm \
+curl -sN -X POST http://localhost:8080/admin/llm \
   -H 'Content-Type: application/json' \
   -d '{"prompt":"讲个笑话"}'
 
-curl -sN -X POST http://localhost:8080/test/tts \
+curl -sN -X POST http://localhost:8080/admin/tts \
   -H 'Content-Type: application/json' \
-  -d '{"text":"你好世界"}' | jq -c '{seq, is_last, len:(.audio|length)}'
+  -d '{"text":"你好世界"}'
+
+# SSE data 行示例：data: {"seq":1,"audio":"...","is_last":false}
 ```
 
 ## 前端 TTS 播放与跨句打断设计

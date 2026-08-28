@@ -3,21 +3,27 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>voice-app web admin</title>
+<title>语音知识助手</title>
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
 
 <header>
-  <h1>🎙️ voice-app 实时对话</h1>
-  <div class="status-bar">
+  <div class="header-row">
+    <h1>语音知识助手</h1>
+    <div class="mode-links" aria-label="界面模式">
+      <a id="dev-mode-link" class="dev-mode-link" href="#developer">开发模式</a>
+      <a id="user-mode-link" class="dev-mode-link" href="#user" hidden>返回对话</a>
+    </div>
+  </div>
+  <div class="status-bar" aria-label="设备状态">
     <span id="conn-status" class="badge badge-offline">未连接</span>
     <span id="mic-status" class="badge badge-offline">麦克风：关</span>
     <span id="speaker-status" class="badge badge-offline">扬声器：空闲</span>
   </div>
 </header>
 
-<nav class="tabs">
+<nav id="developer-tools" class="tabs" aria-label="开发工具">
   <button class="tab-btn active" data-tab="pipeline">💬 全流程对话</button>
   <button class="tab-btn" data-tab="asr">🎤 ASR</button>
   <button class="tab-btn" data-tab="llm">🧠 LLM</button>
@@ -41,45 +47,55 @@
       </button>
     </div>
 
-    <!-- 中央通话舞台：头像 + 呼吸波形 + 状态文字 -->
-    <div class="phone-stage">
-      <div class="phone-avatar-wrap" id="phone-avatar-wrap" data-state="idle">
-        <!-- 三圈呼吸波形 —— 状态切换时显示/隐藏 -->
-        <div class="phone-wave phone-wave-1"></div>
-        <div class="phone-wave phone-wave-2"></div>
-        <div class="phone-wave phone-wave-3"></div>
-        <!-- 头像 -->
-        <div class="phone-avatar">
-          <span class="phone-avatar-emoji">🤖</span>
+    <div class="user-mode-layout">
+      <!-- 中央通话舞台：头像 + 呼吸波形 + 状态文字 -->
+      <div class="phone-stage">
+        <div class="phone-avatar-wrap" id="phone-avatar-wrap" data-state="idle">
+          <!-- 三圈呼吸波形 —— 状态切换时显示/隐藏 -->
+          <div class="phone-wave phone-wave-1"></div>
+          <div class="phone-wave phone-wave-2"></div>
+          <div class="phone-wave phone-wave-3"></div>
+          <!-- 头像 -->
+          <div class="phone-avatar">
+            <span class="phone-avatar-emoji">🤖</span>
+          </div>
+        </div>
+
+        <div class="phone-status" id="agent-phase" role="status" aria-live="polite">准备就绪</div>
+        <div class="phone-substatus" id="agent-substatus">点下方按钮开始对话</div>
+        <button id="retry-action" class="retry-action" type="button" hidden>重试</button>
+
+        <div class="phone-voice-name">
+          音色：<span id="phone-voice-name">加载中...</span>
         </div>
       </div>
 
-      <div class="phone-status" id="phone-status">准备就绪</div>
-      <div class="phone-substatus" id="phone-substatus">点下方按钮开始对话</div>
+      <div class="user-mode-panel">
+        <!-- 大按钮组（豆包式：开始=绿圆形 / 打断=橙 / 结束=红圆形） -->
+        <div class="phone-controls" aria-label="通话控制">
+          <button id="btn-interrupt" class="phone-btn phone-btn-interrupt" disabled>打断</button>
+          <button id="btn-start" class="phone-btn phone-btn-start" title="开始对话" aria-label="开始对话">
+            <span class="phone-btn-icon" aria-hidden="true">📞</span>
+          </button>
+          <button id="btn-stop" class="phone-btn phone-btn-stop" disabled title="结束" aria-label="结束对话">
+            <span class="phone-btn-icon" aria-hidden="true">✕</span>
+          </button>
+        </div>
 
-      <div class="phone-voice-name">
-        音色：<span id="phone-voice-name">加载中...</span>
+        <!-- 字幕默认展开，持续呈现用户与助手的对话。 -->
+        <details class="phone-details transcript-details" id="phone-transcript-details" open>
+          <summary>对话字幕</summary>
+          <div id="conv-log" class="conv-log phone-conv-log" aria-live="polite">
+            <div class="empty-hint">还没开始说话</div>
+          </div>
+        </details>
+
+        <details class="phone-details source-details" id="source-details" hidden>
+          <summary>参考来源</summary>
+          <ol id="source-list" class="source-list"></ol>
+        </details>
       </div>
     </div>
-
-    <!-- 大按钮组（豆包式：开始=绿圆形 / 打断=橙 / 结束=红圆形） -->
-    <div class="phone-controls">
-      <button id="btn-interrupt" class="phone-btn phone-btn-interrupt" disabled>打断</button>
-      <button id="btn-start" class="phone-btn phone-btn-start" title="开始对话">
-        <span class="phone-btn-icon">📞</span>
-      </button>
-      <button id="btn-stop" class="phone-btn phone-btn-stop" disabled title="结束">
-        <span class="phone-btn-icon">✕</span>
-      </button>
-    </div>
-
-    <!-- 折叠：对话日志 -->
-    <details class="phone-details" id="phone-transcript-details">
-      <summary>📜 对话日志</summary>
-      <div id="conv-log" class="conv-log phone-conv-log">
-        <div class="empty-hint">（还没开始说话）</div>
-      </div>
-    </details>
 
     <!-- 折叠：设置（音色 / 说明） -->
     <details class="phone-details">
@@ -102,7 +118,7 @@
   <section id="tab-asr" class="tab-pane" hidden>
     <div class="test-panel">
       <h2>🎤 ASR 单能力验证</h2>
-      <div class="hint">上传 WAV 文件 → POST /admin/asr（前端先解析 WAV 为 PCM s16le 16kHz mono）→ 流式识别</div>
+      <div class="hint">上传 WAV 文件 → POST /admin/asr（前端先解析 WAV 为 PCM s16le 16kHz mono）→ SSE 流式识别</div>
       <div class="test-controls">
         <input id="asr-file-input" type="file" accept=".wav,.raw,.pcm,audio/*" />
         <button id="asr-run" disabled>▶ 跑 ASR</button>
@@ -119,7 +135,7 @@
   <section id="tab-llm" class="tab-pane" hidden>
     <div class="test-panel">
       <h2>🧠 LLM 单能力验证</h2>
-      <div class="hint">输入 prompt → POST /admin/llm → 流式文本回复</div>
+      <div class="hint">输入 prompt → POST /admin/llm → SSE 流式文本回复</div>
       <div class="test-controls">
         <textarea id="llm-prompt" rows="2" placeholder="输入 prompt，例如：讲个笑话"></textarea>
         <button id="llm-run">▶ 跑 LLM</button>
@@ -136,7 +152,7 @@
   <section id="tab-tts" class="tab-pane" hidden>
     <div class="test-panel">
       <h2>🔊 TTS 单能力验证</h2>
-      <div class="hint">输入文本 → POST /admin/tts → 流式音频 chunk → 拼成 WAV 后播放</div>
+      <div class="hint">输入文本 → POST /admin/tts → SSE 流式音频 chunk → 拼成 WAV 后播放</div>
       <div class="test-controls">
         <textarea id="tts-text" rows="2" placeholder="输入要合成的文本，例如：你好世界"></textarea>
         <label class="voice-selector">
@@ -183,7 +199,7 @@
   <section id="tab-asr_llm_tts" class="tab-pane" hidden>
     <div class="test-panel">
       <h2>📁 ASR→LLM→TTS 全链路验证</h2>
-      <div class="hint">上传 WAV/裸 PCM 文件 → POST /admin/asr_llm_tts → ASR 识别 → LLM 流式 → 切句 TTS，分阶段 NDJSON 事件</div>
+      <div class="hint">上传 WAV/裸 PCM 文件 → POST /admin/asr_llm_tts → ASR 识别 → LLM 流式 → 切句 TTS，分阶段 SSE 事件</div>
       <div class="test-controls">
         <input id="asr_llm_tts-file-input" type="file" accept=".wav,.raw,.pcm,audio/*" />
         <label class="voice-selector">
@@ -212,7 +228,7 @@
   </section>
 </main>
 
-<script src="ndjson.js"></script>
+<script src="sse.js"></script>
 <script src="voice_selector.js"></script>
 <script src="tab_asr.js"></script>
 <script src="tab_llm.js"></script>

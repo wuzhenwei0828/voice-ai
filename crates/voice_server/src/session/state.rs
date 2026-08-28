@@ -20,4 +20,6 @@ pub(crate) enum TriggerReason {
     DurationCap,
     /// 服务端兜底：缓冲字节超过 MAX_AUDIO_BYTES
     BufferCap,
+    /// 客户端请求重放最近一次有效语音
+    Retry,
 }
