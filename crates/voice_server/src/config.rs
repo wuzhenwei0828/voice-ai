@@ -23,7 +23,7 @@
 //!     X-Region: cn-beijing
 //!
 //! asr:
-//!   model: "FunAudioLLM/SenseVoiceSmall"
+//!   model: "sensevoice"
 //!
 //! llm:
 //!   model: "deepseek-ai/DeepSeek-V4-Flash"
@@ -241,7 +241,8 @@ pub struct AsrConfig {
     /// 覆盖 ProviderConfig.headers
     #[serde(default)]
     pub headers: HashMap<String, String>,
-    /// 必填：模型 ID
+    /// 模型 ID。FunASR SenseVoice 服务仅支持 `sensevoice`；缺省使用该预设。
+    #[serde(default = "default_asr_model")]
     pub model: String,
     /// 强制指定语种（auto / zh / en / yue / ja / ko / nospeech）。None = 由模型自动检测
     #[serde(default)]
@@ -249,14 +250,10 @@ pub struct AsrConfig {
     /// 响应格式（json | text | verbose_json）。None = 走上游默认（json）
     #[serde(default)]
     pub response_format: Option<String>,
-    /// 是否启用 ct-punc 标点后处理（首请求 +~3s 懒加载 ct-punc 模型）
-    #[serde(default)]
-    pub punc: Option<bool>,
     /// 是否启用说话人分离（首请求 +1~3s 懒加载 cam++ 模型）
     #[serde(default)]
     pub spk: Option<bool>,
-    /// 是否在结果文本里保留 `<|zh|><|HAPPY|>` 等 SenseVoice 标签；
-    /// 仅 `punc=false` 时生效 —— `punc=true` 走 ct-punc 后处理会剥掉所有标签
+    /// 是否在结果文本里保留 `<|zh|><|HAPPY|>` 等 SenseVoice 标签。
     #[serde(default)]
     pub tags: Option<bool>,
 }
@@ -286,14 +283,17 @@ impl Default for AsrConfig {
             api_key: String::new(),
             timeout_ms: None,
             headers: HashMap::new(),
-            model: String::new(),
+            model: default_asr_model(),
             language: None,
             response_format: None,
-            punc: None,
             spk: None,
             tags: None,
         }
     }
+}
+
+fn default_asr_model() -> String {
+    "sensevoice".to_string()
 }
 
 // ===== LLM =====
@@ -495,11 +495,6 @@ fn apply_section_env(c: &mut AsrConfig, prefix: &str) {
     if let Ok(v) = std::env::var(format!("VOICE_{}_RESPONSE_FORMAT", prefix)) {
         c.response_format = Some(v);
     }
-    if let Ok(v) = std::env::var(format!("VOICE_{}_PUNC", prefix)) {
-        if let Some(b) = parse_env_bool(&v) {
-            c.punc = Some(b);
-        }
-    }
     if let Ok(v) = std::env::var(format!("VOICE_{}_SPK", prefix)) {
         if let Some(b) = parse_env_bool(&v) {
             c.spk = Some(b);
@@ -597,7 +592,7 @@ mod tests {
               headers:
                 X-Region: cn-beijing
             asr:
-              model: "FunAudioLLM/SenseVoiceSmall"
+              model: "sensevoice"
             llm:
               model: "deepseek-ai/DeepSeek-V4-Flash"
             tts:
@@ -615,6 +610,15 @@ mod tests {
         assert!(resolved.headers.contains_key("X-Region"));
         assert_eq!(cfg.tts.sample_rate, Some(16000));
         assert!(cfg.tts.stream);
+    }
+
+    #[test]
+    fn asr_model_defaults_to_sensevoice() {
+        let yaml = r#"
+            asr: {}
+        "#;
+        let cfg: VoiceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.asr.model, "sensevoice");
     }
 
     #[test]

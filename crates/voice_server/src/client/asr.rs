@@ -2,14 +2,14 @@
 //!
 //! ## 为什么不用 async-openai
 //! SDK 的 `CreateTranscriptionRequest` 只覆盖 OpenAI-Whisper 标准字段（`file`/`model`/`language`/
-//! `response_format`/`prompt`/`temperature`），**没有** FunASR 私有扩展 `punc` / `spk` / `tags`；
-//! SDK 的 multipart 构造也是 internal 的，没法往里塞任意字段。手搓以透传所有 5 个新参数。
+//! `response_format`/`prompt`/`temperature`），**没有** FunASR 私有扩展 `spk` / `tags`；
+//! SDK 的 multipart 构造也是 internal 的，没法往里塞 FunASR 扩展字段。手搓以透传全部请求参数。
 //!
 //! ## Wire format
 //! 请求：`POST {base_url}/audio/transcriptions`，`multipart/form-data`
 //!   - file: 音频字节（filename + content-type）
 //!   - model: 模型 ID
-//!   - language / response_format / punc / spk / tags: 可选
+//!   - language / response_format / spk / tags: 可选
 //! 响应（按 response_format 分支）：
 //!   - `json`（默认）：`{"text": "..."}`
 //!   - `text`：纯文本 body
@@ -57,7 +57,6 @@ pub struct HttpAsrClient {
     model: String,
     language: Option<String>,
     response_format: Option<String>,
-    punc: Option<bool>,
     spk: Option<bool>,
     tags: Option<bool>,
 }
@@ -73,7 +72,6 @@ impl HttpAsrClient {
         model: String,
         language: Option<String>,
         response_format: Option<String>,
-        punc: Option<bool>,
         spk: Option<bool>,
         tags: Option<bool>,
     ) -> anyhow::Result<Self> {
@@ -88,7 +86,6 @@ impl HttpAsrClient {
             model,
             language,
             response_format,
-            punc,
             spk,
             tags,
         })
@@ -201,7 +198,6 @@ impl AsrClient for HttpAsrClient {
             .part("file", file_part);
         form = Self::push_opt_text(form, "language", self.language.as_deref());
         form = Self::push_opt_text(form, "response_format", self.response_format.as_deref());
-        form = Self::push_opt_bool(form, "punc", self.punc);
         form = Self::push_opt_bool(form, "spk", self.spk);
         form = Self::push_opt_bool(form, "tags", self.tags);
 
@@ -229,7 +225,6 @@ impl AsrClient for HttpAsrClient {
             filename = %upload_name,
             language = self.language.as_deref().unwrap_or(""),
             response_format = self.response_format.as_deref().unwrap_or(""),
-            punc = self.punc.unwrap_or(false),
             spk = self.spk.unwrap_or(false),
             tags = self.tags.unwrap_or(false),
             api_key_present = self.api_key.is_some(),
@@ -391,7 +386,6 @@ pub fn build_asr_client(
         model = %cfg.model,
         language = cfg.language.as_deref().unwrap_or(""),
         response_format = cfg.response_format.as_deref().unwrap_or(""),
-        punc = cfg.punc.unwrap_or(false),
         spk = cfg.spk.unwrap_or(false),
         tags = cfg.tags.unwrap_or(false),
         "构造 HttpAsrClient (reqwest multipart)"
@@ -406,7 +400,6 @@ pub fn build_asr_client(
         cfg.model.clone(),
         cfg.language.clone(),
         cfg.response_format.clone(),
-        cfg.punc,
         cfg.spk,
         cfg.tags,
     )?))
@@ -566,11 +559,7 @@ mod tests {
 
     #[test]
     fn push_opt_bool_skips_none() {
-        let _ = HttpAsrClient::push_opt_bool(reqwest::multipart::Form::new(), "punc", None);
-        let _ = HttpAsrClient::push_opt_bool(
-            reqwest::multipart::Form::new(),
-            "punc",
-            Some(true),
-        );
+        let _ = HttpAsrClient::push_opt_bool(reqwest::multipart::Form::new(), "spk", None);
+        let _ = HttpAsrClient::push_opt_bool(reqwest::multipart::Form::new(), "spk", Some(true));
     }
 }

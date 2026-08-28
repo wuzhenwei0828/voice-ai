@@ -5,7 +5,7 @@
 //!（siliconflow、OpenAI 官方、自建 ASR 等）。
 //!
 //! 模块组织：
-//!   - `asr.rs`         HttpAsrClient（手搓 reqwest multipart，支持 FunASR 私有扩展 punc/spk/tags）
+//!   - `asr.rs`         HttpAsrClient（手搓 reqwest multipart，支持 FunASR 私有扩展 spk/tags）
 //!   - `funasr.rs`      FunasrClient（直连本地 FunASR 部署，docs/FunASR/runtime/docs/websocket_protocol_zh.md）
 //!   - `llm.rs`         HttpLlmClient
 //!   - `tts.rs`         HttpTtsClient（手搓 reqwest：Voice 枚举不兼容 siliconflow 自定义 voice 字符串）

@@ -22,7 +22,12 @@ provider:
 
 # ASR：multipart/form-data 上传音频 → {"text": "..."}
 asr:
-  model: "FunAudioLLM/SenseVoiceSmall"
+  api_base: "http://127.0.0.1:8000/sensevoice/v1"
+  model: "sensevoice"
+  # language: "zh"              # 强制语种（auto / zh / en / yue / ja / ko / nospeech）
+  # response_format: "json"     # json | text | verbose_json，缺省 = json
+  # spk: true                    # 说话人分离（首请求 +1~3s 懒加载 cam++ 模型）
+  # tags: true                   # 保留 SenseVoice 标签，缺省剥离
 
 # LLM：流式 chat completion
 llm:
@@ -62,4 +67,3 @@ asr_live:
   workspace_id: "llm-xxxxxx"             # 业务空间 ID（公共协议端点必需，除非给 endpoint）
   region: "cn-beijing"                   # cn-beijing | ap-southeast-1
   # endpoint: "wss://自定义域名/api-ws/v1/inference"   # 显式覆盖
-
