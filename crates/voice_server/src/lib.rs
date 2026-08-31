@@ -1,5 +1,12 @@
 //! Voice server: 在 webhttp 之上挂载语音 pipeline
 //!
+//! ## 新手阅读顺序
+//! 1. 先看 [`config`]，了解 YAML 如何生成各客户端配置。
+//! 2. 再看 [`service`]，了解 HTTP 与 WebSocket 路由如何组装。
+//! 3. 普通对话从 [`session::VoiceSession`] 进入，具体编排在 [`session::pipeline`]。
+//! 4. LLM 到 TTS 的可复用逻辑在 [`pipeline::llm_tts`]，客户端实现位于 [`client`]。
+//! 5. 领域事件统一定义在 [`events`]，便于追踪模块之间传递的数据形状。
+//!
 //! 关键模块：
 //!   - `client`       ASR / LLM / TTS 客户端 trait + HTTP 实现
 //!   - `agent`        LlmAgent：短期记忆 + 多轮对话 + 提示词注入
@@ -29,10 +36,12 @@ pub use agent::{
     SearchError, SearchResult, Source,
 };
 pub use client::{
-    build_asr_client, build_llm_client, build_tts_client, AsrClient, HttpAsrClient,
-    HttpLlmClient, HttpTtsClient, LlmClient, TtsClient,
+    build_asr_client, build_llm_client, build_tts_client, AsrClient, HttpAsrClient, HttpLlmClient,
+    HttpTtsClient, LlmClient, TtsClient, TtsWsClient, TtsWsConfig,
 };
-pub use config::{AsrConfig, LlmConfig, ProviderConfig, REDIS_KEY_PREFIX, ServerConfig, TtsConfig, VoiceConfig};
+pub use config::{
+    AsrConfig, LlmConfig, ProviderConfig, ServerConfig, TtsConfig, VoiceConfig, REDIS_KEY_PREFIX,
+};
 pub use events::{AsrEvent, AsrSegment, LlmEvent, TtsEvent};
 pub use logging::{
     candidate_paths, default_config_path, init_logging, load_yaml, resolve_config_path,

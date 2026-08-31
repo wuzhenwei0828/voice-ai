@@ -30,7 +30,7 @@
 //!
 //! tts:
 //!   model: "fnlp/MOSS-TTSD-v0.5"
-//!   voice: "fnlp/MOSS-TTSD-v0.5:alex"
+//!   voice: "vivian"
 //!   response_format: "wav"
 //!   stream: true
 //!   # sample_rate: 16000          # Hz，None = 走 provider 默认
@@ -262,8 +262,16 @@ impl AsrConfig {
     pub fn resolved(&self, provider: Option<&ProviderConfig>) -> ProviderConfig {
         let p = provider.cloned().unwrap_or_default();
         ProviderConfig {
-            api_base: if self.api_base.is_empty() { p.api_base } else { self.api_base.clone() },
-            api_key: if self.api_key.is_empty() { p.api_key } else { self.api_key.clone() },
+            api_base: if self.api_base.is_empty() {
+                p.api_base
+            } else {
+                self.api_base.clone()
+            },
+            api_key: if self.api_key.is_empty() {
+                p.api_key
+            } else {
+                self.api_key.clone()
+            },
             timeout_ms: self.timeout_ms.unwrap_or(p.timeout_ms),
             headers: {
                 let mut h = p.headers;
@@ -315,8 +323,16 @@ impl LlmConfig {
     pub fn resolved(&self, provider: Option<&ProviderConfig>) -> ProviderConfig {
         let p = provider.cloned().unwrap_or_default();
         ProviderConfig {
-            api_base: if self.api_base.is_empty() { p.api_base } else { self.api_base.clone() },
-            api_key: if self.api_key.is_empty() { p.api_key } else { self.api_key.clone() },
+            api_base: if self.api_base.is_empty() {
+                p.api_base
+            } else {
+                self.api_base.clone()
+            },
+            api_key: if self.api_key.is_empty() {
+                p.api_key
+            } else {
+                self.api_key.clone()
+            },
             timeout_ms: self.timeout_ms.unwrap_or(p.timeout_ms),
             headers: {
                 let mut h = p.headers;
@@ -353,15 +369,10 @@ pub struct TtsConfig {
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    #[serde(default)]
     pub model: String,
-    /// 必填：默认音色**短名**（如 `"alex"`）。
-    ///
-    /// 白名单见 `client::tts::SUPPORTED_VOICES`（HashMap 形式，构造 HttpTtsClient 时
-    /// 校验，不在表里直接 bail）。
-    ///
-    /// 端侧（前端下拉框 / admin API）可以传另一个 short 覆盖。HttpTtsClient 在
-    /// 请求时查 `SUPPORTED_VOICES` 取对应条目的 `VoiceEntry::wire_voice` 原样
-    /// 发给 TTS provider —— **这里只填 short**；不要在 yaml 里手写 `<model>:<short>`。
+    /// 默认音色名称（模型相关，例如 vLLM-Omni Qwen3-TTS 的 `vivian`）。
+    /// 端侧可以传另一个 voice 覆盖。
     pub voice: String,
     /// 输出格式（mp3/wav/pcm/opus/aac/flac）
     #[serde(default)]
@@ -377,6 +388,74 @@ pub struct TtsConfig {
     ///   - `mp3`              32000 / 44100（默认 44100）
     #[serde(default)]
     pub sample_rate: Option<u32>,
+    /// 输出声道数，默认单声道。
+    #[serde(default = "default_tts_channels")]
+    pub channels: u8,
+    #[serde(default)]
+    /// 播放速度（0.25-4.0），None 使用服务端默认值 1.0。
+    pub speed: Option<f32>,
+    #[serde(default)]
+    /// TTS 任务类型：CustomVoice / VoiceDesign / Base。
+    pub task_type: Option<String>,
+    #[serde(default)]
+    /// 合成语言，例如 Chinese、English 或 Auto。
+    pub language: Option<String>,
+    #[serde(default)]
+    /// 声音风格、情绪等自然语言指令。
+    pub instructions: Option<String>,
+    #[serde(default)]
+    /// 最大生成 token 数，服务端默认 2048。
+    pub max_new_tokens: Option<u32>,
+    #[serde(default)]
+    /// 首个 codec 音频块的帧数，用于 TTFA 调优。
+    pub initial_codec_chunk_frames: Option<u32>,
+    #[serde(default)]
+    /// Qwen3-TTS prompt 构造模式覆盖值。
+    pub non_streaming_mode: Option<bool>,
+    #[serde(default)]
+    /// 流式格式：sse 或 audio。
+    pub stream_format: Option<String>,
+    #[serde(default)]
+    /// Base 任务参考音频 URL、Data URL 或 file URI。
+    pub ref_audio: Option<String>,
+    #[serde(default)]
+    /// 参考音频文字转写。
+    pub ref_text: Option<String>,
+    #[serde(default)]
+    /// 仅使用说话人 embedding，不进行 ICL。
+    pub x_vector_only_mode: Option<bool>,
+    #[serde(default)]
+    /// TTS 传输方式：`http`（默认）或 `websocket`。
+    pub transport: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TtsModelFormat {
+    #[serde(default)]
+    pub sample_rate: Option<u32>,
+    #[serde(default = "default_tts_channels")]
+    pub channels: u8,
+}
+
+fn default_tts_channels() -> u8 { 1 }
+
+/// 模型专属的音频输出格式。
+///
+/// 新增或调整模型时，只改这里的对应条目；不需要在 YAML 配置中重复填写。
+const TTS_MODEL_FORMATS: &[(&str, TtsModelFormat)] = &[
+    (
+        "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        TtsModelFormat { sample_rate: Some(24000), channels: 1 },
+    ),
+];
+
+impl TtsConfig {
+    pub fn model_format(&self) -> TtsModelFormat {
+        TTS_MODEL_FORMATS
+            .iter()
+            .find_map(|(model, format)| (*model == self.model).then_some(*format))
+            .unwrap_or(TtsModelFormat { sample_rate: self.sample_rate, channels: self.channels })
+    }
 }
 
 impl TtsConfig {
@@ -385,8 +464,16 @@ impl TtsConfig {
         let p = provider.cloned().unwrap_or_default();
         (
             ProviderConfig {
-                api_base: if self.api_base.is_empty() { p.api_base } else { self.api_base.clone() },
-                api_key: if self.api_key.is_empty() { p.api_key } else { self.api_key.clone() },
+                api_base: if self.api_base.is_empty() {
+                    p.api_base
+                } else {
+                    self.api_base.clone()
+                },
+                api_key: if self.api_key.is_empty() {
+                    p.api_key
+                } else {
+                    self.api_key.clone()
+                },
                 timeout_ms: self.timeout_ms.unwrap_or(p.timeout_ms),
                 headers: {
                     let mut h = p.headers;
@@ -398,6 +485,36 @@ impl TtsConfig {
             },
             "/audio/speech".to_string(),
         )
+    }
+
+    /// 返回实际使用的 TTS 传输类型。
+    pub fn transport_kind(&self) -> &'static str {
+        if self.transport.eq_ignore_ascii_case("websocket") {
+            "websocket"
+        } else {
+            "http"
+        }
+    }
+
+    /// 返回按传输类型转换后的完整 TTS endpoint，供日志和客户端工厂共用。
+    pub fn resolved_endpoint(&self, provider: Option<&ProviderConfig>) -> String {
+        let (resolved, path) = self.resolved(provider);
+        let base = resolved.api_base.trim_end_matches('/');
+        if self.transport_kind() == "websocket" {
+            let ws_base = if base.starts_with("ws://") || base.starts_with("wss://") {
+                base.to_string()
+            } else {
+                base.replace("https://", "wss://")
+                    .replace("http://", "ws://")
+            };
+            format!(
+                "{}{}",
+                ws_base,
+                path.replace("/audio/speech", "/audio/speech/stream")
+            )
+        } else {
+            format!("{}{}", base, path)
+        }
     }
 }
 
@@ -413,6 +530,19 @@ impl Default for TtsConfig {
             response_format: String::new(),
             stream: false,
             sample_rate: None,
+            channels: default_tts_channels(),
+            speed: None,
+            task_type: None,
+            language: None,
+            instructions: None,
+            max_new_tokens: None,
+            initial_codec_chunk_frames: None,
+            non_streaming_mode: None,
+            stream_format: None,
+            ref_audio: None,
+            ref_text: None,
+            x_vector_only_mode: None,
+            transport: "http".into(),
         }
     }
 }
@@ -570,10 +700,7 @@ impl Default for VoiceConfig {
 pub fn llm_openai(cfg: &LlmConfig, provider: Option<&ProviderConfig>) -> OpenAIConfig {
     cfg.resolved(provider).to_openai_config()
 }
-pub fn tts_parts(
-    cfg: &TtsConfig,
-    provider: Option<&ProviderConfig>,
-) -> (OpenAIConfig, String) {
+pub fn tts_parts(cfg: &TtsConfig, provider: Option<&ProviderConfig>) -> (OpenAIConfig, String) {
     // TTS 走手搓 reqwest，不直接用 OpenAIConfig（但我们仍然用其 api_base 字段语义）
     let (resolved, path) = cfg.resolved(provider);
     (resolved.to_openai_config(), path)
@@ -631,6 +758,60 @@ mod tests {
         "#;
         let cfg: VoiceConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.tts.sample_rate, None);
+    }
+
+    #[test]
+    fn tts_model_format_is_hardcoded_for_qwen3_tts() {
+        let yaml = r#"
+            tts:
+              model: "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+              voice: "Vivian"
+              sample_rate: 16000
+              channels: 1
+        "#;
+        let cfg: VoiceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.tts.model_format(), TtsModelFormat { sample_rate: Some(24000), channels: 1 });
+    }
+
+    #[test]
+    fn tts_model_format_falls_back_to_section_defaults_for_unknown_model() {
+        let yaml = r#"
+            tts:
+              model: "example/tts"
+              voice: "v"
+              sample_rate: 16000
+              channels: 2
+        "#;
+        let cfg: VoiceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.tts.model_format(), TtsModelFormat { sample_rate: Some(16000), channels: 2 });
+    }
+
+    #[test]
+    fn parse_vllm_omni_tts_options() {
+        let yaml = r#"
+            tts:
+              model: "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+              voice: "vivian"
+              speed: 1.25
+              task_type: "CustomVoice"
+              language: "English"
+              instructions: "warm narrator"
+              max_new_tokens: 128
+              initial_codec_chunk_frames: 1
+              non_streaming_mode: false
+              stream_format: "sse"
+              ref_audio: "https://example.test/ref.wav"
+              ref_text: "reference"
+              x_vector_only_mode: true
+              transport: "websocket"
+        "#;
+        let cfg: VoiceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.tts.voice, "vivian");
+        assert_eq!(cfg.tts.speed, Some(1.25));
+        assert_eq!(cfg.tts.max_new_tokens, Some(128));
+        assert_eq!(cfg.tts.stream_format.as_deref(), Some("sse"));
+        assert_eq!(cfg.tts.x_vector_only_mode, Some(true));
+        assert_eq!(cfg.tts.transport, "websocket");
     }
 
     #[test]

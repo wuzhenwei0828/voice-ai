@@ -46,11 +46,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_tungstenite::tungstenite::{
-    client::IntoClientRequest,
-    Message,
-};
 use async_tungstenite::tokio::connect_async;
+use async_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tracing::{info, warn};
@@ -480,7 +477,10 @@ mod tests {
             ..Default::default()
         });
         let req = client.build_handshake_request().unwrap();
-        assert_eq!(req.headers().get("Sec-WebSocket-Protocol").unwrap(), "custom-proto");
+        assert_eq!(
+            req.headers().get("Sec-WebSocket-Protocol").unwrap(),
+            "custom-proto"
+        );
     }
 
     // ===== 借用 protocol 模块的测试 sanity check =====

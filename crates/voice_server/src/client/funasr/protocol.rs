@@ -26,7 +26,10 @@ impl FunasrResponseMode {
     /// - 累积全文：必须做 last_text → delta 转换（前端才能"一个字一个字显示"）。
     /// - 最终纠错：必须替换上一行 final（不要 append）。
     pub fn is_cumulative(&self) -> bool {
-        matches!(self, FunasrResponseMode::Online | FunasrResponseMode::TwoPassOnline)
+        matches!(
+            self,
+            FunasrResponseMode::Online | FunasrResponseMode::TwoPassOnline
+        )
     }
     pub fn is_correction(&self) -> bool {
         matches!(self, FunasrResponseMode::TwoPassOffline)

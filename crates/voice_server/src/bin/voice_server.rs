@@ -92,6 +92,8 @@ async fn main() -> anyhow::Result<()> {
     // 3. 初始化日志（基于 cfg.log）
     init_logging(&cfg.log)?;
 
+    let provider_cfg = cfg.provider.as_ref();
+
     // 4. 打印最终生效的配置
     info!(
         target: "voice_server",
@@ -105,13 +107,12 @@ async fn main() -> anyhow::Result<()> {
         asr_endpoint = %cfg.asr.resolved(cfg.provider.as_ref()).api_base,
         llm_kind = "http",
         llm_endpoint = %cfg.llm.resolved(cfg.provider.as_ref()).api_base,
-        tts_kind = "http",
-        tts_endpoint = %cfg.tts.resolved(cfg.provider.as_ref()).0.api_base,
+        tts_kind = cfg.tts.transport_kind(),
+        tts_endpoint = %cfg.tts.resolved_endpoint(provider_cfg),
         "voice_server 配置加载完成"
     );
 
     // 5. 构造客户端
-    let provider_cfg = cfg.provider.as_ref();
     let asr = voice_server::build_asr_client(&cfg.asr, provider_cfg)?;
     let llm = voice_server::build_llm_client(&cfg.llm, provider_cfg)?;
     let tts = voice_server::build_tts_client(&cfg.tts, provider_cfg)?;
@@ -204,7 +205,11 @@ async fn main() -> anyhow::Result<()> {
         target: "voice_server",
         asr = format!("{} (http)", cfg.asr.resolved(cfg.provider.as_ref()).api_base),
         llm = format!("{} (http)", cfg.llm.resolved(cfg.provider.as_ref()).api_base),
-        tts = format!("{} (http)", cfg.tts.resolved(cfg.provider.as_ref()).0.api_base),
+        tts = format!(
+            "{} ({})",
+            cfg.tts.resolved_endpoint(provider_cfg),
+            cfg.tts.transport_kind()
+        ),
         "后端服务"
     );
     info!(

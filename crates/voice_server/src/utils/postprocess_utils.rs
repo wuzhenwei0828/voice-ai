@@ -314,10 +314,7 @@ pub struct SentenceOutput {
     pub time_stamps: Option<Vec<[i64; 2]>>,
 }
 
-pub fn sentence_postprocess(
-    words: &[&str],
-    time_stamp: Option<&[[i64; 2]]>,
-) -> SentenceOutput {
+pub fn sentence_postprocess(words: &[&str], time_stamp: Option<&[[i64; 2]]>) -> SentenceOutput {
     // ---- 1. 清洗 words：丢 `<s>` / `</s>` / `<unk>` ----
     let middle_lists: Vec<&str> = words
         .iter()
@@ -672,7 +669,10 @@ mod tests {
 
         // "H I T" → ["H", "I", "T"]
         let r = abbr_dispose(&["H", " ", "I", " ", "T"], None);
-        assert_eq!(r.words, vec!["H".to_string(), "I".to_string(), "T".to_string()]);
+        assert_eq!(
+            r.words,
+            vec!["H".to_string(), "I".to_string(), "T".to_string()]
+        );
 
         // "H I foo" → ["H", "I", " ", "foo"]（"foo" 不在 abbr 内，原样保留；abbr
         // 与非 abbr 之间的 space 也保留）
@@ -688,9 +688,9 @@ mod tests {
         );
 
         // 缩写带时间戳：
-//   - begin 取第一个 alpha 的 ts.begin（ts_nums[0]=0 → ts[0][0]=0）
-//   - end   取最后一个 alpha 的 ts.end（ts_nums[2]=1，因为 space 共享下一个
-//           alpha 的 ts_index，所以用 ts[1][1]=200，不是 ts[2][1]=400）
+        //   - begin 取第一个 alpha 的 ts.begin（ts_nums[0]=0 → ts[0][0]=0）
+        //   - end   取最后一个 alpha 的 ts.end（ts_nums[2]=1，因为 space 共享下一个
+        //           alpha 的 ts_index，所以用 ts[1][1]=200，不是 ts[2][1]=400）
         let ts = [[0, 100], [100, 200], [300, 400]];
         let r = abbr_dispose(&["H", " ", "I"], Some(&ts));
         assert_eq!(r.words, vec!["H".to_string(), "I".to_string()]);
@@ -701,7 +701,10 @@ mod tests {
     fn sentence_postprocess_all_chinese() {
         let out = sentence_postprocess(&["你", "好", "<unk>"], None);
         assert_eq!(out.sentence, "你好");
-        assert_eq!(out.real_word_lists, vec!["你".to_string(), "好".to_string()]);
+        assert_eq!(
+            out.real_word_lists,
+            vec!["你".to_string(), "好".to_string()]
+        );
     }
 
     #[test]

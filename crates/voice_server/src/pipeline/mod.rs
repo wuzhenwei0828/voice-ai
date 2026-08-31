@@ -30,9 +30,8 @@
 //! - emit 模式不同（LLM 边发文本边发音频；image/text 没有 mid-flight 文本）
 //! - 强行抽通用 trait 反而要管 Source关联类型 + 多态分发，不如独立函数清晰
 //!
-//! 共享部分（句末判定 + crossfade + seq 编号 + 结束标记）保持在 [`crossfade`]
-//! 和 [`sentence`] 里，所有 pipeline 直接 `use super::crossfade::SentenceCrossfader`、
-//! `use super::sentence::next_sentence_end` 即可。
+//! 共享部分（句末判定 + TTS 文本清洗/短句合并 + crossfade + seq 编号 + 结束标记）
+//! 保持在 [`crossfade`]、[`sentence`] 和 [`text`] 里，所有 pipeline 直接复用即可。
 //!
 //! 事件类型（[`LlmTtsItem`] 这种）每个 pipeline 独立定义 —— 不要试图抽统一的
 //! `PipelineEvent` 枚举，否则 enum 变体会膨胀且与各 pipeline 语义强耦合。
@@ -41,8 +40,10 @@
 pub mod crossfade;
 pub mod llm_tts;
 pub mod sentence;
+pub mod text;
 
 // 公共 re-export：调用方 `use crate::pipeline::*` 拿到主要 API
 pub use crossfade::SentenceCrossfader;
 pub use llm_tts::{llm_tts_items, LlmTtsItem};
 pub use sentence::next_sentence_end;
+pub use text::{to_tts_text, TtsSentenceBuffer};

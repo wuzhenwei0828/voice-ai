@@ -43,7 +43,9 @@ struct OpenAiErrorEnvelope {
 /// 尝试把一段 body 解析成 OpenAI 信封；任何一步失败（坏 JSON / 缺字段）返回 `None`，
 /// 调用方应降级到 `ClientError::Status(u16)` 旧路径，不要静默吞错。
 pub fn parse_openai_error(body: &str) -> Option<OpenAiError> {
-    serde_json::from_str::<OpenAiErrorEnvelope>(body).ok().map(|e| e.error)
+    serde_json::from_str::<OpenAiErrorEnvelope>(body)
+        .ok()
+        .map(|e| e.error)
 }
 
 #[derive(Debug, thiserror::Error)]

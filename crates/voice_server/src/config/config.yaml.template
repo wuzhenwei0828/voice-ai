@@ -32,16 +32,28 @@ asr:
 # LLM：流式 chat completion
 llm:
   model: "Qwen/Qwen2.5-7B-Instruct"
+  # api_key 会由 LLM 客户端映射为 x-api-key 请求头
+  # api_key: "sk-*******"
 
-# TTS：文本 → 音频（手搓 reqwest，因为 Voice 字段要传自定义字符串如 "fnlp/MOSS-TTSD-v0.5:alex"）
+# TTS：文本 → 音频（vLLM-Omni OpenAI-compatible speech API）
 tts:
-  model: "FunAudioLLM/CosyVoice2-0.5B"
-  # voice 填**短名**（白名单：alex / anna / bella / benjamin / charles / claire / david / diana）；
-  # 后端在调 TTS provider 时会自动拼上 "<model>:<short>"，所以这里不要带模型前缀。
-  voice: "alex"
-  response_format: "pcm"
+  model: "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+  voice: "vivian"
+  response_format: "wav"
   stream: true
-  sample_rate: 16000          # 输出采样率（Hz）。None = 走 provider 默认。
+  sample_rate: 24000
+  channels: 1
+  # transport: "websocket"   # 使用 /v1/audio/speech/stream 长连接
+  # vLLM-Omni 扩展字段（均可省略，使用服务端默认）
+  # speed: 1.0
+  # task_type: "CustomVoice"  # CustomVoice | VoiceDesign | Base
+  # language: "Auto"
+  # instructions: ""
+  # max_new_tokens: 2048
+  # stream_format: "sse"      # sse | audio
+  # ref_audio: "https://..."  # Base voice cloning
+  # ref_text: "..."
+  # x_vector_only_mode: false
 
 # Redis：横切关注点，agent / 未来的 cache / rate-limit 等共用
 # 不配 url 就当未启用 Redis，agent 会自动 fallback 到 in_memory

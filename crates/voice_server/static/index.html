@@ -165,7 +165,10 @@
       <div class="test-output">
         <div class="output-label">合成音频：</div>
         <div class="audio-controls">
-          <audio id="tts-audio" controls></audio>
+          <div class="stream-playback-control" data-state="idle">
+            <button id="tts-stream-toggle" class="stream-play-toggle" type="button" disabled title="暂停流式播放" aria-label="暂停流式播放">||</button>
+            <input class="stream-playback-track" type="range" min="0" max="0" value="0" step="0.01" disabled aria-label="播放进度" />
+          </div>
           <a id="tts-download" class="btn-download" hidden>下载 wav</a>
         </div>
       </div>
@@ -189,7 +192,10 @@
       <div class="test-output">
         <div class="output-label">合成音频：</div>
         <div class="audio-controls">
-          <audio id="llm_tts-audio" controls></audio>
+          <div class="stream-playback-control" data-state="idle">
+            <button id="llm_tts-stream-toggle" class="stream-play-toggle" type="button" disabled title="暂停流式播放" aria-label="暂停流式播放">||</button>
+            <input class="stream-playback-track" type="range" min="0" max="0" value="0" step="0.01" disabled aria-label="播放进度" />
+          </div>
           <a id="llm_tts-download" class="btn-download" hidden>下载 wav</a>
         </div>
       </div>
@@ -220,7 +226,10 @@
       <div class="test-output">
         <div class="output-label">合成音频：</div>
         <div class="audio-controls">
-          <audio id="asr_llm_tts-audio" controls></audio>
+          <div class="stream-playback-control" data-state="idle">
+            <button id="asr_llm_tts-stream-toggle" class="stream-play-toggle" type="button" disabled title="暂停流式播放" aria-label="暂停流式播放">||</button>
+            <input class="stream-playback-track" type="range" min="0" max="0" value="0" step="0.01" disabled aria-label="播放进度" />
+          </div>
           <a id="asr_llm_tts-download" class="btn-download" hidden>下载 wav</a>
         </div>
       </div>
@@ -229,6 +238,7 @@
 </main>
 
 <script src="sse.js"></script>
+<script src="pcm-stream-player.js"></script>
 <script src="voice_selector.js"></script>
 <script src="tab_asr.js"></script>
 <script src="tab_llm.js"></script>

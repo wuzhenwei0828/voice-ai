@@ -92,14 +92,22 @@ impl HttpAsrClient {
     }
 
     /// 推一个可选字段到 multipart —— None 时不输出，节省 payload 字节
-    fn push_opt_text(form: reqwest::multipart::Form, name: &str, val: Option<&str>) -> reqwest::multipart::Form {
+    fn push_opt_text(
+        form: reqwest::multipart::Form,
+        name: &str,
+        val: Option<&str>,
+    ) -> reqwest::multipart::Form {
         match val {
             Some(v) if !v.is_empty() => form.text(name.to_string(), v.to_string()),
             _ => form,
         }
     }
 
-    fn push_opt_bool(form: reqwest::multipart::Form, name: &str, val: Option<bool>) -> reqwest::multipart::Form {
+    fn push_opt_bool(
+        form: reqwest::multipart::Form,
+        name: &str,
+        val: Option<bool>,
+    ) -> reqwest::multipart::Form {
         match val {
             Some(b) => form.text(name.to_string(), b.to_string()),
             None => form,
@@ -140,8 +148,9 @@ fn extract_text(body: &str, response_format: Option<&str>) -> Result<String, Cli
             Ok(r.text)
         }
         "verbose_json" => {
-            let r: VerboseJsonResponse = serde_json::from_str(body)
-                .map_err(|e| ClientError::Decode(format!("decode ASR verbose_json response: {}", e)))?;
+            let r: VerboseJsonResponse = serde_json::from_str(body).map_err(|e| {
+                ClientError::Decode(format!("decode ASR verbose_json response: {}", e))
+            })?;
             Ok(r.text)
         }
         other => Err(ClientError::Decode(format!(
@@ -454,10 +463,16 @@ mod tests {
         // fmt fields
         assert_eq!(u16::from_le_bytes([wav[20], wav[21]]), 1); // PCM
         assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 1); // channels
-        assert_eq!(u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]), 16000);
+        assert_eq!(
+            u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]),
+            16000
+        );
         assert_eq!(u16::from_le_bytes([wav[34], wav[35]]), 16); // bits
-        // dataLen
-        assert_eq!(u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]), 320);
+                                                                // dataLen
+        assert_eq!(
+            u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]),
+            320
+        );
         // data follows
         assert_eq!(&wav[44..], &pcm[..]);
     }
@@ -509,7 +524,10 @@ mod tests {
             "text": "你好，世界。",
             "segments": [{"id": 0, "start": 0.0, "end": 2.37, "text": "你好，世界。", "words": []}]
         }"#;
-        assert_eq!(extract_text(body, Some("verbose_json")).unwrap(), "你好，世界。");
+        assert_eq!(
+            extract_text(body, Some("verbose_json")).unwrap(),
+            "你好，世界。"
+        );
     }
 
     #[test]
@@ -549,11 +567,7 @@ mod tests {
         // None → 不动 form
         let _ = HttpAsrClient::push_opt_text(form, "x", None);
         // 空字符串 → 也不动（避免空值噪音）
-        let _ = HttpAsrClient::push_opt_text(
-            reqwest::multipart::Form::new(),
-            "x",
-            Some(""),
-        );
+        let _ = HttpAsrClient::push_opt_text(reqwest::multipart::Form::new(), "x", Some(""));
         // 这里只能验证不 panic；form 内部状态不可直接 inspect
     }
 

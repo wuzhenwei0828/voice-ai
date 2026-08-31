@@ -121,7 +121,10 @@ impl MemoryStore for InMemoryStore {
     }
 
     async fn len(&self, session_id: &str) -> usize {
-        self.map.get(session_id).map(|m| m.lock().len()).unwrap_or(0)
+        self.map
+            .get(session_id)
+            .map(|m| m.lock().len())
+            .unwrap_or(0)
     }
 }
 

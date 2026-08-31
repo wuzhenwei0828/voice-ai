@@ -1,0 +1,1059 @@
+* { box-sizing: border-box; }
+
+/* Electron shell: the inner page intentionally follows the browser PC layout. */
+.app-shell {
+  min-height: 100vh;
+  padding: 16px 24px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.phone-settings-body > label:not(.voice-selector) {
+  display: grid;
+  gap: 6px;
+  color: #c9d1d9;
+  font-size: 13px;
+}
+
+.phone-settings-body input {
+  min-width: 220px;
+  padding: 8px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  background: #0e1117;
+  color: #e6e6e6;
+  border: 1px solid #3a4150;
+  border-radius: 6px;
+}
+
+.phone-settings-body .voice-selector input {
+  min-width: 160px;
+}
+
+.phone-mute-controls .mute-btn:disabled {
+  opacity: 0.5;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  margin: 0;
+  background: #0e1117;
+  color: #e6e6e6;
+  min-height: 100vh;
+}
+
+header {
+  padding: 16px 24px;
+  border-bottom: 1px solid #2a2f3a;
+  background: #161b22;
+}
+
+header h1 {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 600;
+}
+
+.header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.status-bar {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.badge {
+  display: inline-block;
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 500;
+  background: #2a2f3a;
+  color: #c9d1d9;
+  border: 1px solid #3a4150;
+}
+
+.badge-online {
+  background: #1f6f3a;
+  color: #d2f5d8;
+  border-color: #2da14a;
+}
+
+.badge-offline {
+  background: #5a1f1f;
+  color: #f5d2d2;
+  border-color: #a14343;
+}
+
+.badge-busy {
+  background: #7a5a1f;
+  color: #f5e7c2;
+  border-color: #c08f3d;
+}
+
+main {
+  display: block;
+  padding: 16px 24px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+/* ====== Tab 导航 ====== */
+.tabs {
+  display: flex;
+  gap: 4px;
+  padding: 0 24px;
+  background: #161b22;
+  border-bottom: 1px solid #2a2f3a;
+  overflow-x: auto;
+}
+
+body[data-mode="user"] #developer-tools {
+  display: none;
+}
+
+.tab-btn {
+  padding: 10px 18px;
+  font-size: 13px;
+  font-weight: 500;
+  border: none;
+  background: transparent;
+  color: #8b949e;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.tab-btn:hover {
+  color: #c9d1d9;
+}
+
+.tab-btn.active {
+  color: #79b8ff;
+  border-bottom-color: #4a8ed8;
+}
+
+.tab-pane {
+  display: block;
+}
+
+.tab-pane[hidden] {
+  display: none;
+}
+
+/* ====== Test panel（单能力验证页通用） ====== */
+.test-panel {
+  background: #161b22;
+  padding: 20px;
+  border-radius: 8px;
+  border: 1px solid #2a2f3a;
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.test-panel h2 {
+  margin: 0 0 8px 0;
+  font-size: 18px;
+  color: #c9d1d9;
+}
+
+.test-controls {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin: 16px 0;
+  flex-wrap: wrap;
+}
+
+.test-controls textarea,
+.test-controls input[type="file"] {
+  flex: 1;
+  min-width: 240px;
+  padding: 8px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  background: #0e1117;
+  color: #e6e6e6;
+  border: 1px solid #3a4150;
+  border-radius: 6px;
+  resize: vertical;
+}
+
+.test-controls button {
+  padding: 10px 18px;
+  font-size: 13px;
+  font-weight: 500;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  background: #2da14a;
+  color: #fff;
+}
+
+.test-controls button:hover:not(:disabled) {
+  background: #3bc15a;
+}
+
+.test-controls button:disabled {
+  background: #3a4150;
+  color: #8b949e;
+  cursor: not-allowed;
+}
+
+/* TTS 音色下拉 —— 各 tab 共用 */
+.voice-selector {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: #c9d1d9;
+}
+.voice-selector select {
+  padding: 6px 10px;
+  font-size: 13px;
+  font-family: inherit;
+  background: #0e1117;
+  color: #e6e6e6;
+  border: 1px solid #3a4150;
+  border-radius: 6px;
+  min-width: 120px;
+}
+.voice-selector select:disabled {
+  color: #8b949e;
+  cursor: not-allowed;
+}
+
+.status-text {
+  font-size: 12px;
+  color: #8b949e;
+  align-self: center;
+}
+
+.test-output {
+  margin-top: 16px;
+}
+
+.output-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #8b949e;
+  text-transform: uppercase;
+  letter-spacing: 0;
+  margin-bottom: 8px;
+}
+
+.output-box {
+  background: #0e1117;
+  border: 1px solid #2a2f3a;
+  border-radius: 6px;
+  padding: 12px 16px;
+  font-size: 14px;
+  line-height: 1.7;
+  min-height: 80px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #c9d1d9;
+  font-family: -apple-system, "SF Mono", Menlo, monospace;
+}
+
+.output-box .empty-hint {
+  color: #4a5260;
+  font-style: italic;
+}
+
+.output-box .partial {
+  opacity: 0.7;
+}
+
+.output-box .final {
+  color: #79e89a;
+  border-left: 3px solid #4ade80;
+  padding-left: 8px;
+  margin-top: 8px;
+  display: block;
+}
+
+.audio-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.stream-playback-control {
+  display: flex;
+  align-items: center;
+  width: min(220px, 55vw);
+  height: 36px;
+  padding: 3px 10px 3px 3px;
+  border: 1px solid #3a4150;
+  border-radius: 18px;
+  background: #20252e;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.stream-play-toggle {
+  width: 30px;
+  height: 30px;
+  padding: 0 0 1px 1px;
+  border: 0;
+  border-radius: 50%;
+  background: #c9d1d9;
+  color: #161b22;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.stream-play-toggle:hover:not(:disabled) {
+  background: #ffffff;
+}
+
+.stream-play-toggle:disabled {
+  cursor: default;
+  background: #4a5260;
+  color: #252a33;
+}
+
+.stream-playback-track {
+  flex: 1;
+  margin-left: 9px;
+  accent-color: #77c8ee;
+  cursor: pointer;
+}
+
+.stream-playback-track:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.btn-download {
+  padding: 8px 14px;
+  background: #2a2f3a;
+  color: #c9d1d9;
+  border-radius: 6px;
+  text-decoration: none;
+  font-size: 13px;
+  border: 1px solid #3a4150;
+}
+
+.btn-download:hover {
+  background: #3a4150;
+  color: #e6e6e6;
+}
+
+.pane-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
+}
+
+@media (min-width: 900px) {
+  .pane-grid { grid-template-columns: 1fr 1fr; }
+}
+
+.controls {
+  background: #161b22;
+  padding: 16px;
+  border-radius: 8px;
+  border: 1px solid #2a2f3a;
+  height: fit-content;
+}
+
+.controls button {
+  margin: 4px 4px 4px 0;
+  padding: 10px 18px;
+  font-size: 14px;
+  font-weight: 500;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  background: #2da14a;
+  color: #fff;
+}
+
+.controls button:hover:not(:disabled) {
+  background: #3bc15a;
+}
+
+.controls button:disabled {
+  background: #3a4150;
+  color: #8b949e;
+  cursor: not-allowed;
+}
+
+#btn-interrupt {
+  background: #c08f3d;
+}
+#btn-interrupt:hover:not(:disabled) { background: #d4a14d; }
+
+#btn-stop {
+  background: #a14343;
+}
+#btn-stop:hover:not(:disabled) { background: #c25454; }
+
+.hint {
+  margin-top: 12px;
+  font-size: 12px;
+  color: #8b949e;
+  line-height: 1.6;
+}
+
+.file-upload {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px dashed #2a2f3a;
+}
+
+.file-upload label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  color: #c9d1d9;
+  margin-bottom: 8px;
+  cursor: pointer;
+}
+
+#file-input {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: #c9d1d9;
+}
+
+#file-input::file-selector-button {
+  background: #3a4150;
+  color: #e6e6e6;
+  border: none;
+  padding: 6px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  margin-right: 8px;
+}
+
+#file-input::file-selector-button:hover {
+  background: #4a5260;
+}
+
+#btn-upload {
+  background: #1f6f3a;
+  margin: 0;
+}
+
+#btn-upload:hover:not(:disabled) {
+  background: #2da14a;
+}
+
+#btn-upload:disabled {
+  background: #3a4150;
+  color: #8b949e;
+  cursor: not-allowed;
+}
+
+.conversation {
+  background: #161b22;
+  padding: 16px;
+  border-radius: 8px;
+  border: 1px solid #2a2f3a;
+  min-height: 400px;
+}
+
+.conversation-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #8b949e;
+  margin-bottom: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0;
+}
+
+.conv-log {
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.empty-hint {
+  text-align: center;
+  color: #4a5260;
+  font-style: italic;
+  padding: 40px;
+}
+
+/* ====== 豆包式"打电话"全流程对话 tab ====== */
+.phone-call {
+  /* 全屏体验：吃掉 main 的 padding，让舞台居中 */
+  margin: -16px -24px;
+  min-height: calc(100vh - 200px);
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  background: #0e1117;
+}
+
+.user-mode-layout {
+  display: grid;
+  grid-template-columns: minmax(300px, 0.9fr) minmax(420px, 1.1fr);
+  gap: 32px;
+  align-items: center;
+  padding: 8px 32px 24px;
+}
+
+.user-mode-panel {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.phone-mute-controls {
+  display: flex;
+  gap: 8px;
+}
+
+/* 顶部静音按钮条（无左边的状态徽标，右对齐） */
+.phone-mute-top {
+  justify-content: flex-end;
+  padding: 12px 24px 0;
+}
+
+/* ====== 静音按钮 ====== */
+.mute-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  background: rgba(45, 161, 74, 0.18);
+  color: #86efac;
+  border: 1px solid rgba(45, 161, 74, 0.45);
+  border-radius: 18px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.mute-btn:hover { background: rgba(45, 161, 74, 0.32); }
+
+.mute-btn-icon {
+  font-size: 15px;
+  line-height: 1;
+}
+
+.mute-btn[data-muted="true"] {
+  background: rgba(193, 69, 69, 0.22);
+  color: #fca5a5;
+  border-color: rgba(193, 69, 69, 0.55);
+}
+.mute-btn[data-muted="true"]:hover { background: rgba(193, 69, 69, 0.36); }
+
+/* 在头像旁 / 中央舞台展示时 */
+.phone-mute-controls .mute-btn {
+  padding: 8px 14px;
+  font-size: 13px;
+}
+
+/* ====== 中央通话舞台 ====== */
+.phone-stage {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 24px 16px;
+  min-width: 0;
+  min-height: 440px;
+}
+
+/* 头像 + 波形 */
+.phone-avatar-wrap {
+  position: relative;
+  width: 200px;
+  height: 200px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 8px;
+}
+
+/* 三圈呼吸波形 —— 默认 idle 隐藏，只在 listening/thinking/speaking 时显示 */
+.phone-wave {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 180px;
+  height: 180px;
+  margin: -90px 0 0 -90px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.phone-avatar {
+  position: relative;
+  width: 160px;
+  height: 160px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #4f8ef7 0%, #7c5cff 50%, #b266ff 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow:
+    0 0 0 4px rgba(124, 92, 255, 0.18),
+    0 12px 40px rgba(80, 60, 180, 0.45);
+  transition: box-shadow 0.4s ease;
+}
+
+.phone-avatar-emoji {
+  font-size: 70px;
+  line-height: 1;
+  filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.3));
+}
+
+/* 状态文字 */
+.phone-status {
+  font-size: 28px;
+  font-weight: 600;
+  color: #f0f6fc;
+  letter-spacing: 0;
+  text-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
+  transition: color 0.3s ease;
+}
+.phone-substatus {
+  font-size: 14px;
+  color: #8b949e;
+  margin-top: -8px;
+  min-height: 18px;
+  text-align: center;
+}
+
+.retry-action {
+  min-width: 88px;
+  padding: 8px 16px;
+  border: 1px solid #6b3034;
+  border-radius: 6px;
+  background: #402025;
+  color: #d9a2a6;
+  font: inherit;
+  font-size: 13px;
+}
+
+.retry-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.72;
+}
+.phone-voice-name {
+  font-size: 13px;
+  color: #6e7681;
+  margin-top: 8px;
+}
+.phone-voice-name span {
+  color: #c9d1d9;
+  font-weight: 500;
+}
+
+/* ====== 状态色 ====== */
+
+/* idle：头像轻呼吸 */
+.phone-avatar-wrap[data-state="idle"] .phone-avatar {
+  animation: phone-breathe 3.6s ease-in-out infinite;
+  filter: saturate(0.85);
+}
+
+/* listening：绿色三圈波形 + 头像绿色光晕 */
+.phone-avatar-wrap[data-state="listening"] .phone-wave {
+  border-color: #4ade80;
+  animation: phone-ping 2.4s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+.phone-avatar-wrap[data-state="listening"] .phone-wave-2 { animation-delay: 0.8s; }
+.phone-avatar-wrap[data-state="listening"] .phone-wave-3 { animation-delay: 1.6s; }
+.phone-avatar-wrap[data-state="listening"] .phone-avatar {
+  box-shadow:
+    0 0 0 4px rgba(74, 222, 128, 0.22),
+    0 12px 40px rgba(74, 222, 128, 0.4);
+}
+.phone-avatar-wrap[data-state="listening"] ~ .phone-status { color: #86efac; }
+
+/* thinking：蓝色三圈（节奏更快）+ 头像蓝色光晕 */
+.phone-avatar-wrap[data-state="thinking"] .phone-wave {
+  border-color: #60a5fa;
+  animation: phone-ping 1.6s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+.phone-avatar-wrap[data-state="thinking"] .phone-wave-2 { animation-delay: 0.5s; }
+.phone-avatar-wrap[data-state="thinking"] .phone-wave-3 { animation-delay: 1.0s; }
+.phone-avatar-wrap[data-state="thinking"] .phone-avatar {
+  box-shadow:
+    0 0 0 4px rgba(96, 165, 250, 0.22),
+    0 12px 40px rgba(96, 165, 250, 0.4);
+}
+.phone-avatar-wrap[data-state="thinking"] ~ .phone-status { color: #93c5fd; }
+
+/* speaking：橙色三圈 + 头像橙色光晕 */
+.phone-avatar-wrap[data-state="speaking"] .phone-wave {
+  border-color: #fb923c;
+  animation: phone-ping 2.0s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+.phone-avatar-wrap[data-state="speaking"] .phone-wave-2 { animation-delay: 0.66s; }
+.phone-avatar-wrap[data-state="speaking"] .phone-wave-3 { animation-delay: 1.33s; }
+.phone-avatar-wrap[data-state="speaking"] .phone-avatar {
+  box-shadow:
+    0 0 0 4px rgba(251, 146, 60, 0.22),
+    0 12px 40px rgba(251, 146, 60, 0.4);
+}
+.phone-avatar-wrap[data-state="speaking"] ~ .phone-status { color: #fdba74; }
+
+.phone-avatar-wrap[data-state="error"] .phone-avatar {
+  box-shadow:
+    0 0 0 4px rgba(248, 113, 113, 0.2),
+    0 12px 40px rgba(153, 53, 59, 0.34);
+}
+.phone-avatar-wrap[data-state="error"] ~ .phone-status { color: #fca5a5; }
+
+@keyframes phone-breathe {
+  0%, 100% { transform: scale(1); }
+  50%      { transform: scale(1.04); }
+}
+
+@keyframes phone-ping {
+  0%   { transform: scale(1);   opacity: 0.75; }
+  80%  { transform: scale(1.6); opacity: 0;    }
+  100% { transform: scale(1.6); opacity: 0;    }
+}
+
+/* ====== 大按钮组 ====== */
+.phone-controls {
+  display: flex;
+  gap: 28px;
+  align-items: center;
+  justify-content: center;
+  padding: 12px 16px 8px;
+}
+
+.phone-stage > .phone-controls {
+  margin-top: 4px;
+}
+
+.phone-btn {
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  color: #fff;
+  font-weight: 600;
+  transition: transform 0.15s ease, background 0.2s ease, box-shadow 0.2s ease;
+}
+.phone-btn:hover:not(:disabled) { transform: scale(1.05); }
+.phone-btn:active:not(:disabled) { transform: scale(0.96); }
+.phone-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+/* 开始（绿色通话按钮） */
+.phone-btn-start {
+  width: 88px;
+  height: 88px;
+  background: linear-gradient(135deg, #2da14a 0%, #4ade80 100%);
+  box-shadow: 0 10px 28px rgba(45, 161, 74, 0.45);
+}
+.phone-btn-start:hover:not(:disabled) { box-shadow: 0 14px 36px rgba(45, 161, 74, 0.55); }
+.phone-btn-icon {
+  font-size: 36px;
+  line-height: 1;
+}
+
+/* 结束（红色挂断按钮） */
+.phone-btn-stop {
+  width: 88px;
+  height: 88px;
+  background: linear-gradient(135deg, #c14545 0%, #ef4444 100%);
+  box-shadow: 0 10px 28px rgba(193, 69, 69, 0.45);
+}
+.phone-btn-stop:hover:not(:disabled) { box-shadow: 0 14px 36px rgba(193, 69, 69, 0.55); }
+.phone-btn-stop .phone-btn-icon {
+  font-size: 40px;
+  font-weight: 700;
+}
+
+/* 打断（橙色，稍小） */
+.phone-btn-interrupt {
+  width: 60px;
+  height: 60px;
+  background: linear-gradient(135deg, #c08f3d 0%, #fbbf24 100%);
+  box-shadow: 0 6px 18px rgba(192, 143, 61, 0.45);
+  font-size: 14px;
+}
+.phone-btn-interrupt:hover:not(:disabled) { box-shadow: 0 8px 22px rgba(192, 143, 61, 0.55); }
+
+/* ====== 折叠区（对话日志 / 设置） ====== */
+.phone-details {
+  margin: 0 16px 12px;
+  background: rgba(22, 27, 34, 0.7);
+  border: 1px solid #2a2f3a;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.phone-details[hidden] { display: none; }
+.user-mode-panel .phone-details { margin: 0; }
+.phone-details > summary {
+  cursor: pointer;
+  padding: 10px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #c9d1d9;
+  user-select: none;
+  list-style: none;
+}
+.phone-details > summary::-webkit-details-marker { display: none; }
+.phone-details > summary::before {
+  content: "▸ ";
+  display: inline-block;
+  transition: transform 0.15s;
+}
+.phone-details[open] > summary::before { content: "▾ "; }
+.phone-details[open] > summary { border-bottom: 1px solid #2a2f3a; }
+
+.phone-conv-log {
+  min-height: 190px;
+  max-height: 42vh;
+  padding: 12px;
+  margin: 0;
+}
+
+.source-list {
+  list-style: none;
+  margin: 0;
+  padding: 12px 14px;
+  display: grid;
+  gap: 10px;
+}
+
+.source-list li {
+  padding: 10px 0;
+  border-bottom: 1px solid #2a2f3a;
+}
+
+.source-list li:last-child { border-bottom: 0; }
+
+.source-title {
+  color: #e6edf3;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.source-meta {
+  margin-top: 4px;
+  color: #8b949e;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.phone-settings-body {
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* pipeline tab 内 voice-selector 占满一行 */
+.phone-settings-body .voice-selector {
+  font-size: 14px;
+}
+.phone-settings-body .voice-selector select {
+  min-width: 160px;
+  padding: 8px 12px;
+}
+
+.msg {
+  margin-bottom: 12px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 14px;
+  line-height: 1.6;
+  word-break: break-word;
+}
+
+.msg .role {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0;
+  margin-bottom: 4px;
+}
+
+.msg.user {
+  background: #1f3a5f;
+  border-left: 3px solid #4a8ed8;
+}
+
+.msg.user .role { color: #79b8ff; }
+
+.msg.assistant {
+  background: #1f3f2a;
+  border-left: 3px solid #4ade80;
+}
+
+.msg.assistant .role { color: #79e89a; }
+
+.msg.assistant.partial {
+  opacity: 0.65;
+  border-left-color: #2da14a;
+}
+
+.msg.system {
+  background: #2a2f3a;
+  border-left: 3px solid #8b949e;
+  font-size: 12px;
+  color: #c9d1d9;
+}
+
+.msg.system .role { color: #8b949e; }
+
+.msg.error {
+  background: #4a1f1f;
+  border-left: 3px solid #f87171;
+}
+
+.msg.error .role { color: #fca5a5; }
+
+@keyframes blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0.3; }
+}
+
+.recording-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #f87171;
+  margin-right: 6px;
+  animation: blink 1s infinite;
+}
+
+@media (max-width: 899px) {
+  .user-mode-layout {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+    padding: 0 24px 24px;
+  }
+
+  .phone-stage {
+    min-height: 370px;
+    padding: 16px;
+  }
+
+  .user-mode-panel {
+    width: min(100%, 680px);
+    margin: 0 auto;
+  }
+
+  .phone-conv-log {
+    min-height: 160px;
+    max-height: 320px;
+  }
+}
+
+@media (max-width: 600px) {
+  header { padding: 12px 16px; }
+  header h1 { font-size: 19px; }
+  .header-row { gap: 12px; }
+  .status-bar { gap: 6px; }
+  .badge { padding: 4px 8px; }
+
+  .tabs { padding: 0 12px; }
+  .tab-btn {
+    flex: 0 0 auto;
+    padding: 9px 12px;
+  }
+
+  main { padding: 12px; }
+  .phone-call {
+    margin: -12px;
+    min-height: calc(100vh - 154px);
+  }
+  .phone-mute-top { padding: 10px 12px 0; }
+  .phone-mute-controls .mute-btn {
+    padding: 7px 10px;
+    font-size: 12px;
+  }
+
+  .user-mode-layout { padding: 0 12px 16px; }
+  .phone-stage {
+    min-height: 320px;
+    gap: 12px;
+    padding: 12px 8px;
+  }
+  .phone-avatar-wrap {
+    width: 156px;
+    height: 156px;
+    margin-bottom: 0;
+  }
+  .phone-wave {
+    width: 136px;
+    height: 136px;
+    margin: -68px 0 0 -68px;
+  }
+  .phone-avatar {
+    width: 116px;
+    height: 116px;
+  }
+  .phone-avatar-emoji { font-size: 52px; }
+  .phone-status { font-size: 22px; }
+  .phone-substatus {
+    max-width: 100%;
+    margin-top: -4px;
+  }
+
+  .phone-controls {
+    gap: 14px;
+    padding: 8px 4px;
+  }
+  .phone-btn-start,
+  .phone-btn-stop {
+    width: 72px;
+    height: 72px;
+  }
+  .phone-btn-interrupt {
+    width: 54px;
+    height: 54px;
+    font-size: 12px;
+  }
+  .phone-btn-icon { font-size: 30px; }
+  .phone-btn-stop .phone-btn-icon { font-size: 34px; }
+
+  .phone-details { margin: 0 12px 10px; }
+  .user-mode-panel .phone-details { margin: 0; }
+  .phone-conv-log {
+    min-height: 140px;
+    max-height: 280px;
+  }
+  .msg { padding: 9px 10px; }
+
+  .phone-settings-body .voice-selector {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .phone-settings-body .voice-selector select {
+    width: 100%;
+    min-width: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .phone-avatar,
+  .phone-wave,
+  .recording-dot {
+    animation: none !important;
+  }
+}

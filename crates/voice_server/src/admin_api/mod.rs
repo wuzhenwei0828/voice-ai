@@ -12,7 +12,7 @@
 //!
 //! 设计要点：
 //!   - 复用现有 AsrClient / LlmClient / TtsClient trait，不重新实现
-//!   - 切句复用 session::text::next_sentence_end
+//!   - 切句复用 crate::pipeline::sentence::next_sentence_end
 //!   - LLM→TTS 管线由 [`crate::pipeline::llm_tts_items`] 提供，/admin/llm_tts、/admin/asr_llm_tts
 //!     与 session.rs 的 WS pipeline 共用（句间 crossfade / 全局 seq / 结束标记）
 //!   - 流中途出错：插一个 `{error, code}` SSE data event 然后断流（HTTP 200 已发，不能改 status）
@@ -33,14 +33,16 @@ use std::fmt::Display;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
-use audio::prepare_audio_for_asr;
 use crate::client::{ArcAsr, ArcLlm, ArcTts, ClientError};
 use crate::events::{AsrEvent, LlmEvent};
-use crate::pipeline::{llm_tts_items, LlmTtsItem, SentenceCrossfader};
-use crate::session::text::next_sentence_end;
+use crate::pipeline::sentence::next_sentence_end;
+use crate::pipeline::{
+    llm_tts_items, to_tts_text, LlmTtsItem, SentenceCrossfader, TtsSentenceBuffer,
+};
 use crate::utils::postprocess_utils::{
     format_asr_hint, parse_asr_text, rich_transcription_postprocess,
 };
+use audio::prepare_audio_for_asr;
 
 /// 把 `ClientError` 转成 actix 响应。
 ///
@@ -189,7 +191,6 @@ where
 //   - `build_tts_sentence_stream`（/admin/tts 的句间拼接）
 // `llm_tts_items`（共享 LLM→TTS 管线）本身已搬到 pipeline.rs。
 
-
 /// 把一段 PCM 包成 SSE data event（不附加 is_last）。空 PCM 调用方应跳过。
 fn serialize_pcm_line(seq: u32, pcm: &[u8]) -> Result<Bytes, actix_web::Error> {
     let line = TtsLine {
@@ -228,10 +229,7 @@ fn gen_sid(prefix: &str) -> String {
 ///   - 输入是 WAV：自动 strip header，取 data chunk 的 PCM 包回标准 WAV 头
 ///   - 输入是裸 PCM（约定 s16le 16kHz mono）：直接包 WAV 头
 /// response: SSE data events carrying `{"text":"...","is_final":false|true}`
-pub async fn asr(
-    body: Bytes,
-    asr: Data<ArcAsr>,
-) -> Result<HttpResponse, actix_web::Error> {
+pub async fn asr(body: Bytes, asr: Data<ArcAsr>) -> Result<HttpResponse, actix_web::Error> {
     let sid = gen_sid("asr");
     let bytes_len = body.len();
     info!(target: "voice_server.admin_api", endpoint = "asr", session_id = %sid, bytes = bytes_len, "/admin/asr 收到请求");
@@ -251,10 +249,12 @@ pub async fn asr(
         .map_err(api_err_to_response)?;
 
     // AsrEvent -> AsrLine
-    let line_stream = stream.map(|res| res.map(|e: AsrEvent| AsrLine {
-        text: e.text,
-        is_final: e.is_final,
-    }));
+    let line_stream = stream.map(|res| {
+        res.map(|e: AsrEvent| AsrLine {
+            text: e.text,
+            is_final: e.is_final,
+        })
+    });
 
     Ok(HttpResponse::Ok()
         .content_type("text/event-stream")
@@ -265,10 +265,7 @@ pub async fn asr(
 /// POST /admin/llm
 /// body: `{"prompt":"...","session_id":"可选"}`
 /// response: SSE data events carrying `{"delta":"...","is_final":false|true}`
-pub async fn llm(
-    req: Json<LlmReq>,
-    llm: Data<ArcLlm>,
-) -> Result<HttpResponse, actix_web::Error> {
+pub async fn llm(req: Json<LlmReq>, llm: Data<ArcLlm>) -> Result<HttpResponse, actix_web::Error> {
     let sid = req.session_id.clone().unwrap_or_else(|| gen_sid("llm"));
     info!(target: "voice_server.admin_api", endpoint = "llm", session_id = %sid, prompt_len = req.prompt.chars().count(), "/admin/llm 收到请求");
 
@@ -277,10 +274,12 @@ pub async fn llm(
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
 
-    let line_stream = stream.map(|res| res.map(|e: LlmEvent| LlmLine {
-        delta: e.delta,
-        is_final: e.is_final,
-    }));
+    let line_stream = stream.map(|res| {
+        res.map(|e: LlmEvent| LlmLine {
+            delta: e.delta,
+            is_final: e.is_final,
+        })
+    });
 
     Ok(HttpResponse::Ok()
         .content_type("text/event-stream")
@@ -294,10 +293,7 @@ pub async fn llm(
 ///       句间过 crossfade 消除波形拼接尖刺。
 /// response: SSE data events carrying `{"seq":N,"audio":"<base64>","is_last":false|true}`
 ///           最后补一条 `{"seq":N+1,"audio":"","is_last":true}` 作为结束标记
-pub async fn tts(
-    req: Json<TtsReq>,
-    tts: Data<ArcTts>,
-) -> Result<HttpResponse, actix_web::Error> {
+pub async fn tts(req: Json<TtsReq>, tts: Data<ArcTts>) -> Result<HttpResponse, actix_web::Error> {
     let sid = req.session_id.clone().unwrap_or_else(|| gen_sid("tts"));
     info!(
         target: "voice_server.admin_api",
@@ -325,7 +321,7 @@ pub async fn tts(
         )))
 }
 
-/// 把一段长文本按 next_sentence_end 切句，逐句调 TTS，过 SentenceCrossfader 后下发。
+/// 把一段长文本按 next_sentence_end 切句，清洗并合并短句后调 TTS，过 SentenceCrossfader 后下发。
 /// 与 build_llm_tts_stream 结构对称，只是没有 LLM 阶段。
 ///
 /// `sample_rate_override`：端侧 SessionStart 上报的 TTS 输出采样率。
@@ -347,11 +343,16 @@ fn build_tts_sentence_stream(
         let mut buf = text;
         let mut global_seq: u32 = 0;
         let mut fader = SentenceCrossfader::default();
+        let mut short_sentence_buf = TtsSentenceBuffer::default();
 
         // 阶段 1：循环切句 → 逐句 TTS → 过 fader
         while let Some(end) = next_sentence_end(&buf) {
-            let sent: String = buf[..end].to_string();
+            let raw_sent: String = buf[..end].to_string();
             buf = buf[end..].to_string();
+            let sent = to_tts_text(&raw_sent);
+            let Some(sent) = short_sentence_buf.push(&sent) else {
+                continue;
+            };
             info!(target: "voice_server.admin_api", endpoint = "tts", session_id = %sid, sentence = %sent, "切出句子送 TTS");
 
             let mut stream = match tts.synthesize(&sid, &sent, sample_rate_override, voice_override.clone()).await {
@@ -390,8 +391,8 @@ fn build_tts_sentence_stream(
         }
 
         // 阶段 2：残余（末尾没有句末标点的部分）送一次 TTS
-        let tail = buf.trim().to_string();
-        if !tail.is_empty() {
+        let tail = to_tts_text(buf.trim());
+        if let Some(tail) = short_sentence_buf.push(&tail).or_else(|| short_sentence_buf.flush()) {
             info!(target: "voice_server.admin_api", endpoint = "tts", session_id = %sid, sentence = %tail, "TTS 末尾残余句子送 TTS");
             if let Ok(mut stream) = tts.synthesize(&sid, &tail, sample_rate_override, voice_override.clone()).await {
                 fader.begin_sentence();
@@ -565,24 +566,63 @@ pub struct AsrLlmTtsQuery {
 /// { "voices": ["alex", "anna", ...], "default": "alex" }
 /// ```
 ///
-/// 白名单 `SUPPORTED_VOICES` 硬编码在 `client::tts`（HashMap 形式，与 HttpTtsClient 共享）；
-/// 默认值从 `TtsClient::default_voice_short()` 拿（即 yaml `tts.voice`）。
+/// 优先读取 TTS provider 的 `/v1/audio/voices`；请求失败、响应不合法或列表为空时，
+/// 回退到本地兼容 map。配置默认值只有在最终列表中存在时才保留，否则返回列表第一个。
 pub async fn voices(tts: Data<ArcTts>) -> Result<HttpResponse, actix_web::Error> {
     use crate::client::tts::supported_voice_shorts;
 
-    let resp = VoicesResp {
-        voices: supported_voice_shorts().into_iter().map(|s| s.to_string()).collect(),
-        default: tts.get_ref().default_voice_short().to_string(),
+    let voices = match tts.get_ref().list_voices().await {
+        Ok(voices) if !voices.is_empty() => voices,
+        Ok(_) => {
+            warn!(target: "voice_server.admin_api", endpoint = "voices", "TTS provider returned an empty voice list; falling back to legacy map");
+            supported_voice_shorts()
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        }
+        Err(error) => {
+            warn!(target: "voice_server.admin_api", endpoint = "voices", error = %error, "TTS provider voice list unavailable; falling back to legacy map");
+            supported_voice_shorts()
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        }
     };
+    let configured_default = tts.get_ref().default_voice_short();
+    let default = if voices.iter().any(|voice| voice == configured_default) {
+        configured_default.to_string()
+    } else {
+        voices.first().cloned().unwrap_or_default()
+    };
+    let resp = VoicesResp { voices, default };
     Ok(HttpResponse::Ok()
         .content_type("application/json")
         .json(resp))
+}
+
+/// GET /admin/tts/format
+///
+/// 返回当前 TTS 客户端实际使用的 PCM 输出格式，供调试页面封装 WAV。
+pub async fn tts_format(tts: Data<ArcTts>) -> Result<HttpResponse, actix_web::Error> {
+    let (sample_rate, channels) = tts.get_ref().output_format();
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .json(TtsFormatResp {
+            sample_rate,
+            channels,
+        }))
 }
 
 #[derive(Debug, Serialize)]
 struct VoicesResp {
     voices: Vec<String>,
     default: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TtsFormatResp {
+    sample_rate: Option<u32>,
+    channels: u8,
 }
 
 /// ASR 阶段内联跑完拿到 prompt，LLM→TTS 阶段复用 llm_tts_items，
@@ -678,6 +718,42 @@ fn build_asr_llm_tts_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use futures_util::stream;
+    use std::sync::Arc;
+
+    use crate::client::TtsClient;
+
+    struct VoiceListTts {
+        remote_voices: Option<Vec<String>>,
+        configured_default: &'static str,
+    }
+
+    #[async_trait]
+    impl TtsClient for VoiceListTts {
+        async fn synthesize(
+            &self,
+            _session_id: &str,
+            _text: &str,
+            _sample_rate_override: Option<u32>,
+            _voice_override: Option<String>,
+        ) -> Result<
+            crate::client::tts::BoxStream<Result<crate::events::TtsEvent, ClientError>>,
+            ClientError,
+        > {
+            Ok(Box::pin(stream::empty()))
+        }
+
+        async fn list_voices(&self) -> Result<Vec<String>, ClientError> {
+            self.remote_voices
+                .clone()
+                .ok_or_else(|| ClientError::Http("provider unavailable".to_string()))
+        }
+
+        fn default_voice_short(&self) -> &str {
+            self.configured_default
+        }
+    }
 
     #[test]
     fn sse_line_wraps_json_as_data_event() {
@@ -691,5 +767,57 @@ mod tests {
             String::from_utf8(line.to_vec()).expect("UTF-8 SSE event"),
             "data: {\"text\":\"你好\",\"is_final\":true}\n\n"
         );
+    }
+
+    #[actix_web::test]
+    async fn voices_uses_remote_list_and_selects_a_valid_default() {
+        let configured = Arc::new(VoiceListTts {
+            remote_voices: Some(vec!["vivian".to_string(), "aiden".to_string()]),
+            configured_default: "vivian",
+        }) as ArcTts;
+        let response = voices(Data::new(configured))
+            .await
+            .expect("handler should return a response");
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .expect("response body should be readable");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("valid JSON"),
+            serde_json::json!({"voices": ["vivian", "aiden"], "default": "vivian"})
+        );
+
+        let missing_configured_default = Arc::new(VoiceListTts {
+            remote_voices: Some(vec!["aiden".to_string(), "vivian".to_string()]),
+            configured_default: "not-loaded",
+        }) as ArcTts;
+        let response = voices(Data::new(missing_configured_default))
+            .await
+            .expect("handler should return a response");
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .expect("response body should be readable");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("valid JSON"),
+            serde_json::json!({"voices": ["aiden", "vivian"], "default": "aiden"})
+        );
+    }
+
+    #[actix_web::test]
+    async fn voices_falls_back_to_the_legacy_map_when_remote_lookup_fails() {
+        let tts = Arc::new(VoiceListTts {
+            remote_voices: None,
+            configured_default: "vivian",
+        }) as ArcTts;
+        let response = voices(Data::new(tts))
+            .await
+            .expect("handler should return a response");
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .expect("response body should be readable");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+
+        assert_eq!(value["default"], "vivian");
+        assert_eq!(value["voices"][0], "aiden");
+        assert!(value["voices"].as_array().expect("voices array").len() > 1);
     }
 }

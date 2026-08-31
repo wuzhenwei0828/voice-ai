@@ -120,18 +120,23 @@ impl ServiceCallback for VoiceService {
         // 单能力 admin 接口 /admin/* （HTTP REST + SSE 流）
         // 注意：必须先于 static files 注册，否则 Files 服务会优先匹配 /admin/* 路径
         let (asr, llm, tts) = self.arcs();
-        web_app.app_data(web::Data::new(asr))
-                .app_data(web::Data::new(llm))
-                .app_data(web::Data::new(tts))
-                .service(
-                    web::scope("/admin")
-                        .route("/voices", web::get().to(crate::admin_api::voices))
-                        .route("/asr", web::post().to(crate::admin_api::asr))
-                        .route("/llm", web::post().to(crate::admin_api::llm))
-                        .route("/tts", web::post().to(crate::admin_api::tts))
-                        .route("/llm_tts", web::post().to(crate::admin_api::llm_tts))
-                        .route("/asr_llm_tts", web::post().to(crate::admin_api::asr_llm_tts))
-                );
+        web_app
+            .app_data(web::Data::new(asr))
+            .app_data(web::Data::new(llm))
+            .app_data(web::Data::new(tts))
+            .service(
+                web::scope("/admin")
+                    .route("/voices", web::get().to(crate::admin_api::voices))
+                    .route("/tts/format", web::get().to(crate::admin_api::tts_format))
+                    .route("/asr", web::post().to(crate::admin_api::asr))
+                    .route("/llm", web::post().to(crate::admin_api::llm))
+                    .route("/tts", web::post().to(crate::admin_api::tts))
+                    .route("/llm_tts", web::post().to(crate::admin_api::llm_tts))
+                    .route(
+                        "/asr_llm_tts",
+                        web::post().to(crate::admin_api::asr_llm_tts),
+                    ),
+            );
 
         if let Some(path) = &self.web_static_dir {
             if path.exists() {

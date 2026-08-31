@@ -64,7 +64,11 @@ impl LlmAgent {
         store: Arc<dyn MemoryStore>,
         prompts: Arc<AgentPrompts>,
     ) -> Self {
-        Self { llm, store, prompts }
+        Self {
+            llm,
+            store,
+            prompts,
+        }
     }
 
     /// 主动清空某会话的短期记忆（外部触发，如 session 结束 / 用户主动重置）

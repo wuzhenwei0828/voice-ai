@@ -45,9 +45,7 @@ use crate::client::funasr::{
     build_funasr_client, ArcFunasr, FunasrEvent, FunasrReceiver, FunasrSender,
 };
 
-use self::runtime::{
-    get_state_arc, runtime, runtime_cfg, sessions, ClientSlot, LiveAsrState,
-};
+use self::runtime::{get_state_arc, runtime, runtime_cfg, sessions, ClientSlot, LiveAsrState};
 
 // ===== webhttp wsdata 入口 =====
 
@@ -73,7 +71,11 @@ pub fn handle_message(addr: Recipient<OutMessage>, session_id: String, payload: 
 
 async fn dispatch(addr: &Recipient<OutMessage>, session_id: String, p: VoicePayload) {
     match p {
-        VoicePayload::SessionStart { sample_rate, channels, .. } => {
+        VoicePayload::SessionStart {
+            sample_rate,
+            channels,
+            ..
+        } => {
             on_session_start(addr, session_id, sample_rate, channels as u16).await;
         }
         VoicePayload::AudioChunk { data, is_last, .. } => {
@@ -500,7 +502,15 @@ async fn finalize_with_sender(
         let mut g = state_arc.lock().await;
         g.recv_task.take()
     };
-    finalize_with_sender_inner(&state_arc, sender, recv_task, &addr, session_id, close_grace).await;
+    finalize_with_sender_inner(
+        &state_arc,
+        sender,
+        recv_task,
+        &addr,
+        session_id,
+        close_grace,
+    )
+    .await;
 }
 
 async fn finalize_with_sender_inner(

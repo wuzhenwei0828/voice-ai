@@ -1,5 +1,5 @@
 // voice-app frontend — ASR→LLM→TTS 全链路 tab
-// 选文件 → POST /admin/asr_llm_tts → 按 stage 分发渲染 + 累积音频拼 WAV 播放
+// 选文件 → POST /admin/asr_llm_tts → 按 stage 分发渲染 + TTS chunk 流式播放
 
 (function () {
   'use strict';
@@ -9,8 +9,9 @@
   const status = document.getElementById('asr_llm_tts-status');
   const asrOut = document.getElementById('asr_llm_tts-asr-output');
   const llmOut = document.getElementById('asr_llm_tts-llm-output');
-  const audio = document.getElementById('asr_llm_tts-audio');
   const download = document.getElementById('asr_llm_tts-download');
+  const streamPlayer = new window.PcmStreamPlayer();
+  const playback = window.bindPcmStreamPlaybackToggle(streamPlayer, document.getElementById('asr_llm_tts-stream-toggle'));
 
   const TAG = '[tab-asr_llm_tts]';
   const log = (...a) => console.log(TAG, ...a);
@@ -29,6 +30,8 @@
   }
 
   function reset() {
+    streamPlayer.stop();
+    playback.clearReplay();
     [asrOut, llmOut].forEach((box) => {
       box.replaceChildren();
       const hint = document.createElement('span');
@@ -36,9 +39,7 @@
       hint.textContent = '（无）';
       box.appendChild(hint);
     });
-    if (audio.src) URL.revokeObjectURL(audio.src);
-    audio.removeAttribute('src');
-    audio.load();
+    if (download.href.startsWith('blob:')) URL.revokeObjectURL(download.href);
     download.href = '#';
     download.hidden = true;
   }
@@ -59,8 +60,10 @@
     btnRun.disabled = true;
     fileInput.disabled = true;
     reset();
+    void streamPlayer.resume().catch(() => {});
 
     try {
+      const format = await window.loadTtsAudioFormat;
       const buf = await selectedFile.arrayBuffer();
       log('upload start:', selectedFile.name, buf.byteLength, 'B');
 
@@ -86,6 +89,8 @@
       for await (const evt of window.parseSse(resp)) {
         if (evt.error) {
           err('stream error line:', evt);
+          streamPlayer.stop();
+          playback.clearReplay();
           setError(`[code ${evt.code}] ${evt.error}`);
           return;
         }
@@ -108,7 +113,9 @@
           if (!evt.is_final) setStatus(`LLM 生成中 (${llmText.length} 字)`);
         } else if (evt.stage === 'tts') {
           if (evt.audio) {
-            chunks.push(window.base64ToBytes(evt.audio));
+            const bytes = window.base64ToBytes(evt.audio);
+            streamPlayer.enqueue(bytes, format.sampleRate, format.channels);
+            chunks.push(bytes);
             totalBytes += chunks[chunks.length - 1].length;
             chunkCount++;
             setStatus(`TTS: 已收 ${chunkCount} chunks (${totalBytes} 字节 PCM)`);
@@ -126,12 +133,11 @@
       let off = 0;
       for (const c of chunks) { pcmAll.set(c, off); off += c.length; }
 
-      const wavUrl = window.pcmChunksToWavUrl(pcmAll);
-      audio.src = wavUrl;
+      const wavUrl = window.pcmChunksToWavUrl(pcmAll, format.sampleRate, format.channels);
+      playback.setReplay(wavUrl);
       download.href = wavUrl;
       download.download = `asr-llm-tts-${Date.now()}.wav`;
       download.hidden = false;
-      audio.play().catch(() => {});
       setStatus(`✅ 完成 (LLM ${llmText.length} 字, ${chunkCount} chunks, ${totalBytes} 字节 PCM)`);
     } catch (e) {
       err('outer catch:', e);

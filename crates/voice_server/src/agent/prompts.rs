@@ -96,7 +96,10 @@ impl AgentPrompts {
     ///
     /// 便捷方法，内部委托到 [`SystemPromptsSection::render_emotion_hint`]。
     pub fn render_emotion_hint(&self, emotion: &str) -> Option<String> {
-        self.llmagent.chat.systemprompts.render_emotion_hint(emotion)
+        self.llmagent
+            .chat
+            .systemprompts
+            .render_emotion_hint(emotion)
     }
 }
 
@@ -159,6 +162,14 @@ mod tests {
     }
 
     #[test]
+    fn embedded_guidelines_require_speech_friendly_plain_text() {
+        let prompts = AgentPrompts::from_embedded().unwrap();
+        let guidelines = &prompts.llmagent.chat.systemprompts.guidelines;
+        assert!(guidelines.contains("纯文本"));
+        assert!(guidelines.contains("Markdown"));
+    }
+
+    #[test]
     fn render_substitutes_emotion() {
         let p = AgentPrompts::from_embedded().unwrap();
         let out = p
@@ -179,9 +190,14 @@ mod tests {
     #[test]
     fn static_message_combines_role_and_guidelines() {
         let p = AgentPrompts::from_embedded().unwrap();
-        let msg = p.static_system_message().expect("默认 yaml 里 role/guidelines 都应有内容");
+        let msg = p
+            .static_system_message()
+            .expect("默认 yaml 里 role/guidelines 都应有内容");
         // role + guidelines 应该都在
-        assert!(msg.contains("语音助手"), "static message 应包含 role 内容，实际：{msg}");
+        assert!(
+            msg.contains("语音助手"),
+            "static message 应包含 role 内容，实际：{msg}"
+        );
         assert!(
             msg.contains("简洁") || msg.contains("自然"),
             "static message 应包含 guidelines 内容，实际：{msg}"

@@ -17,13 +17,20 @@ fn find_wav_data(bytes: &[u8]) -> Option<(usize, usize)> {
     let mut pos = 12usize;
     while pos + 8 <= bytes.len() {
         let id = &bytes[pos..pos + 4];
-        let size = u32::from_le_bytes([bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]]) as usize;
+        let size = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
         if id == b"data" {
             let avail = bytes.len() - (pos + 8);
             return Some((pos + 8, size.min(avail)));
         }
         let advance = 8 + size + (size & 1);
-        if advance == 0 { break; }
+        if advance == 0 {
+            break;
+        }
         pos += advance;
     }
     None
@@ -39,6 +46,8 @@ pub(super) fn prepare_audio_for_asr(bytes: Vec<u8>) -> Option<Vec<u8>> {
     } else {
         &bytes[..]
     };
-    if pcm.is_empty() { return None; }
+    if pcm.is_empty() {
+        return None;
+    }
     Some(wrap_pcm_as_wav(pcm, 16000, 1))
 }

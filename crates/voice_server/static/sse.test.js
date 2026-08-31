@@ -4,6 +4,10 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 global.window = {};
+global.fetch = async () => ({
+  ok: true,
+  json: async () => ({ sample_rate: 16000, channels: 1 }),
+});
 require('./sse.js');
 
 function mockResponse(chunks) {

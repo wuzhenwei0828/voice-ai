@@ -115,17 +115,21 @@ impl AsrLiveCfg {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
-            .or_else(|| {
-                self.wav_name
-                    .clone()
-                    .filter(|s| !s.is_empty())
-            })
+            .or_else(|| self.wav_name.clone().filter(|s| !s.is_empty()))
             .unwrap_or_else(|| "default".to_string());
         // sample_rate / channels：前端值（> 0）> 硬编码 fallback
         const FALLBACK_SAMPLE_RATE: u32 = 16000;
         const FALLBACK_CHANNELS: u16 = 1;
-        let sample_rate = if sample_rate > 0 { sample_rate } else { FALLBACK_SAMPLE_RATE };
-        let channels = if channels > 0 { channels } else { FALLBACK_CHANNELS };
+        let sample_rate = if sample_rate > 0 {
+            sample_rate
+        } else {
+            FALLBACK_SAMPLE_RATE
+        };
+        let channels = if channels > 0 {
+            channels
+        } else {
+            FALLBACK_CHANNELS
+        };
         Some(FunasrConfig {
             endpoint: endpoint.to_string(),
             mode: self.mode(),
@@ -393,7 +397,9 @@ mod tests {
             endpoint: Some("   ".into()),
             ..Default::default()
         };
-        let c = cfg.into_client_config(None, 0, 0).expect("blank endpoint 应回落到本地默认");
+        let c = cfg
+            .into_client_config(None, 0, 0)
+            .expect("blank endpoint 应回落到本地默认");
         assert_eq!(c.endpoint, "ws://127.0.0.1:10095/");
     }
 

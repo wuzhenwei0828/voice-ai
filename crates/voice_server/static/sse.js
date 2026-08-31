@@ -75,6 +75,25 @@ window.pcmChunksToWavUrl = function(pcmBytes, sampleRate = 16000, channels = 1) 
   return URL.createObjectURL(blob);
 };
 
+// 调试页使用服务端当前 TTS 模型的实际 PCM 格式，避免写死 16kHz。
+window.ttsAudioFormat = { sampleRate: 16000, channels: 1 };
+window.loadTtsAudioFormat = (async function() {
+  try {
+    const resp = await fetch('/admin/tts/format');
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    if (Number.isFinite(data.sample_rate) && data.sample_rate > 0) {
+      window.ttsAudioFormat.sampleRate = data.sample_rate;
+    }
+    if (Number.isInteger(data.channels) && data.channels > 0) {
+      window.ttsAudioFormat.channels = data.channels;
+    }
+  } catch (e) {
+    console.warn('[tts-format] 加载当前 TTS 音频格式失败，使用默认值:', e);
+  }
+  return window.ttsAudioFormat;
+})();
+
 // base64 字符串 → Uint8Array
 window.base64ToBytes = function(b64) {
   const bin = atob(b64);

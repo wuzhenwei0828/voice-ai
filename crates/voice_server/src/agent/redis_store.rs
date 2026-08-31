@@ -34,11 +34,14 @@ pub struct RedisStore {
 impl RedisStore {
     /// 构造。`url` 例：`redis://127.0.0.1:6379/`。
     /// 启动时会建立 ConnectionManager（一次 ping 验证可达），失败立即返回。
-    pub async fn connect(
-        url: &str,
-        window_size: usize,
-    ) -> anyhow::Result<Self> {
-        Self::connect_with_prefix(url, window_size, DEFAULT_KEY_PREFIX.to_string(), DEFAULT_TTL_SECS).await
+    pub async fn connect(url: &str, window_size: usize) -> anyhow::Result<Self> {
+        Self::connect_with_prefix(
+            url,
+            window_size,
+            DEFAULT_KEY_PREFIX.to_string(),
+            DEFAULT_TTL_SECS,
+        )
+        .await
     }
 
     pub async fn connect_with_prefix(
@@ -179,4 +182,3 @@ impl MemoryStore for RedisStore {
         }
     }
 }
-

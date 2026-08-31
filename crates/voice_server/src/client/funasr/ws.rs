@@ -44,17 +44,29 @@ impl FunasrSession {
     /// 后台 task，每 N 秒向上游 WSS 发 `Message::Ping(Vec::new())`，避免 FunASR 服务端
     /// 被自己的 idle timeout 误杀（参见 `FunasrConfig::keepalive_interval` 注释）。
     pub fn split(self) -> (FunasrSender, FunasrReceiver) {
-        let Self { tx, rx, timeout, wav_name, keepalive_interval } = self;
+        let Self {
+            tx,
+            rx,
+            timeout,
+            wav_name,
+            keepalive_interval,
+        } = self;
         // 共享给用户调用 + keepalive task —— 两者都要拿 `&mut SplitSink`，互斥串行
         let tx = Arc::new(TokioMutex::new(tx));
-        let keepalive_handle = FunasrSender::spawn_keepalive(
-            tx.clone(),
-            keepalive_interval,
-            wav_name.clone(),
-        );
+        let keepalive_handle =
+            FunasrSender::spawn_keepalive(tx.clone(), keepalive_interval, wav_name.clone());
         (
-            FunasrSender { tx, timeout, wav_name: wav_name.clone(), keepalive_handle },
-            FunasrReceiver { rx, timeout, wav_name },
+            FunasrSender {
+                tx,
+                timeout,
+                wav_name: wav_name.clone(),
+                keepalive_handle,
+            },
+            FunasrReceiver {
+                rx,
+                timeout,
+                wav_name,
+            },
         )
     }
 }
@@ -144,8 +156,8 @@ impl FunasrSender {
 
     /// 通知服务端本会话音频已发完：发 `{"is_speaking": false}`
     pub async fn send_finish(&mut self) -> Result<(), ClientError> {
-        let frame = serde_json::to_string(&serde_json::json!({"is_speaking": false}))
-            .expect("static json");
+        let frame =
+            serde_json::to_string(&serde_json::json!({"is_speaking": false})).expect("static json");
         info!(
             target: "voice_server.funasr",
             wav_name = %self.wav_name,

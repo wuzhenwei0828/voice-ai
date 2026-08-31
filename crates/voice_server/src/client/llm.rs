@@ -15,7 +15,7 @@
 use async_stream::stream;
 use async_trait::async_trait;
 use futures_util::{Stream, StreamExt};
-use reqwest::{Client, Method};
+use reqwest::{Client, Method, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -69,7 +69,11 @@ impl HttpLlmClient {
         let api_key = resolved.api_key.clone();
         let headers = resolved.to_header_map();
         let http = Client::builder()
-            .timeout(resolved.timeout())
+            // `timeout` is a total deadline and would terminate a healthy long-lived
+            // SSE response while downstream TTS is still processing earlier text.
+            // Keep the same limit for connection and stalled reads instead.
+            .connect_timeout(resolved.timeout())
+            .read_timeout(resolved.timeout())
             .build()
             .expect("reqwest client builder");
         Self {
@@ -80,6 +84,26 @@ impl HttpLlmClient {
             http,
         }
     }
+}
+
+fn apply_auth_headers(
+    mut req: RequestBuilder,
+    api_key: &str,
+    headers: &reqwest::header::HeaderMap,
+) -> RequestBuilder {
+    for (name, value) in headers {
+        req = req.header(name, value);
+    }
+    // `headers.x-api-key` is authoritative. Keep `api_key` as a compatibility
+    // fallback for deployments that have not moved the value into headers yet.
+    if !headers.contains_key("x-api-key") && !api_key.is_empty() {
+        let key = api_key
+            .strip_prefix("Bearer ")
+            .or_else(|| api_key.strip_prefix("bearer "))
+            .unwrap_or(api_key);
+        req = req.header("x-api-key", key);
+    }
+    req
 }
 
 #[derive(Serialize)]
@@ -151,10 +175,7 @@ impl LlmClient for HttpLlmClient {
         session_id: &str,
         messages: &[ChatMessage],
     ) -> Result<BoxStream<Result<LlmEvent, ClientError>>, ClientError> {
-        let url = format!(
-            "{}/chat/completions",
-            self.api_base.trim_end_matches('/')
-        );
+        let url = format!("{}/chat/completions", self.api_base.trim_end_matches('/'));
 
         let body = ChatReq {
             model: &self.model,
@@ -202,23 +223,12 @@ impl LlmClient for HttpLlmClient {
             ),
         }
 
-        let mut req = self
+        let req = self
             .http
             .request(Method::POST, &url)
             .header("Content-Type", "application/json")
             .json(&body);
-        // 透传 provider/llm 自定义 headers
-        for (k, v) in self.headers.iter() {
-            req = req.header(k, v);
-        }
-        if !self.api_key.is_empty() {
-            let key = self
-                .api_key
-                .strip_prefix("Bearer ")
-                .or_else(|| self.api_key.strip_prefix("bearer "))
-                .unwrap_or(&self.api_key);
-            req = req.header("Authorization", format!("Bearer {}", key));
-        }
+        let req = apply_auth_headers(req, &self.api_key, &self.headers);
 
         let resp = req
             .send()
@@ -386,4 +396,39 @@ pub fn build_llm_client(
     );
 
     Ok(Arc::new(HttpLlmClient::new(resolved, cfg.model.clone())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn llm_auth_uses_x_api_key_without_authorization() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-api-key", "x-key".parse().unwrap());
+        let request = apply_auth_headers(
+            Client::new().post("http://localhost/chat/completions"),
+            "legacy-key",
+            &headers,
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(request.headers().get("x-api-key").unwrap(), "x-key");
+        assert!(request.headers().get("authorization").is_none());
+    }
+
+    #[test]
+    fn llm_api_key_falls_back_to_x_api_key() {
+        let request = apply_auth_headers(
+            Client::new().post("http://localhost/chat/completions"),
+            "Bearer legacy-key",
+            &reqwest::header::HeaderMap::new(),
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(request.headers().get("x-api-key").unwrap(), "legacy-key");
+        assert!(request.headers().get("authorization").is_none());
+    }
 }

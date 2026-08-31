@@ -1,0 +1,1 @@
+export function ConnectionStatus({ state }: { state: string }) { const label = { offline: '未连接', connecting: '连接中', online: '已连接', error: '连接异常' }[state] ?? state; return <span className={`status-dot status-${state}`}><i />{label}</span>; }

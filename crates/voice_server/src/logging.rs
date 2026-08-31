@@ -27,8 +27,8 @@ const SHORT_TIME_FMT: &[BorrowedFormatItem] =
 
 impl FormatTime for ShortLocalTime {
     fn format_time(&self, w: &mut fmt::format::Writer<'_>) -> std::fmt::Result {
-        let now = time::OffsetDateTime::now_local()
-            .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+        let now =
+            time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
         write!(
             w,
             "{}",
@@ -211,9 +211,8 @@ pub fn init_logging(cfg: &LogConfig) -> anyhow::Result<()> {
         let log_path = Path::new(&cfg.file);
         if let Some(parent) = log_path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    anyhow::anyhow!("create log dir {}: {}", parent.display(), e)
-                })?;
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| anyhow::anyhow!("create log dir {}: {}", parent.display(), e))?;
             }
         }
         let file = std::fs::OpenOptions::new()
@@ -228,7 +227,9 @@ pub fn init_logging(cfg: &LogConfig) -> anyhow::Result<()> {
             LogFormat::Json if cfg.also_stdout => tracing::subscriber::set_global_default(
                 fmt::Subscriber::builder()
                     .with_env_filter(env_filter)
-                    .with_writer(TeeWriter { file: Arc::new(Mutex::new(file)) })
+                    .with_writer(TeeWriter {
+                        file: Arc::new(Mutex::new(file)),
+                    })
                     .with_ansi(false)
                     .with_timer(ShortLocalTime)
                     .with_file(cfg.with_location)
@@ -250,7 +251,9 @@ pub fn init_logging(cfg: &LogConfig) -> anyhow::Result<()> {
             LogFormat::Text if cfg.also_stdout => tracing::subscriber::set_global_default(
                 fmt::Subscriber::builder()
                     .with_env_filter(env_filter)
-                    .with_writer(TeeWriter { file: Arc::new(Mutex::new(file)) })
+                    .with_writer(TeeWriter {
+                        file: Arc::new(Mutex::new(file)),
+                    })
                     .with_ansi(false)
                     .with_timer(ShortLocalTime)
                     .with_target(true)

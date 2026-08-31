@@ -120,6 +120,12 @@ pub enum VoicePayload {
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
         is_last: bool,
+        /// 当前音频 chunk 的采样率（Hz）。旧服务端未提供时为 None。
+        #[serde(default)]
+        sample_rate: Option<u32>,
+        /// 当前音频 chunk 的声道数。旧服务端未提供时为 None。
+        #[serde(default)]
+        channels: Option<u8>,
         /// 关联一轮用户请求；旧客户端不带该字段时按 0 处理。
         #[serde(default)]
         request_id: u64,
@@ -344,6 +350,16 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn tts_audio_format_fields_round_trip() {
+        let payload = VoicePayload::TtsAudio {
+            session_id: "s".into(), seq: 1, data: vec![1, 2], is_last: false,
+            sample_rate: Some(24_000), channels: Some(1), request_id: 2,
+        };
+        let (_, decoded) = decode_payload(&encode_indication(&payload).unwrap()).unwrap();
+        match decoded { VoicePayload::TtsAudio { sample_rate, channels, .. } => { assert_eq!(sample_rate, Some(24_000)); assert_eq!(channels, Some(1)); }, _ => panic!("wrong variant") }
     }
 
     #[test]

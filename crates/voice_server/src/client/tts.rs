@@ -1,14 +1,13 @@
 //! TTS 客户端：手搓 reqwest（不走 async-openai）
 //!
 //! ## 为什么不用 async-openai
-//! SDK 的 `Voice` 是 enum（Alloy / Echo / Fable / Onyx / Nova / Shimmer / Sage / Verse），
-//! 不支持 siliconflow 的 `"fnlp/MOSS-TTSD-v0.5:alex"` 之类自定义 voice 字符串；
-//! SDK 的 `post_raw` 是 `pub(crate)` 没法绕过。手搓以传任意 voice 字符串。
+//! vLLM-Omni 扩展了 OpenAI TTS 请求字段，且 voice 名称由加载的模型决定；
+//! 手搓 reqwest 可以透传这些字段和任意模型 voice 名称。
 //!
 //! ## Wire format
 //! 请求：JSON `{input, model, voice, response_format, stream?}`（OpenAI-compat）
 //! 响应：可能是
-//!   - SSE（`content-type: text/event-stream`），每条 `data: {"data":"<base64>","finish_reason":null|"stop"}`
+//!   - SSE（`content-type: text/event-stream`），OpenAI `speech.audio.*` 事件
 //!   - 单段二进制音频（`content-type: audio/...`），siliconflow 当前即使发 `stream: true` 也走这种
 //! 按 content-type 自动分支。
 
@@ -16,7 +15,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use futures_util::StreamExt;
 use reqwest::header::HeaderMap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
@@ -24,6 +23,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::client::error::{parse_openai_error, ClientError};
+use crate::client::tts_ws::{TtsWsClient, TtsWsConfig};
 use crate::config::{ProviderConfig, TtsConfig};
 use crate::events::TtsEvent;
 
@@ -32,6 +32,18 @@ pub type ArcTts = Arc<dyn TtsClient>;
 
 #[async_trait]
 pub trait TtsClient: Send + Sync {
+    fn output_format(&self) -> (Option<u32>, u8) { (None, 1) }
+
+    /// 列出当前 TTS provider 已加载的音色。
+    ///
+    /// 只有 HTTP provider 支持 `/v1/audio/voices`；其他实现返回错误，让调用方
+    /// 回退到本地兼容列表。
+    async fn list_voices(&self) -> Result<Vec<String>, ClientError> {
+        Err(ClientError::Config(
+            "this TTS transport does not support listing voices".to_string(),
+        ))
+    }
+
     /// 合成一段文本到音频流。
     ///
     /// `sample_rate_override`：端侧（浏览器）SessionStart 上报的 TTS 输出采样率。
@@ -62,23 +74,31 @@ pub struct HttpTtsClient {
     path: String,
     api_key: Option<String>, // None = 不发 Authorization
     model: String,
-    /// 配置默认音色的**短名**（如 `"alex"`，必须命中 [`SUPPORTED_VOICES`]）。
-    /// 发请求时由 [`SUPPORTED_VOICES`] 表里对应条目的 [`VoiceEntry::wire_voice`] 给出完整 voice 字符串。
+    /// 配置默认音色名称（由模型决定，例如 `vivian`）。
     voice_short: String,
     response_format: String,
     stream: bool,
     /// 输出采样率（Hz）。None = 不在请求里发 `sample_rate`，由 provider 自行决定。
     sample_rate: Option<u32>,
+    channels: u8,
+    speed: Option<f32>,
+    task_type: Option<String>,
+    language: Option<String>,
+    instructions: Option<String>,
+    max_new_tokens: Option<u32>,
+    initial_codec_chunk_frames: Option<u32>,
+    non_streaming_mode: Option<bool>,
+    stream_format: Option<String>,
+    ref_audio: Option<String>,
+    ref_text: Option<String>,
+    x_vector_only_mode: Option<bool>,
     extra_headers: HeaderMap,
     timeout: Duration,
     client: reqwest::Client,
 }
 
 impl HttpTtsClient {
-    /// 用配置里的默认音色短名构造 HttpTtsClient。
-    ///
-    /// 构造期就校验 `voice_short` 是否在 [`SUPPORTED_VOICES`] 白名单里 —— 启动失败时
-    /// 就崩，不留到运行时才发现 yaml 配错。
+    /// 用配置里的默认音色构造 HttpTtsClient。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         base_url: String,
@@ -89,19 +109,27 @@ impl HttpTtsClient {
         response_format: String,
         stream: bool,
         sample_rate: Option<u32>,
+        channels: u8,
+        speed: Option<f32>,
+        task_type: Option<String>,
+        language: Option<String>,
+        instructions: Option<String>,
+        max_new_tokens: Option<u32>,
+        initial_codec_chunk_frames: Option<u32>,
+        non_streaming_mode: Option<bool>,
+        stream_format: Option<String>,
+        ref_audio: Option<String>,
+        ref_text: Option<String>,
+        x_vector_only_mode: Option<bool>,
         extra_headers: HeaderMap,
         timeout: Duration,
     ) -> anyhow::Result<Self> {
-        if !is_supported_voice(&voice_short) {
-            anyhow::bail!(
-                "TTS 默认音色 '{}' 不在白名单 {:?} 中；请修改 yaml tts.voice",
-                voice_short,
-                supported_voice_shorts()
-            );
-        }
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()?;
+        let voice_short = if voice_short.is_empty() {
+            "vivian".to_string()
+        } else {
+            voice_short
+        };
+        let client = reqwest::Client::builder().timeout(timeout).build()?;
         Ok(Self {
             base_url,
             path,
@@ -111,6 +139,18 @@ impl HttpTtsClient {
             response_format,
             stream,
             sample_rate,
+            channels,
+            speed,
+            task_type,
+            language,
+            instructions,
+            max_new_tokens,
+            initial_codec_chunk_frames,
+            non_streaming_mode,
+            stream_format,
+            ref_audio,
+            ref_text,
+            x_vector_only_mode,
             extra_headers,
             timeout,
             client,
@@ -123,18 +163,205 @@ impl HttpTtsClient {
     // 调整 / 加音色都只需要改 [`SUPPORTED_VOICES`] 一处，不需要改拼接逻辑。
 }
 
-#[derive(Deserialize)]
-struct TtsStreamChunk {
+#[derive(Debug, Serialize)]
+pub(crate) struct TtsRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) input: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) voice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) response_format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) speed: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) task_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) max_new_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) initial_codec_chunk_frames: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) non_streaming_mode: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) stream_format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ref_audio: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ref_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) x_vector_only_mode: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) sample_rate: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpeechAudioError {
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpeechAudioEnvelope {
+    #[serde(default)]
+    audio: Option<String>,
+    #[serde(default)]
+    error: Option<SpeechAudioError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VoiceListResponse {
+    #[serde(default)]
+    voices: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyTtsStreamChunk {
     #[serde(default)]
     data: Option<String>,
     #[serde(default)]
     finish_reason: Option<String>,
 }
 
+fn parse_speech_audio_event(
+    event: &str,
+    payload: &[u8],
+    seq: &mut u32,
+) -> Option<Result<TtsEvent, ClientError>> {
+    let parsed: SpeechAudioEnvelope = match serde_json::from_slice(payload) {
+        Ok(value) => value,
+        Err(e) => {
+            return Some(Err(ClientError::Decode(format!(
+                "invalid TTS SSE payload: {e}"
+            ))))
+        }
+    };
+    match event {
+        "speech.audio.delta" => {
+            let bytes = match base64::engine::general_purpose::STANDARD
+                .decode(parsed.audio.unwrap_or_default())
+            {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return Some(Err(ClientError::Decode(format!(
+                        "invalid TTS audio base64: {e}"
+                    ))))
+                }
+            };
+            if bytes.is_empty() {
+                return None;
+            }
+            *seq += 1;
+            Some(Ok(TtsEvent {
+                seq: *seq,
+                data: bytes,
+                is_last: false,
+            }))
+        }
+        "speech.audio.done" => Some(Ok(TtsEvent {
+            seq: *seq + 1,
+            data: Vec::new(),
+            is_last: true,
+        })),
+        "speech.audio.error" => Some(Err(ClientError::Decode(
+            parsed
+                .error
+                .and_then(|e| e.message)
+                .unwrap_or_else(|| "TTS generation failed".into()),
+        ))),
+        _ if event.is_empty() => {
+            let legacy: LegacyTtsStreamChunk = serde_json::from_slice(payload).ok()?;
+            let audio = legacy.data.unwrap_or_default();
+            if audio.is_empty() {
+                return None;
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(audio)
+                .ok()?;
+            if bytes.is_empty() {
+                return None;
+            }
+            *seq += 1;
+            Some(Ok(TtsEvent {
+                seq: *seq,
+                data: bytes,
+                is_last: legacy.finish_reason.is_some(),
+            }))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+fn parse_vllm_sse_stream(input: &[u8]) -> BoxStream<Result<TtsEvent, ClientError>> {
+    let owned = input.to_vec();
+    let stream = async_stream::stream! {
+        let mut event = String::new();
+        let mut seq = 0;
+        for line in owned.split(|b| *b == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.starts_with(b"event: ") { event = String::from_utf8_lossy(&line[7..]).into_owned(); }
+            else if line.starts_with(b"data: ") {
+                if let Some(result) = parse_speech_audio_event(&event, &line[6..], &mut seq) { yield result; }
+            }
+        }
+    };
+    Box::pin(stream)
+}
+
 #[async_trait]
 impl TtsClient for HttpTtsClient {
+    fn output_format(&self) -> (Option<u32>, u8) { (self.sample_rate, self.channels) }
+
     fn default_voice_short(&self) -> &str {
         &self.voice_short
+    }
+
+    async fn list_voices(&self) -> Result<Vec<String>, ClientError> {
+        let url = format!("{}/audio/voices", self.base_url.trim_end_matches('/'));
+        let mut req = self.client.get(&url);
+        if let Some(key) = &self.api_key {
+            let authorization = if key.starts_with("Bearer ") || key.starts_with("bearer ") {
+                key.clone()
+            } else {
+                format!("Bearer {key}")
+            };
+            req = req.header("Authorization", authorization);
+        }
+        for (name, value) in &self.extra_headers {
+            req = req.header(name, value);
+        }
+
+        let response = req.send().await.map_err(|error| {
+            warn!(
+                target: "voice_server.tts.err",
+                url = %url,
+                error = %error,
+                "TTS 音色列表请求失败"
+            );
+            ClientError::Http(error.to_string())
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            if let Some(error) = parse_openai_error(&body) {
+                return Err(ClientError::Api {
+                    status: status.as_u16(),
+                    error,
+                });
+            }
+            return Err(ClientError::Status(status.as_u16()));
+        }
+
+        let response: VoiceListResponse = response.json().await.map_err(|error| {
+            ClientError::Decode(format!("invalid TTS voice list response: {error}"))
+        })?;
+        Ok(response.voices)
     }
 
     async fn synthesize(
@@ -152,22 +379,9 @@ impl TtsClient for HttpTtsClient {
         // 配置 fallback 已在 build_tts_client 时校验过，这里不重复）。
         validate_sample_rate_override(sample_rate_override, &self.response_format)?;
 
-        // ===== 解析 effective voice（短名 → 查 SUPPORTED_VOICES 取 entry.wire_voice）=====
-        // 优先级：端侧 override 短名 > 配置默认短名
+        // Voice values are model-specific in vLLM-Omni (for example "vivian").
         let effective_voice_short = voice_override.as_deref().unwrap_or(&self.voice_short);
-        // 查表：配置 fallback 已在 HttpTtsClient::new 时校验过（构造期 bail），
-        // 所以这里 None 只可能是端侧 override 不在白名单
-        let entry = match lookup_voice(effective_voice_short) {
-            Some(e) => e,
-            None => {
-                return Err(ClientError::Config(format!(
-                    "TTS voice '{}' 不在白名单 {:?} 中",
-                    effective_voice_short,
-                    supported_voice_shorts()
-                )));
-            }
-        };
-        let effective_voice = entry.wire_voice;
+        let effective_voice = effective_voice_short;
 
         let url = if self.path.is_empty() {
             self.base_url.clone()
@@ -175,34 +389,48 @@ impl TtsClient for HttpTtsClient {
             format!("{}{}", self.base_url, self.path)
         };
 
-        #[derive(serde::Serialize)]
-        struct Req<'a> {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            input: Option<&'a str>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            model: Option<String>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            voice: Option<String>,
-            #[serde(skip_serializing_if = "Option::is_none", rename = "response_format")]
-            response_format: Option<String>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            stream: Option<bool>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            sample_rate: Option<u32>,
-        }
-        let body = Req {
+        let body = TtsRequest {
             input: Some(text),
-            model: if self.model.is_empty() { None } else { Some(self.model.clone()) },
-            voice: if effective_voice.is_empty() { None } else { Some(effective_voice.to_string()) },
-            response_format: if self.response_format.is_empty() {
+            model: if self.model.is_empty() {
                 None
             } else {
-                Some(self.response_format.clone())
+                Some(self.model.clone())
             },
-            stream: if self.stream { Some(true) } else { None },
+            voice: if effective_voice.is_empty() {
+                None
+            } else {
+                Some(effective_voice.to_string())
+            },
+            response_format: Some(if self.response_format.is_empty() {
+                "wav".into()
+            } else {
+                self.response_format.clone()
+            }),
+            speed: Some(self.speed.unwrap_or(1.0)),
+            task_type: Some(
+                self.task_type
+                    .clone()
+                    .unwrap_or_else(|| "CustomVoice".into()),
+            ),
+            language: Some(self.language.clone().unwrap_or_else(|| "Auto".into())),
+            instructions: self.instructions.clone().or_else(|| Some(String::new())),
+            max_new_tokens: Some(self.max_new_tokens.unwrap_or(2048)),
+            initial_codec_chunk_frames: self.initial_codec_chunk_frames,
+            non_streaming_mode: self.non_streaming_mode,
+            stream: if self.stream || matches!(self.stream_format.as_deref(), Some("sse" | "audio"))
+            {
+                Some(true)
+            } else {
+                None
+            },
+            stream_format: self.stream_format.clone(),
+            ref_audio: self.ref_audio.clone(),
+            ref_text: self.ref_text.clone(),
+            x_vector_only_mode: self.x_vector_only_mode,
             sample_rate: effective_sample_rate,
         };
-        let mut req = self.client
+        let mut req = self
+            .client
             .request(reqwest::Method::POST, &url)
             .header("x-session-id", session_id)
             .json(&body);
@@ -301,13 +529,7 @@ impl TtsClient for HttpTtsClient {
             let headers_dump: String = resp
                 .headers()
                 .iter()
-                .map(|(k, v)| {
-                    format!(
-                        "{}: {}",
-                        k,
-                        v.to_str().unwrap_or("<binary>")
-                    )
-                })
+                .map(|(k, v)| format!("{}: {}", k, v.to_str().unwrap_or("<binary>")))
                 .collect::<Vec<_>>()
                 .join(" | ");
             // 抓 body 一次：既要写日志（截断预览），又要尝试解析 OpenAI 信封
@@ -362,12 +584,12 @@ impl TtsClient for HttpTtsClient {
         let is_sse = ct.contains("text/event-stream") || ct.contains("application/x-ndjson");
 
         if is_sse {
-            // 流式：每条 data: {"data":"<base64>","finish_reason":null|"stop"}
-            // 内联迷你 SSE 解析器（仅服务于 TTS，不抽公共模块）
+            // vLLM-Omni emits OpenAI speech.audio.* SSE events.
             let mut sse_buf: Vec<u8> = Vec::new();
             let mut byte_stream = Box::pin(resp.bytes_stream());
             let stream = async_stream::stream! {
                 let mut seq: u32 = 0;
+                let mut event_name = String::new();
                 while let Some(chunk_res) = byte_stream.next().await {
                     let chunk = match chunk_res {
                         Ok(c) => c,
@@ -378,21 +600,15 @@ impl TtsClient for HttpTtsClient {
                         let line: Vec<u8> = sse_buf.drain(..=pos).collect();
                         let line = &line[..line.len() - 1];
                         let line = if line.last() == Some(&b'\r') { &line[..line.len()-1] } else { line };
-                        if line.starts_with(b"data: ") {
+                        if line.starts_with(b"event: ") {
+                            event_name = String::from_utf8_lossy(&line[7..]).into_owned();
+                        } else if line.starts_with(b"data: ") {
                             let payload = &line[6..];
                             if payload == b"[DONE]" || payload.is_empty() { continue; }
-                            let parsed: serde_json::Result<TtsStreamChunk> = serde_json::from_slice(payload);
-                            if let Ok(chunk) = parsed {
-                                let b64 = chunk.data.unwrap_or_default();
-                                if b64.is_empty() { continue; }
-                                let bytes = base64::engine::general_purpose::STANDARD
-                                    .decode(&b64)
-                                    .unwrap_or_default();
-                                if bytes.is_empty() { continue; }
-                                seq += 1;
-                                let is_last = chunk.finish_reason.is_some();
-                                yield Ok(TtsEvent { seq, data: bytes, is_last });
-                                if is_last { break; }
+                            if let Some(result) = parse_speech_audio_event(&event_name, payload, &mut seq) {
+                                let terminal = result.as_ref().map(|e| e.is_last).unwrap_or(true);
+                                yield result;
+                                if terminal { break; }
                             }
                         }
                     }
@@ -424,13 +640,55 @@ pub fn build_tts_client(
     provider: Option<&ProviderConfig>,
 ) -> anyhow::Result<Arc<dyn TtsClient>> {
     let (resolved, path) = cfg.resolved(provider);
+    let timeout = resolved.timeout();
+    if cfg.transport_kind() == "websocket" {
+        let model_format = cfg.model_format();
+        let endpoint = cfg.resolved_endpoint(provider);
+        let ws_cfg = TtsWsConfig {
+            endpoint,
+            api_key: (!resolved.api_key.is_empty()).then_some(resolved.api_key),
+            voice: (!cfg.voice.is_empty()).then_some(cfg.voice.clone()),
+            task_type: cfg.task_type.clone(),
+            language: cfg.language.clone(),
+            instructions: cfg.instructions.clone(),
+            response_format: if cfg.response_format.is_empty() {
+                "pcm".into()
+            } else {
+                cfg.response_format.clone()
+            },
+            sample_rate: model_format.sample_rate,
+            channels: model_format.channels,
+            speed: cfg.speed,
+            ref_audio: cfg.ref_audio.clone(),
+            ref_text: cfg.ref_text.clone(),
+            max_new_tokens: cfg.max_new_tokens,
+            stream_audio: cfg.stream_format.as_deref() == Some("audio"),
+            extra_headers: cfg
+                .headers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            timeout,
+        };
+        info!(
+            target: "voice_server.factory",
+            kind = "websocket",
+            endpoint = %ws_cfg.endpoint,
+            model = %cfg.model,
+            voice = %cfg.voice,
+            response_format = %ws_cfg.response_format,
+            stream_audio = ws_cfg.stream_audio,
+            "构造 TTS WebSocket 客户端"
+        );
+        return Ok(Arc::new(TtsWsClient::new(ws_cfg)));
+    }
     let base_url = resolved.api_base.clone();
     let api_key = resolved.api_key.clone();
-    let timeout = resolved.timeout();
     let headers = resolved.to_header_map();
+    let model_format = cfg.model_format();
 
     // 校验 sample_rate 与 response_format 的兼容性（如果用户显式给了 sample_rate）
-    if let Some(sr) = cfg.sample_rate {
+    if let Some(sr) = model_format.sample_rate {
         if cfg.response_format.is_empty() {
             tracing::warn!(
                 target: "voice_server.factory",
@@ -462,9 +720,9 @@ pub fn build_tts_client(
         path = %path,
         model = %cfg.model,
         voice_short = %cfg.voice,
-        full_voice_default = %lookup_voice(&cfg.voice).map(|e| e.wire_voice).unwrap_or(""),
+        default_voice = %cfg.voice,
         response_format = %cfg.response_format,
-        sample_rate = ?cfg.sample_rate,
+        sample_rate = ?model_format.sample_rate,
         "构造 HttpTtsClient"
     );
 
@@ -476,7 +734,19 @@ pub fn build_tts_client(
         cfg.voice.clone(),
         cfg.response_format.clone(),
         cfg.stream,
-        cfg.sample_rate,
+        model_format.sample_rate,
+        model_format.channels,
+        cfg.speed,
+        cfg.task_type.clone(),
+        cfg.language.clone(),
+        cfg.instructions.clone(),
+        cfg.max_new_tokens,
+        cfg.initial_codec_chunk_frames,
+        cfg.non_streaming_mode,
+        cfg.stream_format.clone(),
+        cfg.ref_audio.clone(),
+        cfg.ref_text.clone(),
+        cfg.x_vector_only_mode,
         headers,
         timeout,
     )?))
@@ -535,43 +805,129 @@ pub struct VoiceEntry {
 /// `LazyLock` 里一次性 build，启动后只读；外部可直接 `SUPPORTED_VOICES.get("alex")`。
 ///
 /// 改这张表时，记得同步检查 `config.rs::TtsConfig.voice` 默认值仍是合法 short。
-pub static SUPPORTED_VOICES: LazyLock<HashMap<&'static str, VoiceEntry>> =
-    LazyLock::new(|| {
-        HashMap::from([
-            (
-                "alex",
-                VoiceEntry { short: "alex", wire_voice: "fnlp/MOSS-TTSD-v0.5:alex" },
-            ),
-            (
-                "anna",
-                VoiceEntry { short: "anna", wire_voice: "fnlp/MOSS-TTSD-v0.5:anna" },
-            ),
-            (
-                "bella",
-                VoiceEntry { short: "bella", wire_voice: "fnlp/MOSS-TTSD-v0.5:bella" },
-            ),
-            (
-                "benjamin",
-                VoiceEntry { short: "benjamin", wire_voice: "fnlp/MOSS-TTSD-v0.5:benjamin" },
-            ),
-            (
-                "charles",
-                VoiceEntry { short: "charles", wire_voice: "fnlp/MOSS-TTSD-v0.5:charles" },
-            ),
-            (
-                "claire",
-                VoiceEntry { short: "claire", wire_voice: "fnlp/MOSS-TTSD-v0.5:claire" },
-            ),
-            (
-                "david",
-                VoiceEntry { short: "david", wire_voice: "fnlp/MOSS-TTSD-v0.5:david" },
-            ),
-            (
-                "diana",
-                VoiceEntry { short: "diana", wire_voice: "fnlp/MOSS-TTSD-v0.5:diana" },
-            ),
-        ])
-    });
+pub static SUPPORTED_VOICES: LazyLock<HashMap<&'static str, VoiceEntry>> = LazyLock::new(|| {
+    HashMap::from([
+        (
+            "alex",
+            VoiceEntry {
+                short: "alex",
+                wire_voice: "fnlp/MOSS-TTSD-v0.5:alex",
+            },
+        ),
+        (
+            "anna",
+            VoiceEntry {
+                short: "anna",
+                wire_voice: "fnlp/MOSS-TTSD-v0.5:anna",
+            },
+        ),
+        (
+            "bella",
+            VoiceEntry {
+                short: "bella",
+                wire_voice: "fnlp/MOSS-TTSD-v0.5:bella",
+            },
+        ),
+        (
+            "benjamin",
+            VoiceEntry {
+                short: "benjamin",
+                wire_voice: "fnlp/MOSS-TTSD-v0.5:benjamin",
+            },
+        ),
+        (
+            "charles",
+            VoiceEntry {
+                short: "charles",
+                wire_voice: "fnlp/MOSS-TTSD-v0.5:charles",
+            },
+        ),
+        (
+            "claire",
+            VoiceEntry {
+                short: "claire",
+                wire_voice: "fnlp/MOSS-TTSD-v0.5:claire",
+            },
+        ),
+        (
+            "david",
+            VoiceEntry {
+                short: "david",
+                wire_voice: "fnlp/MOSS-TTSD-v0.5:david",
+            },
+        ),
+        (
+            "diana",
+            VoiceEntry {
+                short: "diana",
+                wire_voice: "fnlp/MOSS-TTSD-v0.5:diana",
+            },
+        ),
+        (
+            "aiden",
+            VoiceEntry {
+                short: "aiden",
+                wire_voice: "aiden",
+            },
+        ),
+        (
+            "dylan",
+            VoiceEntry {
+                short: "dylan",
+                wire_voice: "dylan",
+            },
+        ),
+        (
+            "eric",
+            VoiceEntry {
+                short: "eric",
+                wire_voice: "eric",
+            },
+        ),
+        (
+            "ono_anna",
+            VoiceEntry {
+                short: "ono_anna",
+                wire_voice: "ono_anna",
+            },
+        ),
+        (
+            "ryan",
+            VoiceEntry {
+                short: "ryan",
+                wire_voice: "ryan",
+            },
+        ),
+        (
+            "serena",
+            VoiceEntry {
+                short: "serena",
+                wire_voice: "serena",
+            },
+        ),
+        (
+            "sohee",
+            VoiceEntry {
+                short: "sohee",
+                wire_voice: "sohee",
+            },
+        ),
+        (
+            "uncle_fu",
+            VoiceEntry {
+                short: "uncle_fu",
+                wire_voice: "uncle_fu",
+            },
+        ),
+        (
+            "vivian",
+            VoiceEntry {
+                short: "vivian",
+                wire_voice: "vivian",
+            },
+        ),
+    ])
+});
 
 /// 校验短名是否在 [`SUPPORTED_VOICES`] 白名单里。大小写敏感 —— 短名都是小写。
 pub fn is_supported_voice(short_name: &str) -> bool {
@@ -623,6 +979,23 @@ pub fn validate_sample_rate_override(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
+
+    #[test]
+    fn tts_transport_info_resolves_http_and_websocket_endpoints() {
+        let mut cfg = TtsConfig::default();
+        cfg.api_base = "http://127.0.0.1:8091/v1".into();
+
+        assert_eq!(cfg.transport_kind(), "http");
+        assert_eq!(cfg.resolved_endpoint(None), "http://127.0.0.1:8091/v1/audio/speech");
+
+        cfg.transport = "websocket".into();
+        assert_eq!(cfg.transport_kind(), "websocket");
+        assert_eq!(
+            cfg.resolved_endpoint(None),
+            "ws://127.0.0.1:8091/v1/audio/speech/stream"
+        );
+    }
 
     #[test]
     fn supported_sample_rates_opus() {
@@ -745,25 +1118,16 @@ mod tests {
     }
 
     #[test]
-    fn build_tts_client_rejects_voice_not_in_whitelist() {
-        // 默认音色短名不在 SUPPORTED_VOICES 白名单里 → 构造期 bail
+    fn build_tts_client_accepts_model_specific_voice() {
+        // vLLM-Omni voice names are model-specific and may not be in the legacy map.
         let mut cfg = TtsConfig::default();
         cfg.api_base = "http://127.0.0.1:0".to_string();
         cfg.model = "m".to_string();
         cfg.voice = "snake_oil".to_string(); // 不在白名单
         cfg.response_format = "pcm".to_string();
 
-        match build_tts_client(&cfg, None) {
-            Err(e) => {
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("snake_oil") && msg.contains("白名单"),
-                    "expected error to mention the bad voice and the whitelist; got: {}",
-                    msg
-                );
-            }
-            Ok(_) => panic!("expected build_tts_client to reject non-whitelist voice"),
-        }
+        let client = build_tts_client(&cfg, None).expect("model-specific voice should be accepted");
+        assert_eq!(client.default_voice_short(), "snake_oil");
     }
 
     // ===== validate_sample_rate_override（端侧 override 的请求期校验）=====
@@ -829,7 +1193,8 @@ mod tests {
     fn supported_voices_matches_doc_list() {
         // 与用户提供的图片一致：alex / anna / bella / benjamin / charles / claire / david / diana
         let expected = vec![
-            "alex", "anna", "bella", "benjamin", "charles", "claire", "david", "diana",
+            "aiden", "alex", "anna", "bella", "benjamin", "charles", "claire", "david", "diana",
+            "dylan", "eric", "ono_anna", "ryan", "serena", "sohee", "uncle_fu", "vivian",
         ];
         let actual = supported_voice_shorts();
         assert_eq!(actual, expected);
@@ -880,5 +1245,68 @@ mod tests {
         assert!(!is_supported_voice("alex "));
         assert!(!is_supported_voice("snake_oil"));
         assert!(!is_supported_voice("FunAudioLLM/CosyVoice2-0.5B:alex")); // 全名不是短名
+    }
+
+    #[test]
+    fn vllm_omni_request_serializes_extension_fields() {
+        let req = TtsRequest {
+            input: Some("hello"),
+            model: Some("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice".into()),
+            voice: Some("vivian".into()),
+            response_format: Some("pcm".into()),
+            speed: Some(1.25),
+            task_type: Some("CustomVoice".into()),
+            language: Some("English".into()),
+            instructions: Some("warm".into()),
+            max_new_tokens: Some(128),
+            initial_codec_chunk_frames: Some(1),
+            non_streaming_mode: Some(false),
+            stream: Some(true),
+            stream_format: Some("sse".into()),
+            ref_audio: Some("https://example.test/ref.wav".into()),
+            ref_text: Some("reference".into()),
+            x_vector_only_mode: Some(true),
+            sample_rate: None,
+        };
+        let value = serde_json::to_value(req).expect("request should serialize");
+        assert_eq!(value["voice"], "vivian");
+        assert_eq!(value["task_type"], "CustomVoice");
+        assert_eq!(value["stream_format"], "sse");
+        assert_eq!(value["initial_codec_chunk_frames"], 1);
+        assert_eq!(value["x_vector_only_mode"], true);
+    }
+
+    #[tokio::test]
+    async fn parses_vllm_speech_audio_sse_events() {
+        let input = concat!(
+            "event: speech.audio.delta\n",
+            "data: {\"type\":\"speech.audio.delta\",\"audio\":\"AQI=\",\"response_format\":\"pcm\"}\n\n",
+            "event: speech.audio.done\n",
+            "data: {\"type\":\"speech.audio.done\",\"usage\":{\"input_tokens\":1}}\n\n"
+        );
+        let mut stream = parse_vllm_sse_stream(input.as_bytes());
+        let first = stream
+            .next()
+            .await
+            .expect("delta event")
+            .expect("valid delta");
+        assert_eq!(first.data, vec![1, 2]);
+        assert!(!first.is_last);
+        let done = stream
+            .next()
+            .await
+            .expect("done event")
+            .expect("valid done");
+        assert!(done.data.is_empty());
+        assert!(done.is_last);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn parses_vllm_speech_audio_error_event() {
+        let input = "event: speech.audio.error\ndata: {\"type\":\"speech.audio.error\",\"error\":{\"message\":\"boom\"}}\n\n";
+        let mut stream = parse_vllm_sse_stream(input.as_bytes());
+        let err = stream.next().await.expect("error event").unwrap_err();
+        assert!(err.to_string().contains("boom"));
     }
 }

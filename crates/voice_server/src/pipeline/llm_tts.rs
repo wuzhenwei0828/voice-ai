@@ -8,15 +8,25 @@
 //!
 //! 错误流：阶段内出错时 yield 一条 [`LlmTtsItem::Failed`] 后立即 return（HTTP 200 已发，
 //! 不能改 status，靠 error code 1001~1005 区分）。
+//!
+//! 阅读主流程时可以把它看成一个“边生成、边播放”的转换器：
+//! 1. LLM 持续产出文本 delta；
+//! 2. delta 先放入 `sentence_buf`，切出完整句后清洗并按需合并，再送 TTS；
+//! 3. TTS 的 PCM chunk 经过句间 crossfade 后统一编号并向下游发送；
+//! 4. LLM 结束后再冲刷残余文本，最后发送一个空音频结束标记。
 
 use async_stream::stream;
 use futures_util::{Stream, StreamExt};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::client::{ArcLlm, ArcTts};
+use crate::client::{ArcLlm, ArcTts, ClientError};
+use crate::events::LlmEvent;
 
 use super::crossfade::SentenceCrossfader;
 use super::sentence::next_sentence_end;
+use super::text::{to_tts_text, TtsSentenceBuffer};
 
 /// `llm_tts_items()` 的输出事件，由各消费方映射成自己的 wire 格式
 /// （SSE data event / WS VoicePayload）。`Failed` 是终端事件（产出后流即结束）。
@@ -27,15 +37,96 @@ pub enum LlmTtsItem {
     /// LLM 文本 delta（/admin/llm_tts 不透出，/admin/asr_llm_tts 与 WS 侧透出）
     Llm { delta: String, is_final: bool },
     /// TTS 音频 chunk（audio 为 base64）；最后一条 audio 为空、is_last=true，是结束标记
-    Tts { seq: u32, audio: String, is_last: bool },
+    Tts {
+        seq: u32,
+        audio: String,
+        is_last: bool,
+    },
     /// 管线失败
     Failed { error: String, code: u16 },
+}
+
+// Large enough to absorb a normal complete response while one sentence is being
+// synthesized, while still putting a hard bound on per-request memory use.
+const LLM_EVENT_CHANNEL_CAPACITY: usize = 1024;
+
+enum LlmReaderItem {
+    Event(LlmEvent),
+    CallFailed(ClientError),
+    StreamFailed(ClientError),
+}
+
+/// Cancels the producer when the outer HTTP/WS response stream is dropped.
+struct LlmReaderGuard(CancellationToken);
+
+impl Drop for LlmReaderGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// Drain the LLM HTTP stream independently from TTS work. Without this task,
+/// a slow sentence synthesis pauses `bytes_stream()` and can make a healthy
+/// SSE request exceed a client timeout.
+fn spawn_llm_reader(
+    llm: ArcLlm,
+    sid: String,
+    prompt: String,
+    emotion_hint: Option<String>,
+) -> (mpsc::Receiver<LlmReaderItem>, LlmReaderGuard) {
+    let (tx, rx) = mpsc::channel(LLM_EVENT_CHANNEL_CAPACITY);
+    let cancel = CancellationToken::new();
+    let reader_cancel = cancel.clone();
+
+    tokio::spawn(async move {
+        let stream = tokio::select! {
+            result = llm.chat(&sid, &prompt, emotion_hint.as_deref()) => result,
+            () = reader_cancel.cancelled() => return,
+        };
+        let mut stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                let _ = tokio::select! {
+                    () = reader_cancel.cancelled() => return,
+                    result = tx.send(LlmReaderItem::CallFailed(error)) => result,
+                };
+                return;
+            }
+        };
+
+        loop {
+            let item = tokio::select! {
+                () = reader_cancel.cancelled() => return,
+                item = stream.next() => item,
+            };
+            let Some(item) = item else { return };
+
+            let is_final = item.as_ref().map(|event| event.is_final).unwrap_or(true);
+            let item = match item {
+                Ok(event) => LlmReaderItem::Event(event),
+                Err(error) => LlmReaderItem::StreamFailed(error),
+            };
+            let sent = tokio::select! {
+                () = reader_cancel.cancelled() => return,
+                result = tx.send(item) => result,
+            };
+            if sent.is_err() || is_final {
+                return;
+            }
+        }
+    });
+
+    (rx, LlmReaderGuard(cancel))
 }
 
 /// 把 llm + sentence-split + tts 三个阶段串成一条事件流，
 /// 供 /admin/llm_tts、/admin/asr_llm_tts 与 session.rs 的 WS pipeline 共用
 /// （后两者额外透出 Llm 文本事件）。
 /// 接受 Arc 而非 &Arc 是因为 actix-web 的 streaming() 要求 `Stream + 'static`，Arc 便宜 clone。
+///
+/// 返回的是惰性 Stream：调用本函数只会构造流水线，真正的网络请求和音频处理发生在
+/// 消费方不断调用 `next().await` 时。事件顺序固定为 LLM 文本事件、若干 TTS 音频事件，
+/// 最后是一个 `is_last=true` 的空音频事件；任一阶段失败则改为发送 `Failed` 并结束。
 ///
 /// `emotion_hint`：从 ASR 文本里解析出的情绪与事件参考（参见
 /// `crate::utils::postprocess_utils::parse_asr_text`），作为 system message 传给 LLM。
@@ -60,21 +151,22 @@ pub fn llm_tts_items(
     voice_override: Option<String>,
 ) -> impl Stream<Item = LlmTtsItem> + 'static {
     stream! {
-        // 阶段 1: 拉 LLM 流
-        let mut llm_stream = match llm.chat(&sid, &prompt, emotion_hint.as_deref()).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(target: "voice_server.pipeline", stage = "llm_call", session_id = %sid, "LLM 调用失败: {}", e);
-                yield LlmTtsItem::Failed { error: format!("llm error: {}", e), code: 1002 };
-                return;
-            }
-        };
+        // 阶段 1：后台持续读取 LLM SSE。TTS 可以慢，但不能因此暂停 HTTP body 的
+        // 消费，否则一个健康的长回复会被误判为超时。
+        let (mut llm_rx, _llm_reader_guard) = spawn_llm_reader(llm, sid.clone(), prompt, emotion_hint);
 
+        // `sentence_buf` 保存尚未形成完整句子的尾巴。例如 LLM 先后返回“你好”和“，
+        // 今天好吗？”，第一次 delta 不能合成，第二次到达后才能切出完整句子。
         let mut sentence_buf = String::new();
+        // seq 必须跨句递增，不能每句从 1 开始，否则前端无法按顺序拼接音频。
         let mut global_seq: u32 = 0;
+        // crossfader 暂存每句首尾少量 PCM，让相邻句子衔接自然；它只处理音频，不改变
+        // 事件协议，因此外层消费者无需知道淡化细节。
         let mut fader = SentenceCrossfader::default();
+        let mut short_sentence_buf = TtsSentenceBuffer::default();
 
-        // 把一段 PCM 包成 Tts 事件（空则跳过）
+        // 把一段 PCM 转成统一的 Tts 事件。TTS 可能返回空 chunk（例如只携带状态的
+        // chunk），这类数据没有播放意义，所以不占用 seq，也不向下游发送。
         macro_rules! emit_pcm {
             ($pcm:expr) => {{
                 let pcm: Vec<u8> = $pcm;
@@ -89,11 +181,17 @@ pub fn llm_tts_items(
             }};
         }
 
-        // 阶段 2: 流式消费 LLM delta，切句后调 TTS
-        while let Some(item) = llm_stream.next().await {
+        // 阶段 2：逐个消费 LLM delta。每个 delta 先原样透出给需要显示文字的消费者，
+        // 同时追加到缓冲区；一个 delta 里也可能包含多个句子，因此用 while 一次性切完。
+        while let Some(item) = llm_rx.recv().await {
             let evt = match item {
-                Ok(e) => e,
-                Err(e) => {
+                LlmReaderItem::Event(event) => event,
+                LlmReaderItem::CallFailed(e) => {
+                    warn!(target: "voice_server.pipeline", stage = "llm_call", session_id = %sid, "LLM 调用失败: {}", e);
+                    yield LlmTtsItem::Failed { error: format!("llm error: {}", e), code: 1002 };
+                    return;
+                }
+                LlmReaderItem::StreamFailed(e) => {
                     warn!(target: "voice_server.pipeline", stage = "llm_stream", session_id = %sid, "LLM 流错误: {}", e);
                     yield LlmTtsItem::Failed { error: format!("llm stream: {}", e), code: 1003 };
                     return;
@@ -102,10 +200,15 @@ pub fn llm_tts_items(
             sentence_buf.push_str(&evt.delta);
             yield LlmTtsItem::Llm { delta: evt.delta.clone(), is_final: evt.is_final };
 
-            // 切出所有完整句
+            // 切出所有完整句。`next_sentence_end` 只返回安全的 UTF-8 字符边界，
+            // 取出的 `sent` 立即从缓冲区移除，避免下一轮重复合成。
             while let Some(end) = next_sentence_end(&sentence_buf) {
-                let sent: String = sentence_buf[..end].to_string();
+                let raw_sent: String = sentence_buf[..end].to_string();
                 sentence_buf = sentence_buf[end..].to_string();
+                let sent = to_tts_text(&raw_sent);
+                let Some(sent) = short_sentence_buf.push(&sent) else {
+                    continue;
+                };
                 info!(target: "voice_server.pipeline", stage = "tts_call", session_id = %sid, sentence = %sent, "切出句子送 TTS");
 
                 let mut tts_stream = match tts.synthesize(&sid, &sent, sample_rate_override, voice_override.clone()).await {
@@ -117,7 +220,8 @@ pub fn llm_tts_items(
                     }
                 };
 
-                // 阶段 3: 转发 TTS chunk（过 crossfade，重编号 seq）
+                // 阶段 3：为当前句建立 TTS 流。句子级调用可以让前端尽早收到第一句
+                // 音频；`sample_rate_override` 和 `voice_override` 只影响本句的 provider 请求。
                 fader.begin_sentence();
                 while let Some(tts_item) = tts_stream.next().await {
                     let t = match tts_item {
@@ -128,23 +232,29 @@ pub fn llm_tts_items(
                             return;
                         }
                     };
+                    // 每个 chunk 先喂给 crossfader，再由宏完成 seq 编号和 base64 编码。
                     emit_pcm!(fader.feed(&t.data));
                     if t.is_last {
-                        // 单句 TTS 已经结束，准备下一句
+                        // provider 用 is_last 表示当前句结束；外层协议的全局结束标记
+                        // 要等所有句子都处理完后才能发送，因此这里仅跳出当前句循环。
                         break;
                     }
                 }
+                // 刷出当前句被 fader 暂存的尾部 PCM，为下一句的 crossfade 做准备。
                 emit_pcm!(fader.end_sentence());
             }
 
             if evt.is_final {
+                // LLM 已明确结束。缓冲区中可能仍有不带标点的尾巴，统一在主循环后冲刷。
                 break;
             }
         }
 
-        // 收尾：剩余 sentence_buf
-        let tail = sentence_buf.trim().to_string();
-        if !tail.is_empty() {
+        // 收尾：LLM 结束时仍可能遗留没有句末标点的文本，例如“谢谢你的提问”。
+        // 不能丢弃这段内容，因此加入短句缓冲并在末尾 flush。此处沿用原有的宽松错误处理：
+        // 尾句合成失败时跳过尾句，仍发送 finish 和结束标记，避免客户端永远等不到结束。
+        let tail = to_tts_text(sentence_buf.trim());
+        if let Some(tail) = short_sentence_buf.push(&tail).or_else(|| short_sentence_buf.flush()) {
             info!(target: "voice_server.pipeline", stage = "tts_tail", session_id = %sid, sentence = %tail, "LLM 末尾残余句子送 TTS");
             if let Ok(mut tts_stream) = tts.synthesize(&sid, &tail, sample_rate_override, voice_override.clone()).await {
                 fader.begin_sentence();
@@ -159,7 +269,7 @@ pub fn llm_tts_items(
                 emit_pcm!(fader.end_sentence());
             }
         }
-        // 最后一句扣留的句尾不再需要淡化，原样下发
+        // 最后一句扣留的句尾不再需要淡化，原样下发；finish 之后 fader 不再产生数据。
         emit_pcm!(fader.finish());
 
         // 结束标记：上面各 chunk 下发时无法预知自己是不是最后一条，
@@ -168,5 +278,210 @@ pub fn llm_tts_items(
         yield LlmTtsItem::Tts { seq: global_seq, audio: String::new(), is_last: true };
 
         debug!(target: "voice_server.pipeline", session_id = %sid, "LLM→TTS 管线全部完成");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use futures_util::stream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::Notify;
+    use tokio::time::{timeout, Duration};
+
+    use crate::client::llm::{BoxStream as LlmStream, ChatMessage, LlmClient};
+    use crate::client::tts::{BoxStream as TtsStream, TtsClient};
+    use crate::events::TtsEvent;
+
+    struct BurstLlm {
+        emitted: Arc<AtomicUsize>,
+        event_count: usize,
+    }
+
+    #[async_trait]
+    impl LlmClient for BurstLlm {
+        async fn chat(
+            &self,
+            _session_id: &str,
+            _prompt: &str,
+            _emotion_hint: Option<&str>,
+        ) -> Result<LlmStream<Result<LlmEvent, ClientError>>, ClientError> {
+            let emitted = Arc::clone(&self.emitted);
+            let event_count = self.event_count;
+            Ok(Box::pin(stream::iter((0..event_count).map(move |index| {
+                emitted.fetch_add(1, Ordering::SeqCst);
+                Ok(LlmEvent {
+                    delta: if index == 0 {
+                        "第一句内容。"
+                    } else {
+                        "尾"
+                    }
+                    .to_string(),
+                    is_final: index + 1 == event_count,
+                })
+            }))))
+        }
+
+        async fn chat_with_messages(
+            &self,
+            session_id: &str,
+            _messages: &[ChatMessage],
+        ) -> Result<LlmStream<Result<LlmEvent, ClientError>>, ClientError> {
+            self.chat(session_id, "", None).await
+        }
+    }
+
+    struct DelayedTts {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    struct StaticLlm {
+        response: String,
+    }
+
+    #[async_trait]
+    impl LlmClient for StaticLlm {
+        async fn chat(
+            &self,
+            _session_id: &str,
+            _prompt: &str,
+            _emotion_hint: Option<&str>,
+        ) -> Result<LlmStream<Result<LlmEvent, ClientError>>, ClientError> {
+            Ok(Box::pin(stream::iter(vec![Ok(LlmEvent {
+                delta: self.response.clone(),
+                is_final: true,
+            })])))
+        }
+
+        async fn chat_with_messages(
+            &self,
+            session_id: &str,
+            _messages: &[ChatMessage],
+        ) -> Result<LlmStream<Result<LlmEvent, ClientError>>, ClientError> {
+            self.chat(session_id, "", None).await
+        }
+    }
+
+    struct RecordingTts {
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl TtsClient for RecordingTts {
+        async fn synthesize(
+            &self,
+            _session_id: &str,
+            text: &str,
+            _sample_rate_override: Option<u32>,
+            _voice_override: Option<String>,
+        ) -> Result<TtsStream<Result<TtsEvent, ClientError>>, ClientError> {
+            self.requests.lock().unwrap().push(text.to_string());
+            Ok(Box::pin(stream::iter(vec![Ok(TtsEvent {
+                seq: 1,
+                data: vec![1, 0, 2, 0],
+                is_last: true,
+            })])))
+        }
+
+        fn default_voice_short(&self) -> &str {
+            "test"
+        }
+    }
+
+    async fn collect_tts_requests(response: &str) -> Vec<String> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut items = Box::pin(llm_tts_items(
+            "prompt".into(),
+            None,
+            "test-session".into(),
+            Arc::new(StaticLlm {
+                response: response.to_string(),
+            }),
+            Arc::new(RecordingTts {
+                requests: Arc::clone(&requests),
+            }),
+            None,
+            None,
+        ));
+        while items.next().await.is_some() {}
+        Arc::try_unwrap(requests).unwrap().into_inner().unwrap()
+    }
+
+    #[tokio::test]
+    async fn cleans_markdown_before_calling_tts() {
+        let requests = collect_tts_requests("## **你好世界。**").await;
+        assert_eq!(requests, vec!["你好世界。"]);
+    }
+
+    #[tokio::test]
+    async fn merges_short_sentence_with_the_next_tts_request() {
+        let requests = collect_tts_requests("好的。我马上处理。").await;
+        assert_eq!(requests, vec!["好的。我马上处理。"]);
+    }
+
+    #[async_trait]
+    impl TtsClient for DelayedTts {
+        async fn synthesize(
+            &self,
+            _session_id: &str,
+            _text: &str,
+            _sample_rate_override: Option<u32>,
+            _voice_override: Option<String>,
+        ) -> Result<TtsStream<Result<TtsEvent, ClientError>>, ClientError> {
+            self.started.notify_one();
+            let release = Arc::clone(&self.release);
+            Ok(Box::pin(stream! {
+                release.notified().await;
+                yield Ok(TtsEvent { seq: 1, data: vec![1, 0, 2, 0], is_last: true });
+            }))
+        }
+
+        fn default_voice_short(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_reader_keeps_draining_while_tts_is_slow() {
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let event_count = 128;
+        let mut items = Box::pin(llm_tts_items(
+            "prompt".into(),
+            None,
+            "test-session".into(),
+            Arc::new(BurstLlm {
+                emitted: Arc::clone(&emitted),
+                event_count,
+            }),
+            Arc::new(DelayedTts {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            }),
+            None,
+            None,
+        ));
+
+        assert!(matches!(items.next().await, Some(LlmTtsItem::Llm { .. })));
+        let next_item = tokio::spawn(async move { items.next().await });
+        timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("TTS should start for the first complete sentence");
+
+        timeout(Duration::from_secs(1), async {
+            while emitted.load(Ordering::SeqCst) != event_count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("LLM reader should drain the response while TTS is waiting");
+        assert!(!next_item.is_finished());
+
+        release.notify_one();
+        assert!(next_item.await.unwrap().is_some());
     }
 }

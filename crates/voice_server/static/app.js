@@ -9,7 +9,7 @@
 //   5. 接收下行：
 //        - AsrPartial    → 在 user bubble 里显示/替换
 //        - LlmDelta      → 追加到 assistant bubble
-//        - TtsAudio      → 累积 s16le 字节 + WAV 头 → Blob URL → Audio() 播放
+//        - TtsAudio      → s16le chunk 到达即通过 Web Audio 排程播放
 //        - Error         → 在用户状态区显示安全提示
 
 // ====== 可测试的用户状态辅助 ======
@@ -377,10 +377,6 @@
   let currentUserBubble = null;
   let currentAssistantBubble = null;
   let lastAsrText = '';
-
-  // TTS 播放
-  let ttsChunks = []; // [{seq, data: Uint8Array, isLast}]
-  let audioElement = null;
 
   // AudioWorklet 通信
   let vadCountdown = Infinity; // 离 is_last 还有多少帧
@@ -756,82 +752,22 @@
     recomputePhoneState();
   }
 
-  // ====== TTS 播放：拼 WAV + Audio() 顺序播放队列 ======
-  // 同一个 TTS 句子的多个 chunk 必须顺序播完（不能互相打断），否则像
-  // "你好！有什么问题或需要帮助解决的事情吗？" 只会听到最后一个 chunk；
-  // 用户主动 interrupt 才走 stopTtsPlayback() 一次性清空。
-  const ttsQueue = [];
-  let ttsPlaying = false;
+  // ====== TTS 播放：PCM chunk 到达即排程 ======
+  const ttsPlayer = new window.PcmStreamPlayer({
+    onState: (playing) => {
+      setStatus(speakerStatus, playing ? '扬声器：播放中' : '扬声器：空闲', playing ? 'badge-busy' : 'badge-online');
+    },
+  });
 
-  function playTtsAudio(dataBytes, isLast) {
+  function playTtsAudio(dataBytes, _isLast, sampleRate = SAMPLE_RATE, channels = CHANNELS) {
     // 扬声器静音：直接丢掉这段 TTS 音频（不进队列，不消耗 audio 资源）
     if (speakerMuted) return;
-    const wav = wrapPcmAsWav(dataBytes);
-    ttsQueue.push(URL.createObjectURL(new Blob([wav], { type: 'audio/wav' })));
-    if (!ttsPlaying) playNextTts();
-  }
-
-  function playNextTts() {
-    const url = ttsQueue.shift();
-    if (!url) {
-      ttsPlaying = false;
-      setStatus(speakerStatus, '扬声器：空闲', 'badge-online');
-      return;
-    }
-    ttsPlaying = true;
-    if (!audioElement) audioElement = new Audio();
-    const done = () => {
-      URL.revokeObjectURL(url);
-      playNextTts();
-    };
-    audioElement.onended = done;
-    audioElement.onerror = done;
-    audioElement.src = url;
-    setStatus(speakerStatus, '扬声器：播放中', 'badge-busy');
-    audioElement.play().catch(err => {
-      if (err.name !== 'AbortError') console.warn('TTS play failed:', err);
-      done();
-    });
+    ttsPlayer.enqueue(dataBytes, sampleRate, channels);
   }
 
   function stopTtsPlayback() {
     stopProgressSpeech();
-    ttsQueue.forEach(URL.revokeObjectURL);
-    ttsQueue.length = 0;
-    ttsPlaying = false;
-    if (audioElement) {
-      audioElement.onended = null;
-      audioElement.onerror = null;
-      if (audioElement.src && audioElement.src.startsWith('blob:')) {
-        URL.revokeObjectURL(audioElement.src);
-      }
-      audioElement.pause();
-      audioElement.removeAttribute('src');
-    }
-    setStatus(speakerStatus, '扬声器：空闲', 'badge-online');
-  }
-
-  function wrapPcmAsWav(pcmBytes) {
-    // WAV header for s16le, 16kHz, mono
-    const dataLen = pcmBytes.byteLength;
-    const buf = new ArrayBuffer(44 + dataLen);
-    const view = new DataView(buf);
-    function writeStr(off, s) { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); }
-    writeStr(0, 'RIFF');
-    view.setUint32(4, 36 + dataLen, true);
-    writeStr(8, 'WAVE');
-    writeStr(12, 'fmt ');
-    view.setUint32(16, 16, true);     // fmt chunk size
-    view.setUint16(20, 1, true);      // PCM
-    view.setUint16(22, CHANNELS, true);
-    view.setUint32(24, SAMPLE_RATE, true);
-    view.setUint32(28, SAMPLE_RATE * CHANNELS * 2, true); // byte rate
-    view.setUint16(32, CHANNELS * 2, true);                // block align
-    view.setUint16(34, 16, true);     // bits per sample
-    writeStr(36, 'data');
-    view.setUint32(40, dataLen, true);
-    new Uint8Array(buf, 44).set(new Uint8Array(pcmBytes));
-    return buf;
+    ttsPlayer.stop();
   }
 
   // ====== WebSocket ======
@@ -921,7 +857,7 @@
               if (!requestTracker.isCurrentRequest(payload.request_id)) break;
               if (payload.data && payload.data.length > 0) {
                 // 下行：服务端用 #[serde(with="serde_bytes")] 走 msgpack bin，JS 解码后已是 Uint8Array
-                playTtsAudio(payload.data, payload.is_last);
+                playTtsAudio(payload.data, payload.is_last, payload.sample_rate || SAMPLE_RATE, payload.channels || CHANNELS);
                 if (!lastTtsFirstByteMs) lastTtsFirstByteMs = performance.now();
               }
               if (payload.is_last) {
@@ -1204,6 +1140,7 @@
   // ====== 按钮 ======
   btnStart.onclick = async () => {
     btnStart.disabled = true;
+    void ttsPlayer.resume().catch(() => {});
     // 开启新一轮对话：先清掉旧 TTS 队列和正在播的内容，避免残留
     stopTtsPlayback();
     resetAgentSessionUi();

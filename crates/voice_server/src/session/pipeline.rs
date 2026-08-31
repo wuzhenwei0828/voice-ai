@@ -4,6 +4,10 @@
 //!   - 下行推 VoicePayload（msgpack 信封）而非 HTTP SSE
 //!   - 全程受 CancellationToken 约束（用户打断）
 //!   - Tts chunk 直接带原始 PCM 字节（不做 base64）
+//!
+//! 主流程可以按下面的时序阅读：
+//! `客户端 PCM → WAV 封装 → ASR 事件/最终文本 → 标签解析 → LLM delta → TTS PCM → VoicePayload`。
+//! 每个阶段之间都有取消检查；取消只结束当前 pipeline，不向客户端伪造“成功完成”事件。
 
 use std::sync::Arc;
 
@@ -61,9 +65,14 @@ pub(super) async fn run_pipeline(
     cancel: CancellationToken,
     current_real_cancel: Arc<Mutex<Option<CancellationToken>>>,
 ) {
+    // 这是一次 utterance（用户一段语音）的完整生命周期。函数本身不返回业务数据，
+    // 所有结果都通过 `down_addr` 发送 VoicePayload；因此每个 return 都代表该请求结束。
+    // request_id 会被原样带到所有下行事件，供客户端把并发/打断后的消息归属到正确请求。
     info!(target: "voice_server.session", session_id = %session_id, "pipeline 开始");
 
-    // ===== 阶段 1: ASR —— 转发识别事件，收最终文本作为 LLM prompt =====
+    // ===== 阶段 1：ASR —— 先识别，再决定是否进入后续链路 =====
+    // 先通知前端进入“正在理解”，后续 ASR partial 会在拿到最终文本后一次性 flush。
+    // 这样可以避免空文本、标签文本或被取消的请求产生误导性的中间消息。
     if !send_agent_status(
         &down_addr,
         &session_id,
@@ -162,7 +171,9 @@ pub(super) async fn run_pipeline(
             evt = asr_stream.next() => {
                 match evt {
                     Some(Ok(e)) => {
-                        // 先统一清洗 ASR 标签；非流式 ASR 客户端只发一个完整结果
+                        // 先统一清洗 ASR 标签；非流式 ASR 客户端只发一个完整结果，
+                        // 流式客户端则可能发送多条 partial。prompt 始终保存最近一条非空文本，
+                        // 这样上游偶尔发出的空 partial 不会覆盖有效识别结果。
                         let cleaned = rich_transcription_postprocess(&e.text);
                         if !cleaned.is_empty() {
                             prompt = cleaned.clone();
@@ -213,6 +224,7 @@ pub(super) async fn run_pipeline(
         return;
     }
 
+    // ===== 阶段 1.5：解析 ASR 控制标签 =====
     // ASR 文本已在接收阶段经过 rich 后处理；这里从 rich 输出的 emoji 中提取
     // 情绪/事件，剥掉 emoji 后的正文送 LLM。
     let parsed = parse_asr_text(&prompt);
@@ -256,7 +268,7 @@ pub(super) async fn run_pipeline(
         );
     }
 
-    // ===== 注册为 current real 并 cancel 上一个 real pipeline（auto-interrupt on new utterance）=====
+    // ===== 阶段 1.8：注册当前请求并打断上一条真实语音请求 =====
     // 空文本的 pipeline 已经早 return，不会污染这条路径。
     // 只 cancel 上一个「已经进入 LLM/TTS」的 pipeline（prev_token），不动当前 pipeline 的 cancel。
     // CurrentCancelGuard 在 pipeline 退出时清掉自己的 token，避免 stale token 误 cancel 后续
@@ -275,6 +287,8 @@ pub(super) async fn run_pipeline(
         prev.cancel();
     }
 
+    // ASR 已确认有可处理文本，才进入“正在组织答案”。如果用户在这之前打断，
+    // send_agent_status 会因 cancel 返回 false，后续不会再发任何下行事件。
     if !send_agent_status(
         &down_addr,
         &session_id,
@@ -286,10 +300,13 @@ pub(super) async fn run_pipeline(
         return;
     }
 
-    // ===== 阶段 2+3: LLM → 切句 → TTS（共享管线，含句间 crossfade / 全局 seq / 结束标记）=====
+    // ===== 阶段 2+3：LLM → 切句 → TTS =====
+    // 这里复用共享的 llm_tts_items：它负责网络流、切句、crossfade、base64 和 seq；
+    // 本函数只负责把抽象事件映射成 WS 的 VoicePayload，并在每个 await 上响应取消。
     // sample_rate_override：把端侧 SessionStart 上报的值原样透传 —— HttpTtsClient 内部决定
     // 用 override 还是配置兜底（sample_rate_override.or(self.sample_rate)）。
     // voice_override：同理，原样透传 → HttpTtsClient 拼 model 前缀后发给 provider。
+    let tts_format = tts.output_format();
     let mut items = Box::pin(llm_tts_items(
         prompt,
         asr_hint,
@@ -300,6 +317,8 @@ pub(super) async fn run_pipeline(
         client_voice,
     ));
     let mut speaking_sent = false;
+    // 消费共享管线事件。select! 同时监听 cancel 和 items.next()，保证 LLM/TTS 任一
+    // 网络 await 期间都能被用户的新语音打断。
     while let Some(item) = {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -311,6 +330,7 @@ pub(super) async fn run_pipeline(
     } {
         match item {
             LlmTtsItem::Llm { delta, is_final } => {
+                // 空 delta 只在 is_final=true 时有意义：它是“文本流结束”的协议通知。
                 if !delta.is_empty() || is_final {
                     if cancel.is_cancelled() {
                         return;
@@ -331,6 +351,7 @@ pub(super) async fn run_pipeline(
                 audio,
                 is_last,
             } => {
+                // 第一块音频到达才切换到 Speaking，避免 TTS 尚未产出时提前显示“正在回答”。
                 if !speaking_sent {
                     if !send_agent_status(
                         &down_addr,
@@ -352,6 +373,8 @@ pub(super) async fn run_pipeline(
                     seq,
                     audio,
                     is_last,
+                    tts_format.0.or(client_tts_sample_rate),
+                    Some(tts_format.1),
                 ) {
                     return;
                 }
@@ -369,6 +392,8 @@ pub(super) async fn run_pipeline(
                 }
             }
             LlmTtsItem::Failed { error, code } => {
+                // 共享管线已经把失败阶段映射为稳定错误码；WS 侧统一隐藏内部错误文本，
+                // 只记录日志并返回面向用户的安全提示。
                 error!(target: "voice_server.session", session_id = %session_id, code, %error, "pipeline 失败");
                 if !send_agent_status(
                     &down_addr,
@@ -439,6 +464,8 @@ fn send_tts_audio(
     seq: u32,
     audio: String,
     is_last: bool,
+    sample_rate: Option<u32>,
+    channels: Option<u8>,
 ) -> bool {
     if cancel.is_cancelled() {
         return false;
@@ -452,6 +479,8 @@ fn send_tts_audio(
             data: base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &audio)
                 .unwrap_or_default(),
             is_last,
+            sample_rate,
+            channels,
             request_id,
         },
     );
@@ -789,6 +818,8 @@ mod tests {
             1,
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [1_u8, 0, 2, 0],),
             false,
+            Some(24_000),
+            Some(1),
         ));
 
         let status = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())

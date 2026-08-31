@@ -11,8 +11,8 @@
 //! ## 模块拆分
 //! - [`state`]    状态机枚举（`SessionState` / `TriggerReason`）
 //! - [`audio`]    音频缓冲（`AudioAccumulator` + 触发阈值常量）
-//! - [`text`]     文本处理（`next_sentence_end`）。ASR 标签解析见
-//!                [`crate::utils::postprocess_utils::parse_asr_text`]
+//! - 文本切句统一使用 [`crate::pipeline::sentence::next_sentence_end`]；ASR 标签解析见
+//!   [`crate::utils::postprocess_utils::parse_asr_text`]
 //! - [`pipeline`] 完整 pipeline 编排（`run_pipeline` / `send_down` / `CurrentCancelGuard`）
 //!
 //! ## Pipeline 并发策略：**打断旧的**（auto-interrupt on new utterance），但只在新句真有内容时
@@ -63,7 +63,6 @@
 pub mod audio;
 pub mod pipeline;
 pub mod state;
-pub mod text;
 
 use std::sync::Arc;
 

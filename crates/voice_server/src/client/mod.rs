@@ -1,5 +1,9 @@
 //! ASR / LLM / TTS 客户端
 //!
+//! 每种能力都先定义一个 trait，再提供 HTTP 或 WebSocket 实现；上层 pipeline 只依赖
+//! trait，因此替换 provider 不需要改会话编排代码。工厂函数负责把 [`VoiceConfig`]
+//! 转成具体客户端，启动入口只需注入这些 trait 对象。
+//!
 //! ASR / TTS 走手搓 reqwest（绕开 async-openai 的限制 —— FunASR 私有字段、自定义 voice 字符串），
 //! LLM 仍用 async-openai SDK。provider 通过 `ProviderConfig::api_base` 切换
 //!（siliconflow、OpenAI 官方、自建 ASR 等）。
@@ -19,11 +23,13 @@ pub mod error;
 pub mod funasr;
 pub mod llm;
 pub mod tts;
+pub mod tts_ws;
 
 pub use asr::{build_asr_client, ArcAsr, AsrClient, HttpAsrClient};
 pub use error::ClientError;
 pub use funasr::{
     build_funasr_client, ArcFunasr, FunasrClient, FunasrConfig, FunasrMode, FunasrSession,
 };
-pub use llm::{build_llm_client, ArcLlm, LlmClient, HttpLlmClient};
-pub use tts::{build_tts_client, ArcTts, TtsClient, HttpTtsClient};
+pub use llm::{build_llm_client, ArcLlm, HttpLlmClient, LlmClient};
+pub use tts::{build_tts_client, ArcTts, HttpTtsClient, TtsClient};
+pub use tts_ws::{TtsWsClient, TtsWsConfig};
