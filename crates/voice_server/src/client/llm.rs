@@ -21,6 +21,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use crate::client::apply_trace_header;
 use crate::client::error::{parse_openai_error, ClientError};
 use crate::config::{LlmConfig, ProviderConfig};
 use crate::events::LlmEvent;
@@ -59,12 +60,27 @@ pub struct HttpLlmClient {
     api_base: String,
     api_key: String,
     model: String,
+    max_completion_tokens: Option<u32>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    reasoning_effort: Option<String>,
+    include_usage: bool,
     headers: reqwest::header::HeaderMap,
     http: Client,
 }
 
 impl HttpLlmClient {
     pub fn new(resolved: ProviderConfig, model: String) -> Self {
+        Self::from_config(
+            resolved,
+            &LlmConfig {
+                model,
+                ..LlmConfig::default()
+            },
+        )
+    }
+
+    pub fn from_config(resolved: ProviderConfig, cfg: &LlmConfig) -> Self {
         let api_base = resolved.api_base.clone();
         let api_key = resolved.api_key.clone();
         let headers = resolved.to_header_map();
@@ -79,9 +95,29 @@ impl HttpLlmClient {
         Self {
             api_base,
             api_key,
-            model,
+            model: cfg.model.clone(),
+            max_completion_tokens: cfg.max_completion_tokens,
+            temperature: cfg.temperature,
+            top_p: cfg.top_p,
+            reasoning_effort: cfg.reasoning_effort.clone(),
+            include_usage: cfg.include_usage,
             headers,
             http,
+        }
+    }
+
+    fn request_body<'a>(&'a self, messages: &'a [ChatMessage]) -> ChatReq<'a> {
+        ChatReq {
+            model: &self.model,
+            messages,
+            stream: true,
+            max_completion_tokens: self.max_completion_tokens,
+            temperature: self.temperature,
+            top_p: self.top_p,
+            reasoning_effort: self.reasoning_effort.as_deref(),
+            stream_options: self.include_usage.then_some(ChatStreamOptions {
+                include_usage: true,
+            }),
         }
     }
 }
@@ -111,6 +147,21 @@ struct ChatReq<'a> {
     model: &'a str,
     messages: &'a [ChatMessage],
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<ChatStreamOptions>,
+}
+
+#[derive(Serialize)]
+struct ChatStreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,15 +169,23 @@ struct ChatChunk {
     #[serde(default)]
     #[allow(dead_code)]
     id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[allow(dead_code)]
+    created: Option<u64>,
     #[serde(default)]
     #[allow(dead_code)]
     model: String,
     #[serde(default)]
     choices: Vec<ChatChoice>,
+    #[serde(default)]
+    usage: Option<ChatUsage>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatChoice {
+    #[serde(default)]
+    #[allow(dead_code)]
+    index: Option<u64>,
     #[serde(default)]
     delta: ChatDelta,
     #[serde(default)]
@@ -137,6 +196,113 @@ struct ChatChoice {
 struct ChatDelta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    refusal: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ChatUsage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+}
+
+#[derive(Debug)]
+struct ParsedChatOutput {
+    delta: String,
+    reasoning_content: Option<String>,
+    is_final: bool,
+    usage: Option<ChatUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatResponse {
+    choices: Vec<ChatResponseChoice>,
+    #[serde(default)]
+    usage: Option<ChatUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatResponseChoice {
+    message: ChatResponseMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatResponseMessage {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    refusal: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+}
+
+fn response_text(content: Option<String>, refusal: Option<String>) -> String {
+    match (content, refusal) {
+        (Some(content), Some(refusal)) if !content.is_empty() && !refusal.is_empty() => {
+            format!("{content}\n{refusal}")
+        }
+        (Some(content), _) if !content.is_empty() => content,
+        (_, Some(refusal)) => refusal,
+        _ => String::new(),
+    }
+}
+
+fn non_blank_text(value: Option<String>) -> Option<String> {
+    value.filter(|text| !text.trim().is_empty())
+}
+
+fn parse_stream_payload(payload: &[u8]) -> Result<Option<ParsedChatOutput>, ClientError> {
+    if payload.is_empty() || payload == b"[DONE]" {
+        return Ok(None);
+    }
+
+    let chunk: ChatChunk =
+        serde_json::from_slice(payload).map_err(|e| ClientError::Decode(e.to_string()))?;
+    let usage = chunk.usage;
+    if let Some(choice) = chunk.choices.into_iter().next() {
+        let delta = choice.delta;
+        return Ok(Some(ParsedChatOutput {
+            delta: response_text(delta.content, delta.refusal),
+            reasoning_content: non_blank_text(delta.reasoning_content),
+            is_final: choice.finish_reason.is_some(),
+            usage,
+        }));
+    }
+
+    Ok(usage.map(|usage| ParsedChatOutput {
+        delta: String::new(),
+        reasoning_content: None,
+        is_final: false,
+        usage: Some(usage),
+    }))
+}
+
+fn parse_sse_data_line(line: &[u8]) -> Result<Option<ParsedChatOutput>, ClientError> {
+    let Some(payload) = line.strip_prefix(b"data:") else {
+        return Ok(None);
+    };
+    parse_stream_payload(payload.strip_prefix(b" ").unwrap_or(payload))
+}
+
+fn parse_non_stream_response(body: &[u8]) -> Result<ParsedChatOutput, ClientError> {
+    let response: ChatResponse =
+        serde_json::from_slice(body).map_err(|e| ClientError::Decode(e.to_string()))?;
+    let choice = response
+        .choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| ClientError::Decode("no choices in response".into()))?;
+
+    let message = choice.message;
+    Ok(ParsedChatOutput {
+        delta: response_text(message.content, message.refusal),
+        reasoning_content: non_blank_text(message.reasoning_content),
+        is_final: true,
+        usage: response.usage,
+    })
 }
 
 #[async_trait]
@@ -177,11 +343,7 @@ impl LlmClient for HttpLlmClient {
     ) -> Result<BoxStream<Result<LlmEvent, ClientError>>, ClientError> {
         let url = format!("{}/chat/completions", self.api_base.trim_end_matches('/'));
 
-        let body = ChatReq {
-            model: &self.model,
-            messages,
-            stream: true,
-        };
+        let body = self.request_body(messages);
 
         let messages_count = messages.len();
         let has_system = messages.iter().any(|m| m.role == "system");
@@ -228,7 +390,7 @@ impl LlmClient for HttpLlmClient {
             .request(Method::POST, &url)
             .header("Content-Type", "application/json")
             .json(&body);
-        let req = apply_auth_headers(req, &self.api_key, &self.headers);
+        let req = apply_trace_header(apply_auth_headers(req, &self.api_key, &self.headers));
 
         let resp = req
             .send()
@@ -305,14 +467,30 @@ impl LlmClient for HttpLlmClient {
                         // 去掉换行符
                         line.pop();
                         if line.last() == Some(&b'\r') { line.pop(); }
-                        if line.starts_with(b"data: ") {
-                            let payload = &line[6..];
-                            if payload == b"[DONE]" || payload.is_empty() { continue; }
-                            match serde_json::from_slice::<ChatChunk>(payload) {
-                                Ok(c) => {
-                                    if let Some(choice) = c.choices.into_iter().next() {
-                                        let delta = choice.delta.content.unwrap_or_default();
-                                        let is_final = choice.finish_reason.is_some();
+                        if line.starts_with(b"data:") {
+                            match parse_sse_data_line(&line) {
+                                Ok(Some(parsed)) => {
+                                    if let Some(usage) = &parsed.usage {
+                                        info!(
+                                            target: "voice_server.llm",
+                                            session_id = %session,
+                                            prompt_tokens = usage.prompt_tokens,
+                                            completion_tokens = usage.completion_tokens,
+                                            total_tokens = usage.total_tokens,
+                                            "收到 LLM token usage"
+                                        );
+                                    }
+                                    if let Some(reasoning_content) = &parsed.reasoning_content {
+                                        info!(
+                                            target: "voice_server.llm",
+                                            session_id = %session,
+                                            reasoning_content = %reasoning_content,
+                                            "收到 LLM reasoning_content"
+                                        );
+                                    }
+                                    let delta = parsed.delta;
+                                    let is_final = parsed.is_final;
+                                    if !delta.is_empty() || is_final {
                                         chunk_count += 1;
                                         total_delta_chars += delta.chars().count();
                                         info!(
@@ -324,17 +502,16 @@ impl LlmClient for HttpLlmClient {
                                             delta = %delta,
                                             "收到 LLM delta"
                                         );
-                                        if !delta.is_empty() || is_final {
-                                            yield Ok(LlmEvent { delta, is_final });
-                                        }
+                                        yield Ok(LlmEvent { delta, is_final });
                                     }
                                 }
+                                Ok(None) => {}
                                 Err(e) => {
                                     tracing::warn!(
                                         target: "voice_server.llm.err",
                                         session_id = %session,
                                         error = %e,
-                                        payload = %String::from_utf8_lossy(payload),
+                                        payload = %String::from_utf8_lossy(&line),
                                         "LLM SSE 解析失败"
                                     );
                                     yield Err(ClientError::Decode(e.to_string()));
@@ -359,20 +536,30 @@ impl LlmClient for HttpLlmClient {
                 .bytes()
                 .await
                 .map_err(|e| ClientError::Http(e.to_string()))?;
-            match serde_json::from_slice::<ChatChunk>(&bytes) {
-                Ok(c) => {
-                    if let Some(choice) = c.choices.into_iter().next() {
-                        let delta = choice.delta.content.unwrap_or_default();
-                        let is_final = choice.finish_reason.is_some();
-                        Box::pin(stream! {
-                            yield Ok(LlmEvent { delta, is_final });
-                        })
-                    } else {
-                        return Err(ClientError::Decode("no choices in response".into()));
-                    }
-                }
-                Err(e) => return Err(ClientError::Decode(e.to_string())),
+            let parsed = parse_non_stream_response(&bytes)?;
+            if let Some(usage) = &parsed.usage {
+                info!(
+                    target: "voice_server.llm",
+                    session_id,
+                    prompt_tokens = usage.prompt_tokens,
+                    completion_tokens = usage.completion_tokens,
+                    total_tokens = usage.total_tokens,
+                    "收到 LLM token usage"
+                );
             }
+            if let Some(reasoning_content) = &parsed.reasoning_content {
+                info!(
+                    target: "voice_server.llm",
+                    session_id,
+                    reasoning_content = %reasoning_content,
+                    "收到 LLM reasoning_content"
+                );
+            }
+            let delta = parsed.delta;
+            let is_final = parsed.is_final;
+            Box::pin(stream! {
+                yield Ok(LlmEvent { delta, is_final });
+            })
         };
 
         Ok(stream)
@@ -395,12 +582,271 @@ pub fn build_llm_client(
         "构造 HttpLlmClient（手搓 reqwest，drop stream 立即关闭 HTTP 连接）"
     );
 
-    Ok(Arc::new(HttpLlmClient::new(resolved, cfg.model.clone())))
+    Ok(Arc::new(HttpLlmClient::from_config(resolved, cfg)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_standard_stream_content_and_finish_reason() {
+        let payload = br#"{
+            "id":"chatcmpl-1",
+            "object":"chat.completion.chunk",
+            "created":1,
+            "model":"test-model",
+            "choices":[{
+                "index":0,
+                "delta":{"content":"hello"},
+                "logprobs":null,
+                "finish_reason":"stop"
+            }]
+        }"#;
+
+        let parsed = parse_stream_payload(payload).unwrap().unwrap();
+        assert_eq!(parsed.delta, "hello");
+        assert!(parsed.is_final);
+        assert!(parsed.usage.is_none());
+    }
+
+    #[test]
+    fn parses_openai_sse_data_line() {
+        let line = br#"data: {"id":"chatcmpl-sse","object":"chat.completion.chunk","created":1,"model":"test-model","choices":[{"index":0,"delta":{"content":"chunk"},"logprobs":null,"finish_reason":null}]}"#;
+
+        let parsed = parse_sse_data_line(line).unwrap().unwrap();
+
+        assert_eq!(parsed.delta, "chunk");
+        assert!(!parsed.is_final);
+    }
+
+    #[test]
+    fn preserves_stream_reasoning_content_for_logging() {
+        let payload = br#"{
+            "id":"chatcmpl-reasoning-stream",
+            "object":"chat.completion.chunk",
+            "created":1,
+            "model":"test-model",
+            "choices":[{
+                "index":0,
+                "delta":{"content":null,"reasoning_content":"checking the answer"},
+                "finish_reason":null
+            }]
+        }"#;
+
+        let parsed = parse_stream_payload(payload).unwrap().unwrap();
+        assert_eq!(
+            parsed.reasoning_content.as_deref(),
+            Some("checking the answer")
+        );
+        assert!(parsed.delta.is_empty());
+    }
+
+    #[test]
+    fn drops_blank_stream_reasoning_content() {
+        let payload = br#"{
+            "choices":[{
+                "delta":{"reasoning_content":"  \n  "},
+                "finish_reason":null
+            }]
+        }"#;
+
+        let parsed = parse_stream_payload(payload).unwrap().unwrap();
+        assert!(parsed.reasoning_content.is_none());
+    }
+
+    #[test]
+    fn parses_stream_refusal_as_visible_text() {
+        let payload = br#"{
+            "id":"chatcmpl-2",
+            "object":"chat.completion.chunk",
+            "created":1,
+            "model":"test-model",
+            "choices":[{
+                "index":0,
+                "delta":{"content":"","refusal":"cannot comply"},
+                "logprobs":null,
+                "finish_reason":"content_filter"
+            }]
+        }"#;
+
+        let parsed = parse_stream_payload(payload).unwrap().unwrap();
+        assert_eq!(parsed.delta, "cannot comply");
+        assert!(parsed.is_final);
+    }
+
+    #[test]
+    fn preserves_stream_content_and_refusal_when_both_are_present() {
+        let payload = br#"{
+            "id":"chatcmpl-2b",
+            "object":"chat.completion.chunk",
+            "created":1,
+            "model":"test-model",
+            "choices":[{
+                "index":0,
+                "delta":{"content":"partial answer","refusal":"cannot continue"},
+                "logprobs":null,
+                "finish_reason":"content_filter"
+            }]
+        }"#;
+
+        let parsed = parse_stream_payload(payload).unwrap().unwrap();
+        assert_eq!(parsed.delta, "partial answer\ncannot continue");
+        assert!(parsed.is_final);
+    }
+
+    #[test]
+    fn parses_usage_only_stream_chunk_without_a_choice() {
+        let payload = br#"{
+            "id":"chatcmpl-3",
+            "object":"chat.completion.chunk",
+            "created":1,
+            "model":"test-model",
+            "choices":[],
+            "usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16}
+        }"#;
+
+        let parsed = parse_stream_payload(payload).unwrap().unwrap();
+        assert_eq!(parsed.delta, "");
+        assert!(!parsed.is_final);
+        let usage = parsed.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 12);
+        assert_eq!(usage.completion_tokens, 4);
+        assert_eq!(usage.total_tokens, 16);
+    }
+
+    #[test]
+    fn parses_standard_non_stream_response_message_content() {
+        let body = br#"{
+            "id":"chatcmpl-4",
+            "object":"chat.completion",
+            "created":1,
+            "model":"test-model",
+            "choices":[{
+                "index":0,
+                "message":{"role":"assistant","content":"complete answer","refusal":null},
+                "logprobs":null,
+                "finish_reason":"stop"
+            }],
+            "usage":{"prompt_tokens":8,"completion_tokens":2,"total_tokens":10}
+        }"#;
+
+        let parsed = parse_non_stream_response(body).unwrap();
+        assert_eq!(parsed.delta, "complete answer");
+        assert!(parsed.is_final);
+        assert_eq!(parsed.usage.unwrap().total_tokens, 10);
+    }
+
+    #[test]
+    fn preserves_non_stream_reasoning_content_for_logging() {
+        let body = br#"{
+            "choices":[{
+                "message":{
+                    "role":"assistant",
+                    "content":"complete answer",
+                    "reasoning_content":"checking the answer"
+                },
+                "finish_reason":"stop"
+            }]
+        }"#;
+
+        let parsed = parse_non_stream_response(body).unwrap();
+        assert_eq!(
+            parsed.reasoning_content.as_deref(),
+            Some("checking the answer")
+        );
+        assert_eq!(parsed.delta, "complete answer");
+    }
+
+    #[test]
+    fn parses_non_stream_refusal_when_content_is_empty() {
+        let body = br#"{
+            "choices":[{
+                "message":{"role":"assistant","content":"","refusal":"cannot comply"},
+                "finish_reason":"content_filter"
+            }]
+        }"#;
+
+        let parsed = parse_non_stream_response(body).unwrap();
+        assert_eq!(parsed.delta, "cannot comply");
+        assert!(parsed.is_final);
+    }
+
+    #[test]
+    fn preserves_non_stream_content_and_refusal_when_both_are_present() {
+        let body = br#"{
+            "choices":[{
+                "message":{
+                    "role":"assistant",
+                    "content":"partial answer",
+                    "refusal":"cannot continue"
+                },
+                "finish_reason":"content_filter"
+            }]
+        }"#;
+
+        let parsed = parse_non_stream_response(body).unwrap();
+        assert_eq!(parsed.delta, "partial answer\ncannot continue");
+        assert!(parsed.is_final);
+    }
+
+    #[test]
+    fn request_body_serializes_configured_openai_options() {
+        let cfg = LlmConfig {
+            model: "test-model".into(),
+            max_completion_tokens: Some(256),
+            temperature: Some(0.2),
+            top_p: Some(0.85),
+            reasoning_effort: Some("low".into()),
+            include_usage: true,
+            ..LlmConfig::default()
+        };
+        let client = HttpLlmClient::from_config(ProviderConfig::default(), &cfg);
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hello".into(),
+        }];
+
+        let body = serde_json::to_value(client.request_body(&messages)).unwrap();
+
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true,
+                "max_completion_tokens": 256,
+                "temperature": 0.2,
+                "top_p": 0.85,
+                "reasoning_effort": "low",
+                "stream_options": {"include_usage": true}
+            })
+        );
+    }
+
+    #[test]
+    fn request_body_omits_unconfigured_optional_fields() {
+        let cfg = LlmConfig {
+            model: "test-model".into(),
+            ..LlmConfig::default()
+        };
+        let client = HttpLlmClient::new(ProviderConfig::default(), cfg.model.clone());
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hello".into(),
+        }];
+
+        let body = serde_json::to_value(client.request_body(&messages)).unwrap();
+
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true
+            })
+        );
+    }
 
     #[test]
     fn llm_auth_uses_x_api_key_without_authorization() {

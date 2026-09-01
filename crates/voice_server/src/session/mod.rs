@@ -65,17 +65,20 @@ pub mod pipeline;
 pub mod state;
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use actix::prelude::Recipient;
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, Instrument};
 use voice_proto::VoicePayload;
 use webhttp::websocket::OutMessage;
 
 use crate::agent::LlmAgent;
 use crate::client::{AsrClient, TtsClient};
+use crate::metrics::VoiceMetrics;
+use crate::trace_context::scope;
 
 pub use state::SessionState;
 
@@ -100,7 +103,10 @@ pub struct VoiceSession {
     current_real_cancel: Arc<Mutex<Option<CancellationToken>>>,
     /// 单会话内的 pipeline 请求序号；0 保留给没有请求序列的兼容事件。
     next_request_id: u64,
+    trace_id: String,
     audio_buf: AudioAccumulator,
+    metrics: Arc<VoiceMetrics>,
+    input_started_at: Option<Instant>,
     /// 最近一次通过最短时长校验的语音请求，供显式 Retry 重放。
     last_request_audio: Option<Vec<u8>>,
     /// 从 SessionStart 记下，用于包 WAV 头给 ASR（siliconflow 等 provider 按文件后缀选解码器）
@@ -131,6 +137,17 @@ impl VoiceSession {
         tts: Arc<dyn TtsClient>,
         down_addr: Recipient<OutMessage>,
     ) -> Self {
+        Self::new_with_metrics(session_id, asr, llm, tts, down_addr, Arc::new(VoiceMetrics::new()))
+    }
+
+    pub fn new_with_metrics(
+        session_id: String,
+        asr: Arc<dyn AsrClient>,
+        llm: Arc<LlmAgent>,
+        tts: Arc<dyn TtsClient>,
+        down_addr: Recipient<OutMessage>,
+        metrics: Arc<VoiceMetrics>,
+    ) -> Self {
         info!(target: "voice_server.session", session_id = %session_id, "VoiceSession 创建");
         Self {
             session_id,
@@ -139,7 +156,10 @@ impl VoiceSession {
             global_cancel: CancellationToken::new(),
             current_real_cancel: Arc::new(Mutex::new(None)),
             next_request_id: 0,
+            trace_id: crate::trace_context::new_trace_id(),
             audio_buf: AudioAccumulator::new(),
+            metrics,
+            input_started_at: None,
             last_request_audio: None,
             sample_rate: 0,
             channels: 0,
@@ -171,6 +191,15 @@ impl VoiceSession {
     /// 调用方（service.rs）应将其推入 service 级 JoinSet 以追踪 panic / 优雅退出。
     /// `None` 表示本调用没 spawn（例如音频过短、空文本、非 AudioChunk）。
     pub fn on_payload(&mut self, p: VoicePayload) -> Option<JoinHandle<()>> {
+        self.on_payload_with_trace_id(p, crate::trace_context::new_trace_id())
+    }
+
+    pub fn on_payload_with_trace_id(
+        &mut self,
+        p: VoicePayload,
+        trace_id: String,
+    ) -> Option<JoinHandle<()>> {
+        self.trace_id = trace_id;
         if self.closed {
             debug!(
                 target: "voice_server.session",
@@ -231,6 +260,9 @@ impl VoiceSession {
                 );
                 if self.state == SessionState::Idle {
                     self.transition(SessionState::Listening);
+                }
+                if self.audio_buf.len() == 0 {
+                    self.input_started_at = Some(Instant::now());
                 }
                 self.audio_buf.push(data);
                 if is_last {
@@ -298,6 +330,7 @@ impl VoiceSession {
                 self.global_cancel = CancellationToken::new();
                 *self.current_real_cancel.lock() = None;
                 let _ = self.audio_buf.drain();
+                self.input_started_at = Some(Instant::now());
                 self.audio_buf.push(audio);
                 self.trigger_pipeline(TriggerReason::Retry)
             }
@@ -330,6 +363,8 @@ impl VoiceSession {
         // 先把"耗时"取出来再 drain（drain 后 audio_buf 计时会被下次 push 重置）
         let bytes_before = self.audio_buf.len();
         let elapsed_before = self.audio_buf.elapsed_ms();
+        let input_started_at = self.input_started_at.take().unwrap_or_else(Instant::now);
+        let input_ended_at = Instant::now();
         let audio = self.audio_buf.drain();
         if audio.len() < MIN_UTTERANCE_BYTES {
             warn!(
@@ -375,8 +410,17 @@ impl VoiceSession {
         let llm = self.llm.clone();
         let tts = self.tts.clone();
         let down_addr = self.down_addr.clone();
+        let metrics = self.metrics.clone();
 
-        let handle = tokio::spawn(async move {
+        let trace_id = self.trace_id.clone();
+        let span = tracing::info_span!(
+            target: "voice_server.ws",
+            "WS pipeline",
+            session_id = %session_id,
+            request_id,
+            trace_id = %trace_id,
+        );
+        let handle = tokio::spawn(scope(trace_id, async move {
             run_pipeline(
                 session_id,
                 request_id,
@@ -391,9 +435,13 @@ impl VoiceSession {
                 down_addr,
                 cancel,
                 current_real_cancel,
+                metrics,
+                input_started_at,
+                input_ended_at,
             )
             .await;
-        });
+        })
+        .instrument(span));
 
         self.transition(SessionState::Listening);
 

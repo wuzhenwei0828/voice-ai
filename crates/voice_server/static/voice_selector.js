@@ -31,7 +31,7 @@
   async function loadAndPopulate() {
     let data;
     try {
-      const resp = await fetch('/admin/voices');
+      const resp = await fetchWithTrace('/admin/voices');
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       data = await resp.json();
     } catch (e) {

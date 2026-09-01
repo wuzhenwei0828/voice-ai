@@ -53,6 +53,7 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::client::error::ClientError;
+use crate::trace_context::current_trace_id;
 
 pub use protocol::{FunasrClose, FunasrEvent, FunasrResponse, FunasrResponseMode};
 pub use ws::{FunasrReceiver, FunasrSender, FunasrSession};
@@ -214,7 +215,16 @@ impl FunasrClient {
             "FunASR WSS 建连开始"
         );
 
-        let req = self.build_handshake_request()?;
+        let mut req = self.build_handshake_request()?;
+        if let Some(trace_id) = current_trace_id() {
+            if let Ok(value) = async_tungstenite::tungstenite::http::HeaderValue::from_str(&trace_id)
+            {
+                req.headers_mut().insert(
+                    async_tungstenite::tungstenite::http::HeaderName::from_static("trace_id"),
+                    value,
+                );
+            }
+        }
         let (ws, _resp) = connect_async(req)
             .await
             .map_err(|e| ClientError::Ws(format!("ws handshake: {}", e)))?;

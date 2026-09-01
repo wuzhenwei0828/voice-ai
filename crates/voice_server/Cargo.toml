@@ -28,6 +28,7 @@ tracing-subscriber = { workspace = true }
 time = { version = "0.3", features = ["macros", "formatting", "local-offset"] }
 clap = { version = "4", features = ["derive"] }
 uuid = { workspace = true }
+prometheus = { workspace = true }
 parking_lot = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }

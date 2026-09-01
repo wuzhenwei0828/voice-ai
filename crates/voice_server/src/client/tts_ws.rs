@@ -21,10 +21,11 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use super::tts::{BoxStream, TtsClient, TtsInputSession};
 use crate::client::error::ClientError;
+use crate::trace_context::current_trace_id;
 use crate::events::TtsEvent;
 
 pub type WsStream = async_tungstenite::WebSocketStream<
@@ -254,6 +255,7 @@ pub struct TtsWsInputSession {
     utterance_started_at: Option<Instant>,
     closed: bool,
     seq: u32,
+    first_audio_logged: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,6 +310,13 @@ impl TtsWsClient {
                     .map_err(|e| ClientError::Ws(format!("invalid authorization: {e}")))?,
             );
         }
+        if let Some(trace_id) = current_trace_id() {
+            request.headers_mut().insert(
+                HeaderName::from_static("trace_id"),
+                HeaderValue::from_str(&trace_id)
+                    .map_err(|e| ClientError::Ws(format!("invalid trace_id: {e}")))?,
+            );
+        }
         for (name, value) in &self.cfg.extra_headers {
             let name = HeaderName::from_bytes(name.as_bytes())
                 .map_err(|e| ClientError::Ws(format!("invalid header name: {e}")))?;
@@ -357,7 +366,7 @@ impl TtsWsClient {
             );
             ClientError::Ws(format!("send session.config: {e}"))
         })?;
-        debug!(target: "voice_server.tts.ws", "TTS WebSocket 已发送 session.config");
+        info!(target: "voice_server.tts.ws", "TTS WebSocket 已发送 session.config");
         Ok(ws)
     }
 
@@ -473,7 +482,7 @@ impl TtsWsClient {
                     drop(stream);
                     let mut meta = entry.meta.lock().await;
                     meta.last_sent_at = Instant::now();
-                    debug!(target: "voice_server.tts.ws", session_id, "TTS WebSocket 新对话已发送 session.config");
+                    info!(target: "voice_server.tts.ws", session_id, "TTS WebSocket 新对话已发送 session.config");
                 }
             }
             return Ok(TtsWsLease {
@@ -583,6 +592,7 @@ impl TtsClient for TtsWsClient {
             utterance_started_at: None,
             closed: false,
             seq: 0,
+            first_audio_logged: false,
         })))
     }
 
@@ -605,6 +615,7 @@ impl TtsClient for TtsWsClient {
             utterance_started_at: None,
             closed: false,
             seq: 0,
+            first_audio_logged: false,
         };
         let session_id = session_id.to_string();
         let text = text.to_string();
@@ -675,6 +686,12 @@ impl TtsWsLease {
             .map_err(|error| ClientError::Ws(format!("send {kind}: {error}")))?;
         drop(stream);
         self.entry.meta.lock().await.last_sent_at = Instant::now();
+        info!(
+            target: "voice_server.tts.ws",
+            session_id = %self.session_id,
+            event = kind,
+            "TTS WebSocket 已发送事件"
+        );
         Ok(())
     }
 
@@ -696,7 +713,17 @@ impl TtsWsLease {
                 Some(Ok(Message::Binary(bytes))) => {
                     return Some(Ok(ServerMessage::Audio(bytes.to_vec())))
                 }
-                Some(Ok(Message::Text(value))) => return Some(parse_control_message(&value)),
+                Some(Ok(Message::Text(value))) => {
+                    let parsed = parse_control_message(&value);
+                    match &parsed {
+                        Ok(ServerMessage::AudioStart) => info!(target: "voice_server.tts.ws", session_id = %self.session_id, event = "audio.start", "TTS WebSocket 收到事件"),
+                        Ok(ServerMessage::AudioDone { error }) => info!(target: "voice_server.tts.ws", session_id = %self.session_id, event = "audio.done", error = *error, "TTS WebSocket 收到事件"),
+                        Ok(ServerMessage::SessionDone) => info!(target: "voice_server.tts.ws", session_id = %self.session_id, event = "session.done", "TTS WebSocket 收到事件"),
+                        Ok(ServerMessage::Error(message)) => warn!(target: "voice_server.tts.ws", session_id = %self.session_id, event = "error", error = %message, "TTS WebSocket 收到错误事件"),
+                        Ok(ServerMessage::Audio(_)) | Err(_) => {}
+                    }
+                    return Some(parsed);
+                }
                 Some(Ok(Message::Ping(payload))) => {
                     let _ = ws.send(Message::Pong(payload)).await;
                 }
@@ -851,6 +878,7 @@ impl super::tts::TtsInputSession for TtsWsInputSession {
                 .await?;
         }
         self.utterance_started_at = Some(Instant::now());
+        self.first_audio_logged = false;
         self.utterance_state = UtteranceState::WaitingForDone;
         Ok(())
     }
@@ -887,6 +915,16 @@ impl super::tts::TtsInputSession for TtsWsInputSession {
             match next {
                 Ok(ServerMessage::Audio(bytes)) => {
                     self.seq = self.seq.saturating_add(1);
+                    if !self.first_audio_logged {
+                        self.first_audio_logged = true;
+                        info!(
+                            target: "voice_server.tts.ws",
+                            session_id = %self.session_id,
+                            elapsed_ms = self.utterance_started_at.map(|started| started.elapsed().as_millis() as u64).unwrap_or(0),
+                            bytes = bytes.len(),
+                            "TTS WebSocket 收到首个音频 chunk"
+                        );
+                    }
                     return Some(Ok(TtsEvent {
                         seq: self.seq,
                         data: bytes,
@@ -904,9 +942,16 @@ impl super::tts::TtsInputSession for TtsWsInputSession {
                     return Some(Err(ClientError::Ws("TTS audio generation failed".into())));
                 }
                 Ok(ServerMessage::SessionDone) => {
+                    info!(
+                        target: "voice_server.tts.ws",
+                        session_id = %self.session_id,
+                        elapsed_ms = self.utterance_started_at.map(|started| started.elapsed().as_millis() as u64).unwrap_or(0),
+                        "TTS WebSocket 回复完成"
+                    );
                     self.utterance_text.clear();
                     self.utterance_state = UtteranceState::Collecting;
                     self.utterance_started_at = None;
+                    self.first_audio_logged = false;
                     self.seq = self.seq.saturating_add(1);
                     return Some(Ok(TtsEvent {
                         seq: self.seq,
@@ -914,7 +959,8 @@ impl super::tts::TtsInputSession for TtsWsInputSession {
                         is_last: true,
                     }));
                 }
-                Ok(ServerMessage::Error(_message)) => {
+                Ok(ServerMessage::Error(message)) => {
+                    warn!(target: "voice_server.tts.ws", session_id = %self.session_id, error = %message, "TTS WebSocket 回复错误");
                     self.client.invalidate(&entry).await;
                     self.lease = None;
                     self.config_sent = false;

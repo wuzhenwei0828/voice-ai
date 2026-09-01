@@ -581,7 +581,7 @@
   }
 
   function encodeIndication(payload) {
-    return msgpackEncode({ Indication: { data: payload } });
+    return msgpackEncode({ Indication: { data: { ...payload, message_id: payload.message_id || createTraceId() } } });
   }
 
   function decodeMessage(bytes) {
@@ -771,6 +771,20 @@
   }
 
   // ====== WebSocket ======
+  function sendWsPayload(payload) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    const message = { ...payload, message_id: payload.message_id || createTraceId() };
+    const bytes = encodeIndication(message);
+    console.info('[voice-ws] send', {
+      sessionId,
+      type: message.type,
+      messageId: message.message_id,
+      bytes: bytes.byteLength,
+    });
+    ws.send(bytes);
+    return true;
+  }
+
   function connect() {
     return new Promise((resolve, reject) => {
       ws = new WebSocket(buildWsUrl(sessionId));
@@ -790,8 +804,7 @@
           language: 'zh-CN',
         };
         if (voice) startPayload.voice = voice;
-        const start = encodeIndication(startPayload);
-        ws.send(start);
+        sendWsPayload(startPayload);
         console.log(`[发送] SessionStart session_id=${sessionId} sample_rate=${SAMPLE_RATE} channels=${CHANNELS} codec=pcm_s16le language=zh-CN voice=${voice || '(default)'}`);
         addMessage('system', '已发送 SessionStart');
         resolve();
@@ -819,6 +832,12 @@
           const bytes = new Uint8Array(ev.data);
           const payload = decodeMessage(bytes);
           if (!payload || !payload.type) return;
+          console.info('[voice-ws] receive', {
+            sessionId,
+            type: payload.type,
+            messageId: payload.message_id,
+            bytes: bytes.byteLength,
+          });
 
           switch (payload.type) {
             case 'asr_partial':
@@ -886,10 +905,10 @@
 
   function sendInterrupt() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(encodeIndication({
+    sendWsPayload({
       type: 'interrupt',
       session_id: sessionId,
-    }));
+    });
     console.log(`[发送] Interrupt session_id=${sessionId}`);
     addMessage('system', '已发送 Interrupt');
     // 立即停止正在播放的 TTS，并清空队列里未播的 chunk
@@ -900,11 +919,11 @@
 
   function sendSessionEnd(reason) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(encodeIndication({
+    sendWsPayload({
       type: 'session_end',
       session_id: sessionId,
       reason: reason || 'normal exit',
-    }));
+    });
     console.log(`[发送] SessionEnd session_id=${sessionId} reason=${reason || 'normal exit'}`);
   }
 
@@ -1092,7 +1111,7 @@
           data: bytes,
           is_last: isLast,
         };
-        ws.send(encodeIndication(payload));
+        sendWsPayload(payload);
         // 与服务端"收到 AudioChunk"日志逐字段对齐，便于两端对比
         console.log(`[发送] AudioChunk session_id=${sessionId} seq=${seq} bytes=${bytes.length} timestamp_ms=${payload.timestamp_ms} is_last=${isLast}`);
         if (isLast) {
@@ -1175,10 +1194,10 @@
       socketOpen: !!ws && ws.readyState === WebSocket.OPEN,
       stopPlayback: stopTtsPlayback,
       invalidateRequest: () => requestTracker.invalidateCurrent(),
-      sendRetry: () => ws.send(encodeIndication({
+      sendRetry: () => sendWsPayload({
         type: 'retry',
         session_id: sessionId,
-      })),
+      }),
     });
     if (!sent) return;
 

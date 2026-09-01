@@ -8,6 +8,7 @@ description = "VoicePayload protocol definitions for voice-ai"
 
 [dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true }
 rmp-serde = { workspace = true }
 serde_bytes = "0.11"
 webproto = { workspace = true }

@@ -1,5 +1,5 @@
 # voice-server 配置
-# 字段名与 async-openai::OpenAIConfig 对齐：api_base / api_key
+# 连接字段使用 OpenAI-compatible 命名：api_base / api_key
 # 顶层 `provider` 是 asr/llm/tts 的连接级默认值（被 per-section 字段覆盖）
 
 log:
@@ -32,8 +32,18 @@ asr:
 # LLM：流式 chat completion
 llm:
   model: "Qwen/Qwen2.5-7B-Instruct"
-  # api_key 会由 LLM 客户端映射为 x-api-key 请求头
+  # 连接字段缺省时继承 provider；api_key 会映射为 x-api-key 请求头
+  # api_base: "https://llm.example.com/v1"
   # api_key: "sk-*******"
+  # timeout_ms: 30000
+  # headers:
+  #   X-Tenant: tenant-a
+  # OpenAI Chat Completions 可选生成参数；缺省时不发送，使用上游默认值
+  # max_completion_tokens: 512
+  # temperature: 0.7              # 0..2；通常不要与 top_p 同时调整
+  # top_p: 0.9                    # 0..1
+  # reasoning_effort: "low"       # 仅配置兼容该字段的模型/provider
+  # include_usage: true           # 请求 stream_options.include_usage 并记录 token usage
 
 # TTS：文本 → 音频（vLLM-Omni OpenAI-compatible speech API）
 tts:

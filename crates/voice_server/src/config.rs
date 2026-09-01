@@ -2,7 +2,7 @@
 //!
 //! `log` 段由本 crate 的 `logging` 模块提供 LogConfig
 //! `server` 段：监听端口 / worker 数
-//! `asr` / `llm` / `tts` 段：每个 section 直接对应一个 client，**复用 async-openai 的 OpenAIConfig**
+//! `asr` / `llm` / `tts` 段：每个 section 直接对应一个 client
 //! 顶层 `provider` 段：可作为 asr/llm/tts 的连接级默认值（api_base / api_key / timeout / headers）
 //!
 //! 完整示例：
@@ -17,7 +17,7 @@
 //!
 //! provider:
 //!   api_base: "https://api.siliconflow.cn/v1"   # 所有 client 默认走这个 base
-//!   api_key: "sk-eqrxgvn..."                    # 裸 token（OpenAIConfig 会自动加 Bearer）
+//!   api_key: "sk-eqrxgvn..."                    # 裸 token；各 client 映射为目标鉴权 header
 //!   timeout_ms: 30000
 //!   headers:                                    # 透传给所有 client
 //!     X-Region: cn-beijing
@@ -161,7 +161,7 @@ pub struct ProviderConfig {
     /// 客户端会自动拼 OpenAI 标准路径（/audio/transcriptions、/chat/completions、/audio/speech）
     #[serde(default)]
     pub api_base: String,
-    /// 裸 API token（如 "sk-xxx"），OpenAIConfig 会自动加 "Bearer "
+    /// 裸 API token（如 "sk-xxx"），由具体 client 映射为目标鉴权 header
     /// 也支持完整 "Bearer xxx" 形式（兼容旧 yaml）
     #[serde(default)]
     pub api_key: String,
@@ -317,6 +317,16 @@ pub struct LlmConfig {
     #[serde(default)]
     pub headers: HashMap<String, String>,
     pub model: String,
+    #[serde(default)]
+    pub max_completion_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub top_p: Option<f64>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub include_usage: bool,
 }
 
 impl LlmConfig {
@@ -353,6 +363,11 @@ impl Default for LlmConfig {
             timeout_ms: None,
             headers: HashMap::new(),
             model: String::new(),
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+            include_usage: false,
         }
     }
 }
@@ -561,6 +576,8 @@ impl VoiceConfig {
     ///   - VOICE_PROVIDER_API_KEY                  （provider 段）
     ///   - VOICE_<ASR|LLM|TTS>_API_KEY             （per-section 覆盖）
     ///   - VOICE_<ASR|LLM|TTS>_MODEL               （per-section）
+    ///   - VOICE_LLM_{API_BASE,TIMEOUT_MS,HEADERS}  （LLM 连接覆盖；HEADERS 是 JSON object）
+    ///   - VOICE_LLM_{MAX_COMPLETION_TOKENS,TEMPERATURE,TOP_P,REASONING_EFFORT,INCLUDE_USAGE}
     ///   - VOICE_TTS_VOICE                          （tts 段）
     ///   - VOICE_TTS_SAMPLE_RATE                    （tts 段，u32；非法值忽略）
     ///   - VOICE_REDIS_URL                          （redis 顶层段，连接 URL）
@@ -575,11 +592,14 @@ impl VoiceConfig {
                 self.server.port = p;
             }
         }
-        if let Some(p) = self.provider.as_mut() {
-            if let Ok(v) = std::env::var("VOICE_PROVIDER_API_BASE") {
+        let provider_api_base = std::env::var("VOICE_PROVIDER_API_BASE").ok();
+        let provider_api_key = std::env::var("VOICE_PROVIDER_API_KEY").ok();
+        if provider_api_base.is_some() || provider_api_key.is_some() {
+            let p = self.provider.get_or_insert_with(ProviderConfig::default);
+            if let Some(v) = provider_api_base {
                 p.api_base = v;
             }
-            if let Ok(v) = std::env::var("VOICE_PROVIDER_API_KEY") {
+            if let Some(v) = provider_api_key {
                 p.api_key = v;
             }
         }
@@ -653,11 +673,77 @@ fn parse_env_bool(s: &str) -> Option<bool> {
     }
 }
 fn apply_section_env_llm(c: &mut LlmConfig, prefix: &str) {
+    if let Ok(v) = std::env::var(format!("VOICE_{}_API_BASE", prefix)) {
+        c.api_base = v;
+    }
     if let Ok(v) = std::env::var(format!("VOICE_{}_API_KEY", prefix)) {
         c.api_key = v;
     }
+    if let Ok(v) = std::env::var(format!("VOICE_{}_TIMEOUT_MS", prefix)) {
+        match v.trim().parse() {
+            Ok(n) => c.timeout_ms = Some(n),
+            Err(_) => tracing::warn!(
+                target: "voice_server.config",
+                env = format!("VOICE_{}_TIMEOUT_MS", prefix),
+                raw = %v,
+                "LLM timeout_ms 环境变量无法解析为 u64，忽略"
+            ),
+        }
+    }
+    if let Ok(v) = std::env::var(format!("VOICE_{}_HEADERS", prefix)) {
+        match serde_json::from_str::<HashMap<String, String>>(&v) {
+            Ok(headers) => c.headers = headers,
+            Err(e) => tracing::warn!(
+                target: "voice_server.config",
+                env = format!("VOICE_{}_HEADERS", prefix),
+                error = %e,
+                "LLM headers 环境变量不是 JSON 字符串对象，忽略"
+            ),
+        }
+    }
     if let Ok(v) = std::env::var(format!("VOICE_{}_MODEL", prefix)) {
         c.model = v;
+    }
+    if let Ok(v) = std::env::var(format!("VOICE_{}_MAX_COMPLETION_TOKENS", prefix)) {
+        match v.trim().parse() {
+            Ok(n) => c.max_completion_tokens = Some(n),
+            Err(_) => tracing::warn!(
+                target: "voice_server.config",
+                env = format!("VOICE_{}_MAX_COMPLETION_TOKENS", prefix),
+                raw = %v,
+                "LLM max_completion_tokens 环境变量无法解析为 u32，忽略"
+            ),
+        }
+    }
+    if let Ok(v) = std::env::var(format!("VOICE_{}_TEMPERATURE", prefix)) {
+        match v.trim().parse() {
+            Ok(n) => c.temperature = Some(n),
+            Err(_) => tracing::warn!(
+                target: "voice_server.config",
+                env = format!("VOICE_{}_TEMPERATURE", prefix),
+                raw = %v,
+                "LLM temperature 环境变量无法解析为浮点数，忽略"
+            ),
+        }
+    }
+    if let Ok(v) = std::env::var(format!("VOICE_{}_TOP_P", prefix)) {
+        match v.trim().parse() {
+            Ok(n) => c.top_p = Some(n),
+            Err(_) => tracing::warn!(
+                target: "voice_server.config",
+                env = format!("VOICE_{}_TOP_P", prefix),
+                raw = %v,
+                "LLM top_p 环境变量无法解析为浮点数，忽略"
+            ),
+        }
+    }
+    if let Ok(v) = std::env::var(format!("VOICE_{}_REASONING_EFFORT", prefix)) {
+        c.reasoning_effort = Some(v);
+    }
+    if let Ok(v) = std::env::var(format!("VOICE_{}_INCLUDE_USAGE", prefix)) {
+        if let Some(include_usage) = parse_env_bool(&v) {
+            c.include_usage = include_usage;
+        }
     }
 }
 fn apply_section_env_tts(c: &mut TtsConfig, prefix: &str) {
@@ -699,9 +785,8 @@ impl Default for VoiceConfig {
     }
 }
 
-// ===== 辅助：让 ASR/LLM client 拿到 OpenAIConfig =====
-// 注：ASR 已切到手搓 reqwest（multipart/form-data），不再需要 OpenAIConfig 桥接；
-// 仅 LLM 仍走 async-openai SDK，保留 llm_openai / tts_parts。
+// ===== OpenAIConfig 兼容桥接 =====
+// 当前 client 已直接使用 reqwest；保留这些 public helper，避免破坏现有外部调用。
 
 pub fn llm_openai(cfg: &LlmConfig, provider: Option<&ProviderConfig>) -> OpenAIConfig {
     cfg.resolved(provider).to_openai_config()
@@ -715,6 +800,25 @@ pub fn tts_parts(cfg: &TtsConfig, provider: Option<&ProviderConfig>) -> (OpenAIC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct EnvGuard(Vec<&'static str>);
+
+    impl EnvGuard {
+        fn new(keys: Vec<&'static str>) -> Self {
+            for key in &keys {
+                std::env::remove_var(key);
+            }
+            Self(keys)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for key in &self.0 {
+                std::env::remove_var(key);
+            }
+        }
+    }
 
     #[test]
     fn parse_full_yaml() {
@@ -743,6 +847,84 @@ mod tests {
         assert!(resolved.headers.contains_key("X-Region"));
         assert_eq!(cfg.tts.sample_rate, Some(16000));
         assert!(cfg.tts.stream);
+    }
+
+    #[test]
+    fn parses_llm_generation_options() {
+        let yaml = r#"
+            llm:
+              model: "test-model"
+              max_completion_tokens: 512
+              temperature: 0.4
+              top_p: 0.9
+              reasoning_effort: "low"
+              include_usage: true
+        "#;
+
+        let cfg: VoiceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.llm.max_completion_tokens, Some(512));
+        assert_eq!(cfg.llm.temperature, Some(0.4));
+        assert_eq!(cfg.llm.top_p, Some(0.9));
+        assert_eq!(cfg.llm.reasoning_effort.as_deref(), Some("low"));
+        assert!(cfg.llm.include_usage);
+    }
+
+    #[test]
+    fn env_only_provider_settings_create_provider() {
+        let _guard = EnvGuard::new(vec!["VOICE_PROVIDER_API_BASE", "VOICE_PROVIDER_API_KEY"]);
+        std::env::set_var("VOICE_PROVIDER_API_BASE", "https://provider.test/v1");
+        std::env::set_var("VOICE_PROVIDER_API_KEY", "provider-key");
+        let mut cfg = VoiceConfig::default();
+
+        cfg.apply_env_overrides();
+
+        let provider = cfg.provider.expect("provider should be created from env");
+        assert_eq!(provider.api_base, "https://provider.test/v1");
+        assert_eq!(provider.api_key, "provider-key");
+    }
+
+    #[test]
+    fn llm_environment_overrides_all_supported_options() {
+        let keys = vec![
+            "VOICE_LLM_API_BASE",
+            "VOICE_LLM_API_KEY",
+            "VOICE_LLM_TIMEOUT_MS",
+            "VOICE_LLM_HEADERS",
+            "VOICE_LLM_MODEL",
+            "VOICE_LLM_MAX_COMPLETION_TOKENS",
+            "VOICE_LLM_TEMPERATURE",
+            "VOICE_LLM_TOP_P",
+            "VOICE_LLM_REASONING_EFFORT",
+            "VOICE_LLM_INCLUDE_USAGE",
+        ];
+        let _guard = EnvGuard::new(keys);
+        std::env::set_var("VOICE_LLM_API_BASE", "https://llm.test/v1");
+        std::env::set_var("VOICE_LLM_API_KEY", "llm-key");
+        std::env::set_var("VOICE_LLM_TIMEOUT_MS", "45000");
+        std::env::set_var("VOICE_LLM_HEADERS", r#"{"X-Tenant":"tenant-a"}"#);
+        std::env::set_var("VOICE_LLM_MODEL", "test-model");
+        std::env::set_var("VOICE_LLM_MAX_COMPLETION_TOKENS", "384");
+        std::env::set_var("VOICE_LLM_TEMPERATURE", "0.3");
+        std::env::set_var("VOICE_LLM_TOP_P", "0.8");
+        std::env::set_var("VOICE_LLM_REASONING_EFFORT", "medium");
+        std::env::set_var("VOICE_LLM_INCLUDE_USAGE", "true");
+        let mut cfg = VoiceConfig::default();
+
+        cfg.apply_env_overrides();
+
+        assert_eq!(cfg.llm.api_base, "https://llm.test/v1");
+        assert_eq!(cfg.llm.api_key, "llm-key");
+        assert_eq!(cfg.llm.timeout_ms, Some(45000));
+        assert_eq!(
+            cfg.llm.headers.get("X-Tenant").map(String::as_str),
+            Some("tenant-a")
+        );
+        assert_eq!(cfg.llm.model, "test-model");
+        assert_eq!(cfg.llm.max_completion_tokens, Some(384));
+        assert_eq!(cfg.llm.temperature, Some(0.3));
+        assert_eq!(cfg.llm.top_p, Some(0.8));
+        assert_eq!(cfg.llm.reasoning_effort.as_deref(), Some("medium"));
+        assert!(cfg.llm.include_usage);
     }
 
     #[test]

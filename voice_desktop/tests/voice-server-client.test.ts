@@ -1,8 +1,63 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { VoiceServerClient, buildWsUrl, normalizeBaseUrl } from '../src/services/voice-server-client';
 import { decodeVoiceMessage, encodeVoiceIndication } from '../src/services/msgpack';
 import { AudioPlayer } from '../src/services/audio-player';
 describe('voice server urls', () => { it('normalizes and converts https to wss', () => { expect(normalizeBaseUrl('https://api.example.com/')).toBe('https://api.example.com'); expect(buildWsUrl({ baseUrl: 'https://api.example.com/', token: '' }, 'a b')).toBe('wss://api.example.com/ws/voice/web/a%20b'); }); it('rejects unsupported schemes', () => { expect(() => normalizeBaseUrl('ftp://example.com')).toThrow(); }); });
+
+describe('voice message tracing', () => {
+  it('adds a UUID message_id to every outgoing websocket message', () => {
+    const sent: Uint8Array[] = [];
+    const client = new VoiceServerClient({ baseUrl: 'http://localhost', token: '' }, {
+      onState: () => {}, onEvent: () => {},
+    });
+    (client as any).socket = { readyState: WebSocket.OPEN, send: (data: Uint8Array) => sent.push(data) };
+
+    (client as any).send({ type: 'interrupt', session_id: 's' });
+    (client as any).send({ type: 'retry', session_id: 's' });
+
+    const first = decodeVoiceMessage(sent[0]);
+    const second = decodeVoiceMessage(sent[1]);
+    expect(first.message_id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    expect(second.message_id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    expect(second.message_id).not.toBe(first.message_id);
+  });
+
+  it('logs outgoing websocket metadata without payload contents', () => {
+    const sent: Uint8Array[] = [];
+    const client = new VoiceServerClient({ baseUrl: 'http://localhost', token: '' }, {
+      onState: () => {}, onEvent: () => {},
+    });
+    const log = vi.spyOn(console, 'info').mockImplementation(() => {});
+    (client as any).socket = { readyState: WebSocket.OPEN, send: (data: Uint8Array) => sent.push(data) };
+
+    (client as any).send({ type: 'interrupt', session_id: 's' });
+
+    expect(sent).toHaveLength(1);
+    expect(log).toHaveBeenCalledWith('[voice-ws] send', expect.objectContaining({
+      type: 'interrupt',
+      bytes: expect.any(Number),
+    }));
+    log.mockRestore();
+  });
+
+  it('logs received websocket frame size before decoding it', () => {
+    const client = new VoiceServerClient({ baseUrl: 'http://localhost', token: '' }, {
+      onState: () => {}, onEvent: () => {},
+    });
+    const log = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const bytes = encodeVoiceIndication({ type: 'session_ack', session_id: 's', success: true, message: '' });
+
+    (client as any).sessionId = 's';
+    (client as any).handleMessage(bytes);
+
+    expect(log).toHaveBeenCalledWith('[voice-ws] receive', expect.objectContaining({
+      sessionId: 's',
+      type: 'session_ack',
+      bytes: bytes.byteLength,
+    }));
+    log.mockRestore();
+  });
+});
 
 describe('voice MessagePack protocol', () => {
   it('encodes the Rust Indication envelope and preserves binary audio/u64 timestamps', () => {

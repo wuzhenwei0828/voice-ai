@@ -4620,6 +4620,7 @@ dependencies = [
  "rmp-serde",
  "serde",
  "serde_bytes",
+ "serde_json",
  "webproto",
 ]
 
@@ -4642,6 +4643,7 @@ dependencies = [
  "futures",
  "futures-util",
  "parking_lot",
+ "prometheus",
  "redis",
  "reqwest",
  "serde",

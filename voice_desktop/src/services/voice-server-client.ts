@@ -30,18 +30,28 @@ export class VoiceServerClient {
     this.invalidatedRequestId = 0;
     this.activeRequestId = 0;
     this.callbacks.onState('connecting');
+    console.info('[voice-ws] connecting', { sessionId });
     this.socket = new WebSocket(buildWsUrl(this.settings, sessionId));
     this.socket.binaryType = 'arraybuffer';
     this.socket.onopen = () => {
+      console.info('[voice-ws] connected', { sessionId });
       this.send({
         type: 'session_start', session_id: sessionId, sample_rate: 16000, channels: 1,
         codec: 'pcm_s16le', language: 'zh-CN', tts_sample_rate: 24000,
         ...(this.settings.voice?.trim() ? { voice: this.settings.voice.trim() } : {}),
       });
     };
-    this.socket.onmessage = (message) => this.handleMessage(message.data);
-    this.socket.onerror = () => this.callbacks.onState('error');
-    this.socket.onclose = () => this.callbacks.onState('closed');
+    this.socket.onmessage = (message) => {
+      this.handleMessage(message.data);
+    };
+    this.socket.onerror = () => {
+      console.warn('[voice-ws] error', { sessionId: this.sessionId });
+      this.callbacks.onState('error');
+    };
+    this.socket.onclose = (event) => {
+      console.info('[voice-ws] closed', { sessionId: this.sessionId, code: event.code, reason: event.reason });
+      this.callbacks.onState('closed');
+    };
   }
 
   sendAudio(data: ArrayBuffer, isLast = false) {
@@ -53,13 +63,31 @@ export class VoiceServerClient {
   interrupt() { this.invalidatedRequestId = Math.max(this.invalidatedRequestId, this.activeRequestId); if (this.sessionId) this.send({ type: 'interrupt', session_id: this.sessionId }); }
   retry() { if (this.sessionId) this.send({ type: 'retry', session_id: this.sessionId }); }
   stop() { if (this.sessionId) this.send({ type: 'session_end', session_id: this.sessionId, reason: 'user' }); this.utteranceStartedAt = undefined; this.socket?.close(); }
-  private send(payload: Record<string, unknown>) { if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(encodeVoiceIndication(payload) as unknown as ArrayBuffer); }
+  private send(payload: Record<string, unknown>) {
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      const message = { ...payload, message_id: crypto.randomUUID() };
+      const bytes = encodeVoiceIndication(message);
+      console.info('[voice-ws] send', {
+        sessionId: this.sessionId,
+        type: payload['type'],
+        messageId: message.message_id,
+        bytes: bytes.byteLength,
+      });
+      this.socket.send(bytes as unknown as ArrayBuffer);
+    }
+  }
 
   private handleMessage(data: ArrayBuffer | string) {
     try {
       if (typeof data === 'string') throw new Error('服务端返回了不兼容的文本帧');
       const raw = decodeVoiceMessage(data);
       const type = String(raw.type ?? '').toLowerCase();
+      console.info('[voice-ws] receive', {
+        sessionId: this.sessionId,
+        type,
+        messageId: raw.message_id,
+        bytes: data.byteLength,
+      });
       let event: VoiceEvent | undefined;
       if (type === 'session_ack') {
         if (raw.success) this.callbacks.onState('connected');
@@ -83,6 +111,13 @@ export class VoiceServerClient {
         event = { type: 'error', message: String(raw.message ?? '服务端错误') };
       }
       if (event) this.callbacks.onEvent(event);
-    } catch { this.callbacks.onEvent({ type: 'error', message: '收到无法解析的服务端消息' }); }
+    } catch (error) {
+      console.warn('[voice-ws] receive decode failed', {
+        sessionId: this.sessionId,
+        bytes: typeof data === 'string' ? data.length : data.byteLength,
+        error: String(error),
+      });
+      this.callbacks.onEvent({ type: 'error', message: '收到无法解析的服务端消息' });
+    }
   }
 }

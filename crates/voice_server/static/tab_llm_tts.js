@@ -36,7 +36,7 @@
       status.textContent = '调用 /admin/llm_tts ...';
       const body = { text };
       if (voice) body.voice = voice;
-      const resp = await fetch('/admin/llm_tts', {
+      const resp = await fetchWithTrace('/admin/llm_tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),

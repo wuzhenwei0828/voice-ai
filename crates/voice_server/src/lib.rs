@@ -26,8 +26,10 @@ pub mod config;
 pub mod events;
 pub mod live_asr;
 pub mod logging;
+pub mod metrics;
 pub mod pipeline;
 pub mod service;
+pub mod trace_context;
 pub mod session;
 pub mod utils;
 
@@ -47,5 +49,6 @@ pub use logging::{
     candidate_paths, default_config_path, init_logging, load_yaml, resolve_config_path,
     resolve_web_static_dir, LogConfig, LogFormat,
 };
+pub use metrics::VoiceMetrics;
 pub use service::VoiceService;
 pub use session::{SessionState, VoiceSession};

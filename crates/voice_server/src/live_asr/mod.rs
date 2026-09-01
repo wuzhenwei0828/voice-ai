@@ -44,6 +44,7 @@ use crate::client::error::ClientError;
 use crate::client::funasr::{
     build_funasr_client, ArcFunasr, FunasrEvent, FunasrReceiver, FunasrSender,
 };
+use crate::trace_context::{current_trace_id, scope};
 
 use self::runtime::{get_state_arc, runtime, runtime_cfg, sessions, ClientSlot, LiveAsrState};
 
@@ -51,21 +52,29 @@ use self::runtime::{get_state_arc, runtime, runtime_cfg, sessions, ClientSlot, L
 
 /// service.rs::wsdata 在收到 live-asr 业务消息时调用此函数。
 /// 返回 unit，错误以 AsrPartial {is_final:true, text:"[error]..."} 下行回报。
-pub fn handle_message(addr: Recipient<OutMessage>, session_id: String, payload: Vec<u8>) {
+pub fn handle_message(
+    addr: Recipient<OutMessage>,
+    session_id: String,
+    payload: Vec<u8>,
+    trace_id: String,
+) {
     actix_rt::spawn(async move {
-        let (kind, p) = match decode_payload(&payload) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(target: "voice_server.live_asr", session_id, error = %e, "解码失败");
-                send_error(&addr, &session_id, "decode error");
+        scope(trace_id, async move {
+            let (kind, p) = match decode_payload(&payload) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(target: "voice_server.live_asr", session_id, error = %e, "解码失败");
+                    send_error(&addr, &session_id, "decode error");
+                    return;
+                }
+            };
+            if kind != PayloadKind::Indication {
+                debug!(target: "voice_server.live_asr", session_id, ?kind, "忽略非 Indication 消息");
                 return;
             }
-        };
-        if kind != PayloadKind::Indication {
-            debug!(target: "voice_server.live_asr", session_id, ?kind, "忽略非 Indication 消息");
-            return;
-        }
-        dispatch(&addr, session_id, p).await;
+            dispatch(&addr, session_id, p).await;
+        })
+        .await;
     });
 }
 
@@ -163,8 +172,12 @@ async fn on_session_start(
     // 后台任务跑握手，不阻塞 on_session_start —— 浏览器可以继续推 AudioChunk（缓冲）
     let addr_clone = addr.clone();
     let sid_clone = session_id.clone();
+    let setup_trace_id = current_trace_id().unwrap_or_else(crate::trace_context::new_trace_id);
     actix_rt::spawn(async move {
-        run_setup(addr_clone, sid_clone, client, state_arc).await;
+        scope(setup_trace_id, async move {
+            run_setup(addr_clone, sid_clone, client, state_arc).await;
+        })
+        .await;
     });
 }
 
@@ -722,12 +735,7 @@ fn send_error<E: std::fmt::Display>(addr: &Recipient<OutMessage>, session_id: &s
 }
 
 fn send_down(addr: &Recipient<OutMessage>, payload: VoicePayload) {
-    let kind = match &payload {
-        VoicePayload::SessionAck { .. } => "SessionAck",
-        VoicePayload::AsrPartial { .. } => "AsrPartial",
-        VoicePayload::Error { .. } => "Error",
-        _other => "other",
-    };
+    let kind = payload.type_name();
     info!(
         target: "voice_server.live_asr",
         session_id = ?payload.session_id(),

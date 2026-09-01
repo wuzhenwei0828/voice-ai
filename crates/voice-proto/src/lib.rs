@@ -148,6 +148,23 @@ pub enum VoicePayload {
 }
 
 impl VoicePayload {
+    /// 返回线协议中的消息类型名，用于日志和指标，避免记录完整音频/文本正文。
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            VoicePayload::SessionStart { .. } => "session_start",
+            VoicePayload::SessionEnd { .. } => "session_end",
+            VoicePayload::Interrupt { .. } => "interrupt",
+            VoicePayload::Retry { .. } => "retry",
+            VoicePayload::SessionAck { .. } => "session_ack",
+            VoicePayload::AudioChunk { .. } => "audio_chunk",
+            VoicePayload::AsrPartial { .. } => "asr_partial",
+            VoicePayload::LlmDelta { .. } => "llm_delta",
+            VoicePayload::TtsAudio { .. } => "tts_audio",
+            VoicePayload::AgentStatus { .. } => "agent_status",
+            VoicePayload::Error { .. } => "error",
+        }
+    }
+
     /// 取出 `session_id`（如有）。用于日志/路由。
     pub fn session_id(&self) -> Option<&str> {
         match self {
@@ -181,6 +198,22 @@ pub fn decode_payload(bytes: &[u8]) -> anyhow::Result<(PayloadKind, VoicePayload
         webproto::Message::ServerCommand(c) => (PayloadKind::ServerCommand, c.command),
     };
     Ok((kind, p))
+}
+
+/// 从任意业务消息中提取客户端生成的消息链路 ID。
+/// 旧客户端没有该字段时返回 None，保持协议向后兼容。
+pub fn decode_message_id(bytes: &[u8]) -> Option<String> {
+    let msg: webproto::Message<serde_json::Value> =
+        webproto::decode_message(&bytes.to_vec()).ok()?;
+    let payload = match msg {
+        webproto::Message::Indication(indication) => indication.data,
+        webproto::Message::ClientCommand(command) => command.command,
+        webproto::Message::ServerCommand(command) => command.command,
+    };
+    payload
+        .get("message_id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -461,5 +494,25 @@ mod tests {
             VoicePayload::LlmDelta { request_id, .. } => assert_eq!(request_id, 0),
             other => panic!("unexpected payload: {other:?}"),
         }
+    }
+
+    #[test]
+    fn extracts_message_id_from_indication_payload() {
+        let payload = serde_json::json!({
+            "type": "interrupt",
+            "session_id": "s",
+            "message_id": "550e8400-e29b-41d4-a716-446655440000",
+        });
+        let bytes = webproto::Indication::<serde_json::Value>::encode(payload).unwrap();
+        assert_eq!(decode_message_id(&bytes).as_deref(), Some("550e8400-e29b-41d4-a716-446655440000"));
+    }
+
+    #[test]
+    fn exposes_protocol_type_name_without_serializing_payload() {
+        let payload = VoicePayload::Error {
+            code: 500,
+            message: "provider error".into(),
+        };
+        assert_eq!(payload.type_name(), "error");
     }
 }

@@ -25,7 +25,7 @@
 pub mod audio;
 
 use actix_web::web::{Bytes, Data, Json, Query};
-use actix_web::HttpResponse;
+use actix_web::{HttpRequest, HttpResponse};
 use async_stream::try_stream;
 use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -43,6 +43,7 @@ use crate::utils::postprocess_utils::{
     format_asr_hint, parse_asr_text, rich_transcription_postprocess,
 };
 use audio::prepare_audio_for_asr;
+use crate::trace_context::{scope, scope_stream, trace_id_from_request};
 
 /// 把 `ClientError` 转成 actix 响应。
 ///
@@ -229,7 +230,9 @@ fn gen_sid(prefix: &str) -> String {
 ///   - 输入是 WAV：自动 strip header，取 data chunk 的 PCM 包回标准 WAV 头
 ///   - 输入是裸 PCM（约定 s16le 16kHz mono）：直接包 WAV 头
 /// response: SSE data events carrying `{"text":"...","is_final":false|true}`
-pub async fn asr(body: Bytes, asr: Data<ArcAsr>) -> Result<HttpResponse, actix_web::Error> {
+pub async fn asr(request: HttpRequest, body: Bytes, asr: Data<ArcAsr>) -> Result<HttpResponse, actix_web::Error> {
+    let trace_id = trace_id_from_request(&request);
+    let span = tracing::info_span!(target: "voice_server.http", "HTTP request", endpoint = "asr", trace_id = %trace_id);
     let sid = gen_sid("asr");
     let bytes_len = body.len();
     info!(target: "voice_server.admin_api", endpoint = "asr", session_id = %sid, bytes = bytes_len, "/admin/asr 收到请求");
@@ -243,9 +246,10 @@ pub async fn asr(body: Bytes, asr: Data<ArcAsr>) -> Result<HttpResponse, actix_w
         }
     };
 
-    let stream = asr
-        .recognize(&sid, None, prepared)
-        .await
+    let stream = scope(trace_id.clone(), async {
+        let _entered = span.enter();
+        asr.recognize(&sid, None, prepared).await
+    }).await
         .map_err(api_err_to_response)?;
 
     // AsrEvent -> AsrLine
@@ -259,19 +263,22 @@ pub async fn asr(body: Bytes, asr: Data<ArcAsr>) -> Result<HttpResponse, actix_w
     Ok(HttpResponse::Ok()
         .content_type("text/event-stream")
         .insert_header((actix_web::http::header::CACHE_CONTROL, "no-cache"))
-        .streaming(sse_stream::<AsrLine, ClientError, _>(line_stream)))
+        .streaming(scope_stream(trace_id, span, sse_stream::<AsrLine, ClientError, _>(line_stream))))
 }
 
 /// POST /admin/llm
 /// body: `{"prompt":"...","session_id":"可选"}`
 /// response: SSE data events carrying `{"delta":"...","is_final":false|true}`
-pub async fn llm(req: Json<LlmReq>, llm: Data<ArcLlm>) -> Result<HttpResponse, actix_web::Error> {
+pub async fn llm(request: HttpRequest, req: Json<LlmReq>, llm: Data<ArcLlm>) -> Result<HttpResponse, actix_web::Error> {
+    let trace_id = trace_id_from_request(&request);
+    let span = tracing::info_span!(target: "voice_server.http", "HTTP request", endpoint = "llm", trace_id = %trace_id);
     let sid = req.session_id.clone().unwrap_or_else(|| gen_sid("llm"));
     info!(target: "voice_server.admin_api", endpoint = "llm", session_id = %sid, prompt_len = req.prompt.chars().count(), "/admin/llm 收到请求");
 
-    let stream = llm
-        .chat(&sid, &req.prompt, None)
-        .await
+    let stream = scope(trace_id.clone(), async {
+        let _entered = span.enter();
+        llm.chat(&sid, &req.prompt, None).await
+    }).await
         .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
 
     let line_stream = stream.map(|res| {
@@ -284,7 +291,7 @@ pub async fn llm(req: Json<LlmReq>, llm: Data<ArcLlm>) -> Result<HttpResponse, a
     Ok(HttpResponse::Ok()
         .content_type("text/event-stream")
         .insert_header((actix_web::http::header::CACHE_CONTROL, "no-cache"))
-        .streaming(sse_stream::<LlmLine, ClientError, _>(line_stream)))
+        .streaming(scope_stream(trace_id, span, sse_stream::<LlmLine, ClientError, _>(line_stream))))
 }
 
 /// POST /admin/tts
@@ -293,7 +300,9 @@ pub async fn llm(req: Json<LlmReq>, llm: Data<ArcLlm>) -> Result<HttpResponse, a
 ///       句间过 crossfade 消除波形拼接尖刺。
 /// response: SSE data events carrying `{"seq":N,"audio":"<base64>","is_last":false|true}`
 ///           最后补一条 `{"seq":N+1,"audio":"","is_last":true}` 作为结束标记
-pub async fn tts(req: Json<TtsReq>, tts: Data<ArcTts>) -> Result<HttpResponse, actix_web::Error> {
+pub async fn tts(request: HttpRequest, req: Json<TtsReq>, tts: Data<ArcTts>) -> Result<HttpResponse, actix_web::Error> {
+    let trace_id = trace_id_from_request(&request);
+    let span = tracing::info_span!(target: "voice_server.http", "HTTP request", endpoint = "tts", trace_id = %trace_id);
     let sid = req.session_id.clone().unwrap_or_else(|| gen_sid("tts"));
     info!(
         target: "voice_server.admin_api",
@@ -312,13 +321,13 @@ pub async fn tts(req: Json<TtsReq>, tts: Data<ArcTts>) -> Result<HttpResponse, a
     Ok(HttpResponse::Ok()
         .content_type("text/event-stream")
         .insert_header((actix_web::http::header::CACHE_CONTROL, "no-cache"))
-        .streaming(build_tts_sentence_stream(
+        .streaming(scope_stream(trace_id, span, build_tts_sentence_stream(
             text,
             sid_inner,
             tts.get_ref().clone(),
             None,
             voice_override,
-        )))
+        ))))
 }
 
 /// 把一段长文本按 next_sentence_end 切句，清洗并合并短句后调 TTS，过 SentenceCrossfader 后下发。
@@ -439,10 +448,13 @@ fn build_tts_sentence_stream(
 ///           最后补一条 `{"seq":N+1,"audio":"","is_last":true}` 作为结束标记
 /// （LLM 文本 delta 不透出、服务端日志可见；/admin/asr_llm_tts 会透出）
 pub async fn llm_tts(
+    request: HttpRequest,
     req: Json<TtsReq>,
     llm: Data<ArcLlm>,
     tts: Data<ArcTts>,
 ) -> Result<HttpResponse, actix_web::Error> {
+    let trace_id = trace_id_from_request(&request);
+    let span = tracing::info_span!(target: "voice_server.http", "HTTP request", endpoint = "llm_tts", trace_id = %trace_id);
     let sid = req.session_id.clone().unwrap_or_else(|| gen_sid("llm_tts"));
     info!(
         target: "voice_server.admin_api",
@@ -471,7 +483,7 @@ pub async fn llm_tts(
     Ok(HttpResponse::Ok()
         .content_type("text/event-stream")
         .insert_header((actix_web::http::header::CACHE_CONTROL, "no-cache"))
-        .streaming(llm_tts_lines(items)))
+        .streaming(scope_stream(trace_id, span, llm_tts_lines(items))))
 }
 
 /// 把 LlmTtsItem 流映射成 /admin/llm_tts 的 wire 格式（Llm 事件不透出）。
@@ -509,6 +521,7 @@ fn llm_tts_lines(
 ///   `{"stage":"tts","seq":..,"audio":base64,"is_last":..}`（末尾 audio 空、is_last:true 结束标记）
 ///   `{"error":..,"code":1001~1005}`
 pub async fn asr_llm_tts(
+    request: HttpRequest,
     body: Bytes,
     asr: Data<ArcAsr>,
     llm: Data<ArcLlm>,
@@ -516,6 +529,8 @@ pub async fn asr_llm_tts(
     // /admin/asr_llm_tts 是裸 PCM body，没法用 JSON 字段传 voice → 用 query 参数
     query: Query<AsrLlmTtsQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
+    let trace_id = trace_id_from_request(&request);
+    let span = tracing::info_span!(target: "voice_server.http", "HTTP request", endpoint = "asr_llm_tts", trace_id = %trace_id);
     let sid = gen_sid("asr_llm_tts");
     let bytes_len = body.len();
     info!(
@@ -540,14 +555,14 @@ pub async fn asr_llm_tts(
     Ok(HttpResponse::Ok()
         .content_type("text/event-stream")
         .insert_header((actix_web::http::header::CACHE_CONTROL, "no-cache"))
-        .streaming(build_asr_llm_tts_stream(
+        .streaming(scope_stream(trace_id, span, build_asr_llm_tts_stream(
             prepared,
             sid,
             asr.get_ref().clone(),
             llm.get_ref().clone(),
             tts.get_ref().clone(),
             query.voice.clone(),
-        )))
+        ))))
 }
 
 /// /admin/asr_llm_tts 的 query 参数：现在仅 `voice`（短名，可选）。
@@ -568,10 +583,15 @@ pub struct AsrLlmTtsQuery {
 ///
 /// 优先读取 TTS provider 的 `/v1/audio/voices`；请求失败、响应不合法或列表为空时，
 /// 回退到本地兼容 map。配置默认值只有在最终列表中存在时才保留，否则返回列表第一个。
-pub async fn voices(tts: Data<ArcTts>) -> Result<HttpResponse, actix_web::Error> {
+pub async fn voices(request: HttpRequest, tts: Data<ArcTts>) -> Result<HttpResponse, actix_web::Error> {
+    let trace_id = trace_id_from_request(&request);
+    let span = tracing::info_span!(target: "voice_server.http", "HTTP request", endpoint = "voices", trace_id = %trace_id);
     use crate::client::tts::supported_voice_shorts;
 
-    let voices = match tts.get_ref().list_voices().await {
+    let voices = match scope(trace_id, async {
+        let _entered = span.enter();
+        tts.get_ref().list_voices().await
+    }).await {
         Ok(voices) if !voices.is_empty() => voices,
         Ok(_) => {
             warn!(target: "voice_server.admin_api", endpoint = "voices", "TTS provider returned an empty voice list; falling back to legacy map");
@@ -603,7 +623,9 @@ pub async fn voices(tts: Data<ArcTts>) -> Result<HttpResponse, actix_web::Error>
 /// GET /admin/tts/format
 ///
 /// 返回当前 TTS 客户端实际使用的 PCM 输出格式，供调试页面封装 WAV。
-pub async fn tts_format(tts: Data<ArcTts>) -> Result<HttpResponse, actix_web::Error> {
+pub async fn tts_format(request: HttpRequest, tts: Data<ArcTts>) -> Result<HttpResponse, actix_web::Error> {
+    let trace_id = trace_id_from_request(&request);
+    let _span = tracing::info_span!(target: "voice_server.http", "HTTP request", endpoint = "tts_format", trace_id = %trace_id);
     let (sample_rate, channels) = tts.get_ref().output_format();
     Ok(HttpResponse::Ok()
         .content_type("application/json")
@@ -775,7 +797,7 @@ mod tests {
             remote_voices: Some(vec!["vivian".to_string(), "aiden".to_string()]),
             configured_default: "vivian",
         }) as ArcTts;
-        let response = voices(Data::new(configured))
+        let response = voices(actix_web::test::TestRequest::default().to_http_request(), Data::new(configured))
             .await
             .expect("handler should return a response");
         let body = actix_web::body::to_bytes(response.into_body())
@@ -790,7 +812,10 @@ mod tests {
             remote_voices: Some(vec!["aiden".to_string(), "vivian".to_string()]),
             configured_default: "not-loaded",
         }) as ArcTts;
-        let response = voices(Data::new(missing_configured_default))
+        let response = voices(
+            actix_web::test::TestRequest::default().to_http_request(),
+            Data::new(missing_configured_default),
+        )
             .await
             .expect("handler should return a response");
         let body = actix_web::body::to_bytes(response.into_body())
@@ -808,7 +833,7 @@ mod tests {
             remote_voices: None,
             configured_default: "vivian",
         }) as ArcTts;
-        let response = voices(Data::new(tts))
+        let response = voices(actix_web::test::TestRequest::default().to_http_request(), Data::new(tts))
             .await
             .expect("handler should return a response");
         let body = actix_web::body::to_bytes(response.into_body())

@@ -54,7 +54,7 @@
       log('upload start:', selectedFile.name, buf.byteLength, 'B');
 
       setStatus('调用 /admin/asr ...');
-      const resp = await fetch('/admin/asr', {
+      const resp = await fetchWithTrace('/admin/asr', {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
         body: buf,

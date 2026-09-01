@@ -23,6 +23,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::client::error::{parse_openai_error, ClientError};
+use crate::client::apply_trace_header;
 use crate::client::tts_ws::{TtsWsClient, TtsWsConfig};
 use crate::config::{ProviderConfig, TtsConfig};
 use crate::events::TtsEvent;
@@ -468,11 +469,11 @@ impl TtsClient for HttpTtsClient {
             x_vector_only_mode: self.x_vector_only_mode,
             sample_rate: effective_sample_rate,
         };
-        let mut req = self
+        let mut req = apply_trace_header(self
             .client
             .request(reqwest::Method::POST, &url)
             .header("x-session-id", session_id)
-            .json(&body);
+            .json(&body));
         if let Some(key) = &self.api_key {
             // 如果用户已经在 key 里写了 "Bearer xxx"，原样发；
             // 否则 SDK 习惯是只发 token，由服务端加 Bearer —— 我们这里也加

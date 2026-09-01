@@ -20,7 +20,7 @@
     output.innerHTML = '';
     try {
       status.textContent = '调用 /admin/llm ...';
-      const resp = await fetch('/admin/llm', {
+      const resp = await fetchWithTrace('/admin/llm', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt }),

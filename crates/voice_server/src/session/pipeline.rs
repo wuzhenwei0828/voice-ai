@@ -10,6 +10,7 @@
 //! 每个阶段之间都有取消检查；取消只结束当前 pipeline，不向客户端伪造“成功完成”事件。
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use actix::prelude::Recipient;
 use futures_util::StreamExt;
@@ -21,6 +22,7 @@ use webhttp::websocket::OutMessage;
 
 use crate::client::{asr::wrap_pcm_as_wav, AsrClient, LlmClient, TtsClient};
 use crate::events::AsrEvent;
+use crate::metrics::VoiceMetrics;
 use crate::pipeline::{llm_tts_items, LlmTtsItem};
 use crate::utils::postprocess_utils::{
     format_asr_hint, parse_asr_text, rich_transcription_postprocess,
@@ -64,11 +66,15 @@ pub(super) async fn run_pipeline(
     down_addr: Recipient<OutMessage>,
     cancel: CancellationToken,
     current_real_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    metrics: Arc<VoiceMetrics>,
+    input_started_at: Instant,
+    input_ended_at: Instant,
 ) {
     // 这是一次 utterance（用户一段语音）的完整生命周期。函数本身不返回业务数据，
     // 所有结果都通过 `down_addr` 发送 VoicePayload；因此每个 return 都代表该请求结束。
     // request_id 会被原样带到所有下行事件，供客户端把并发/打断后的消息归属到正确请求。
     info!(target: "voice_server.session", session_id = %session_id, "pipeline 开始");
+    let mut metric_guard = metrics.start_pipeline(input_started_at, input_ended_at);
 
     // ===== 阶段 1：ASR —— 先识别，再决定是否进入后续链路 =====
     // 先通知前端进入“正在理解”，后续 ASR partial 会在拿到最终文本后一次性 flush。
@@ -100,6 +106,8 @@ pub(super) async fn run_pipeline(
     // 同时加 tokio::time::timeout：上游挂死/极慢响应 → future 被 drop，不会永久持有
     // Arc client + Mutex + HTTP 连接资源（M4 part A）
     let asr_timeout = std::time::Duration::from_secs(30);
+    let asr_started_at = Instant::now();
+    metrics.observe_queue(asr_started_at.duration_since(input_ended_at));
     let mut asr_stream = match tokio::select! {
         _ = cancel.cancelled() => {
             warn!(target: "voice_server.session", session_id = %session_id, "ASR 建连阶段被取消");
@@ -180,7 +188,10 @@ pub(super) async fn run_pipeline(
                         }
                         asr_events.push(AsrEvent { text: cleaned, ..e });
                         if let Some(last) = asr_events.last() {
-                            if last.is_final { break; }
+                            if last.is_final {
+                                metrics.observe_asr(asr_started_at.elapsed());
+                                break;
+                            }
                         }
                     }
                     Some(Err(e)) => {
@@ -307,6 +318,7 @@ pub(super) async fn run_pipeline(
     // 用 override 还是配置兜底（sample_rate_override.or(self.sample_rate)）。
     // voice_override：同理，原样透传 → HttpTtsClient 拼 model 前缀后发给 provider。
     let tts_format = tts.output_format();
+    let llm_started_at = Instant::now();
     let mut items = Box::pin(llm_tts_items(
         prompt,
         asr_hint,
@@ -317,6 +329,9 @@ pub(super) async fn run_pipeline(
         client_voice,
     ));
     let mut speaking_sent = false;
+    let mut llm_first_token_recorded = false;
+    let mut llm_completed_recorded = false;
+    let mut tts_completed_recorded = false;
     // 消费共享管线事件。select! 同时监听 cancel 和 items.next()，保证 LLM/TTS 任一
     // 网络 await 期间都能被用户的新语音打断。
     while let Some(item) = {
@@ -332,6 +347,14 @@ pub(super) async fn run_pipeline(
             LlmTtsItem::Llm { delta, is_final } => {
                 // 空 delta 只在 is_final=true 时有意义：它是“文本流结束”的协议通知。
                 if !delta.is_empty() || is_final {
+                    if !delta.is_empty() && !llm_first_token_recorded {
+                        llm_first_token_recorded = true;
+                        metrics.observe_llm_first_token(llm_started_at.elapsed());
+                    }
+                    if is_final && !llm_completed_recorded {
+                        llm_completed_recorded = true;
+                        metrics.observe_llm_duration(llm_started_at.elapsed());
+                    }
                     if cancel.is_cancelled() {
                         return;
                     }
@@ -351,6 +374,11 @@ pub(super) async fn run_pipeline(
                 audio,
                 is_last,
             } => {
+                if !audio.is_empty() && !metric_guard.has_first_audio() {
+                    let first_audio_at = Instant::now();
+                    metric_guard.record_first_audio(first_audio_at);
+                    metrics.observe_tts_first_audio(llm_started_at.elapsed());
+                }
                 // 第一块音频到达才切换到 Speaking，避免 TTS 尚未产出时提前显示“正在回答”。
                 if !speaking_sent {
                     if !send_agent_status(
@@ -377,6 +405,10 @@ pub(super) async fn run_pipeline(
                     Some(tts_format.1),
                 ) {
                     return;
+                }
+                if is_last && !tts_completed_recorded {
+                    tts_completed_recorded = true;
+                    metrics.observe_tts_generation(llm_started_at.elapsed());
                 }
                 if is_last
                     && !send_agent_status(
@@ -416,6 +448,7 @@ pub(super) async fn run_pipeline(
             }
         }
     }
+    metric_guard.finish("success", Instant::now());
     info!(target: "voice_server.session", session_id = %session_id, "pipeline 全部完成");
 }
 
@@ -491,21 +524,37 @@ fn send_tts_audio(
 pub(super) fn send_down(addr: &Recipient<OutMessage>, p: VoicePayload) {
     match voice_proto::encode_indication(&p) {
         Ok(bytes) => {
+            let kind = p.type_name();
+            let session_id = p.session_id().map(str::to_owned);
+            let bytes_len = bytes.len();
             // 注：Recipient::do_send 返回 ()，无法获知失败 —— 用 try_send 接住 SendError
             // （SendError 的 Display 只输出变体名 "receiver is full" / "receiver is gone"），
             // 弱网下能定位"客户端没收到 TTS"这类问题
-            if let Err(e) = addr.try_send(OutMessage { data: bytes }) {
-                debug!(
+            match addr.try_send(OutMessage { data: bytes }) {
+                Ok(()) => info!(
                     target: "voice_server.session",
-                    session_id = ?p.session_id(),
-                    "下行 try_send 失败（客户端可能已断开）: {}", e
-                );
+                    direction = "outbound",
+                    session_id = ?session_id,
+                    kind,
+                    bytes = bytes_len,
+                    "WS 发送消息"
+                ),
+                Err(e) => warn!(
+                    target: "voice_server.session",
+                    direction = "outbound",
+                    session_id = ?session_id,
+                    kind,
+                    bytes = bytes_len,
+                    "WS 发送消息失败（客户端可能已断开）: {}", e
+                ),
             }
         }
         Err(e) => warn!(
             target: "voice_server.session",
+            direction = "outbound",
             session_id = ?p.session_id(),
-            "下行编码失败: {}", e
+            kind = p.type_name(),
+            "WS 发送消息编码失败: {}", e
         ),
     }
 }
@@ -663,6 +712,9 @@ mod tests {
             down_addr,
             CancellationToken::new(),
             Arc::new(Mutex::new(None)),
+            Arc::new(VoiceMetrics::new()),
+            Instant::now(),
+            Instant::now(),
         )
         .await;
 
@@ -770,6 +822,9 @@ mod tests {
             down_addr,
             CancellationToken::new(),
             Arc::new(Mutex::new(None)),
+            Arc::new(VoiceMetrics::new()),
+            Instant::now(),
+            Instant::now(),
         )
         .await;
 

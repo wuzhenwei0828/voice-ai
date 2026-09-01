@@ -79,7 +79,8 @@ window.pcmChunksToWavUrl = function(pcmBytes, sampleRate = 16000, channels = 1) 
 window.ttsAudioFormat = { sampleRate: 16000, channels: 1 };
 window.loadTtsAudioFormat = (async function() {
   try {
-    const resp = await fetch('/admin/tts/format');
+    const request = typeof fetchWithTrace === 'function' ? fetchWithTrace : fetch;
+    const resp = await request('/admin/tts/format');
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
     if (Number.isFinite(data.sample_rate) && data.sample_rate > 0) {

@@ -72,7 +72,7 @@
       const url = voice
         ? `/admin/asr_llm_tts?voice=${encodeURIComponent(voice)}`
         : '/admin/asr_llm_tts';
-      const resp = await fetch(url, {
+      const resp = await fetchWithTrace(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
         body: buf,

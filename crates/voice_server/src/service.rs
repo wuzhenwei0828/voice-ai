@@ -12,7 +12,7 @@ use dashmap::DashMap;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
-use voice_proto::decode_payload;
+use voice_proto::{decode_message_id, decode_payload};
 
 use webhttp::websocket::{ActorMsg, OutMessage};
 use webhttp::{ServiceCallback, WsData};
@@ -21,7 +21,9 @@ use crate::agent::LlmAgent;
 use crate::client::ArcAsr;
 use crate::client::ArcLlm;
 use crate::client::ArcTts;
+use crate::metrics::VoiceMetrics;
 use crate::session::VoiceSession;
+use crate::trace_context::new_trace_id;
 
 pub struct VoiceService {
     pub asr: ArcAsr,
@@ -30,6 +32,8 @@ pub struct VoiceService {
     /// LlmAgent，session pipeline 用（带 per-session 短期记忆）
     pub agent: Arc<LlmAgent>,
     pub tts: ArcTts,
+    /// Prometheus collectors for server-side voice pipeline timings.
+    pub metrics: Arc<VoiceMetrics>,
     /// session_id -> VoiceSession
     sessions: DashMap<String, VoiceSession>,
     /// web admin 静态文件目录（None = 不挂载）
@@ -46,6 +50,7 @@ pub struct VoiceService {
 impl VoiceService {
     pub fn new(asr: ArcAsr, llm: ArcLlm, agent: Arc<LlmAgent>, tts: ArcTts) -> Self {
         let pipeline_tasks = Arc::new(Mutex::new(JoinSet::new()));
+        let metrics = Arc::new(VoiceMetrics::new());
 
         // janitor：循环 join_next，已完成的任务自动从 set 移除；panic 转 error 日志。
         // 注意：这是 minimal 版本 —— shutdown 时不等待 in-flight pipeline 退出，
@@ -89,6 +94,7 @@ impl VoiceService {
             llm,
             agent,
             tts,
+            metrics,
             sessions: DashMap::new(),
             web_static_dir: None,
             pipeline_tasks,
@@ -124,6 +130,8 @@ impl ServiceCallback for VoiceService {
             .app_data(web::Data::new(asr))
             .app_data(web::Data::new(llm))
             .app_data(web::Data::new(tts))
+            .app_data(web::Data::new(self.metrics.clone()))
+            .route("/metrics/voice", web::get().to(crate::metrics::handler))
             .service(
                 web::scope("/admin")
                     .route("/voices", web::get().to(crate::admin_api::voices))
@@ -169,32 +177,45 @@ impl ServiceCallback for VoiceService {
                 } = split_in_message(in_msg);
 
                 let session_id = format!("{}-{}-{}", business, actor, connid);
+                let trace_id = decode_message_id(&payload).unwrap_or_else(new_trace_id);
 
-                let (kind, p) = match decode_payload(&payload) {
+                let (_, p) = match decode_payload(&payload) {
                     Ok(v) => v,
                     Err(e) => {
                         warn!(target: "voice_server.service", session_id = %session_id, "解码失败: {}", e);
                         return Ok(ActorMsg::Ok);
                     }
                 };
-                debug!(target: "voice_server.service", session_id = %session_id, ?kind, "收到 WS 消息");
+                info!(
+                    target: "voice_server.service",
+                    direction = "inbound",
+                    business = %business,
+                    actor = %actor,
+                    connid = %connid,
+                    session_id = %session_id,
+                    message_id = %trace_id,
+                    kind = p.type_name(),
+                    bytes = payload.len(),
+                    "WS 收到消息"
+                );
 
                 // live-asr 业务：复用 webhttp 路由 + voice-providers WsConnPool 跨会话复用
                 // （公共协议：fun-asr / qwen-audio-3.0 / paraformer，docs L3289）
                 if business == "live-asr" {
-                    crate::live_asr::handle_message(addr, session_id, payload);
+                    crate::live_asr::handle_message(addr, session_id, payload, trace_id);
                     return Ok(ActorMsg::Ok);
                 }
 
                 // 找/建 session
                 let mut entry = self.sessions.entry(session_id.clone()).or_insert_with(|| {
                     info!(target: "voice_server.service", session_id = %session_id, "新建 VoiceSession");
-                    VoiceSession::new(
+                    VoiceSession::new_with_metrics(
                         session_id.clone(),
                         self.asr.clone(),
                         self.agent.clone(),
                         self.tts.clone(),
                         addr,
+                        self.metrics.clone(),
                     )
                 });
 
@@ -203,7 +224,7 @@ impl ServiceCallback for VoiceService {
                 // 锁 entry 期间 spawn 一个 helper 把 handle 移交给 JoinSet，
                 // helper 立即退出但 JoinSet 内的 child task 会 await 这个 handle，
                 // 所以 panics / 异常退出都会被 janitor 观察到。
-                let spawned = entry.on_payload(p);
+                let spawned = entry.on_payload_with_trace_id(p, trace_id);
                 if let Some(handle) = spawned {
                     let set = self.pipeline_tasks.clone();
                     tokio::spawn(async move {

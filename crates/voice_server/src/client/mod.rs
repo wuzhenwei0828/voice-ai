@@ -4,8 +4,8 @@
 //! trait，因此替换 provider 不需要改会话编排代码。工厂函数负责把 [`VoiceConfig`]
 //! 转成具体客户端，启动入口只需注入这些 trait 对象。
 //!
-//! ASR / TTS 走手搓 reqwest（绕开 async-openai 的限制 —— FunASR 私有字段、自定义 voice 字符串），
-//! LLM 仍用 async-openai SDK。provider 通过 `ProviderConfig::api_base` 切换
+//! ASR / LLM / TTS 都直接使用 reqwest，以支持私有字段、自定义鉴权和可立即取消的流。
+//! provider 通过 `ProviderConfig::api_base` 切换
 //!（siliconflow、OpenAI 官方、自建 ASR 等）。
 //!
 //! 模块组织：
@@ -33,3 +33,12 @@ pub use funasr::{
 pub use llm::{build_llm_client, ArcLlm, HttpLlmClient, LlmClient};
 pub use tts::{build_tts_client, ArcTts, HttpTtsClient, TtsClient, TtsInputSession};
 pub use tts_ws::{TtsWsClient, TtsWsConfig};
+
+/// Attach the current inbound trace ID to an outbound HTTP request when one is
+/// available. The helper is intentionally a no-op for background calls.
+pub fn apply_trace_header(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match crate::trace_context::current_trace_id() {
+        Some(trace_id) => req.header("trace_id", trace_id),
+        None => req,
+    }
+}

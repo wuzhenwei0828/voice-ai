@@ -25,6 +25,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::client::error::{parse_openai_error, ClientError};
+use crate::client::apply_trace_header;
 use crate::config::{AsrConfig, ProviderConfig};
 use crate::events::AsrEvent;
 
@@ -211,7 +212,7 @@ impl AsrClient for HttpAsrClient {
         form = Self::push_opt_bool(form, "tags", self.tags);
 
         // ===== 请求构造（鉴权 + extra_headers，照搬 tts.rs 模式）=====
-        let mut req = self.client.post(&url).multipart(form);
+        let mut req = apply_trace_header(self.client.post(&url).multipart(form));
         if let Some(key) = &self.api_key {
             if key.starts_with("Bearer ") || key.starts_with("bearer ") {
                 req = req.header("Authorization", key);

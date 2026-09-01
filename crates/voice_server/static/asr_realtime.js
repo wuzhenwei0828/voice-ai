@@ -240,7 +240,7 @@
   }
 
   function encodeIndication(payload) {
-    return msgpackEncode({ Indication: { data: payload } });
+    return msgpackEncode({ Indication: { data: { ...payload, message_id: payload.message_id || createTraceId() } } });
   }
 
   function decodeMessage(bytes) {
@@ -467,14 +467,14 @@
       if (e.data.type !== 'audio') return;
       if (ws && ws.readyState === WebSocket.OPEN && running && !finishing) {
         const seq = ++seqCounter;
-        ws.send(encodeIndication({
+        sendPayload({
           type: 'audio_chunk',
           session_id: sessionId,
           seq: seq,
           timestamp_ms: Date.now(),
           data: e.data.bytes,
           is_last: false,
-        }));
+        });
         // 关键证据：running=true 后第一帧推出去 = ack-gating 生效
         // 之后每 50 帧 (~5s) 打一条，防刷屏
         if (seq === 1 || seq % 50 === 0) {
@@ -571,7 +571,15 @@
 
   function sendPayload(payload) {
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(encodeIndication(payload));
+      const message = { ...payload, message_id: payload.message_id || createTraceId() };
+      const bytes = encodeIndication(message);
+      log('[voice-ws] send', {
+        sessionId,
+        type: message.type,
+        messageId: message.message_id,
+        bytes: bytes.byteLength,
+      });
+      ws.send(bytes);
     }
   }
 
@@ -650,6 +658,12 @@
         console.warn(TAG, 'decode=null; raw hex:', _toHex(bytes));
         return;
       }
+      log('[voice-ws] receive', {
+        sessionId,
+        type: payload.type,
+        messageId: payload.message_id,
+        bytes: bytes.byteLength,
+      });
       handleServerEvent(payload);
     };
 

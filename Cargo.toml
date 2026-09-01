@@ -36,6 +36,7 @@ futures-util = "0.3"
 axum = { version = "0.7", features = ["macros"] }
 tower = "0.5"
 uuid = { version = "1", features = ["v4"] }
+prometheus = "0.13"
 rand = "0.8"
 parking_lot = "0.12"
 bytes = "1"
