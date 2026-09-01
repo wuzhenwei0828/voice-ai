@@ -1,4 +1,4 @@
-// voice-app frontend —— 音色下拉加载
+// voice-ai frontend —— 音色下拉加载
 // 页面加载时 fetch /admin/voices → 给 4 个 tab 各一个 <select> 填上选项 + 默认选中。
 //
 // 4 个 select 的 id：

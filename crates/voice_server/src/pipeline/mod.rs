@@ -43,7 +43,7 @@ pub mod sentence;
 pub mod text;
 
 // 公共 re-export：调用方 `use crate::pipeline::*` 拿到主要 API
+pub use self::text::{to_tts_text, TtsSentenceBuffer};
 pub use crossfade::SentenceCrossfader;
 pub use llm_tts::{llm_tts_items, LlmTtsItem};
 pub use sentence::next_sentence_end;
-pub use text::{to_tts_text, TtsSentenceBuffer};

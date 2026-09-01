@@ -30,9 +30,48 @@ use crate::events::TtsEvent;
 pub type BoxStream<T> = Pin<Box<dyn futures_util::Stream<Item = T> + Send>>;
 pub type ArcTts = Arc<dyn TtsClient>;
 
+/// 可持续写入输入文本并按需 flush 的增量 TTS 会话。
+///
+/// HTTP TTS 不提供这种会话能力；支持增量输入的传输（例如 WebSocket）可以通过
+/// [`TtsClient::open_input_session`] 返回具体实现。
+#[async_trait]
+pub trait TtsInputSession: Send {
+    /// 发送一段增量文本，不结束当前 utterance。
+    async fn send_text(&mut self, text: &str) -> Result<(), ClientError>;
+
+    /// 结束当前 utterance，并触发上游开始生成。
+    async fn flush(&mut self) -> Result<(), ClientError>;
+
+    /// 读取下一条 TTS 音频或控制事件；流结束时返回 `None`。
+    async fn next_event(&mut self) -> Option<Result<TtsEvent, ClientError>>;
+
+    /// 关闭当前增量会话并释放上游资源。
+    async fn close(&mut self) -> Result<(), ClientError>;
+
+    /// 完成整轮增量会话并归还可复用的上游连接。
+    ///
+    /// 默认退化为 `close`，以兼容只实现旧接口的客户端；WebSocket 会话会覆写
+    /// 此方法，在不关闭物理连接的情况下将当前租约标记为空闲。
+    async fn finish(&mut self) -> Result<(), ClientError> {
+        self.close().await
+    }
+}
+
 #[async_trait]
 pub trait TtsClient: Send + Sync {
     fn output_format(&self) -> (Option<u32>, u8) { (None, 1) }
+
+    /// 打开增量输入会话。
+    ///
+    /// 默认返回 `None`，表示客户端仅支持 [`TtsClient::synthesize`] 的完整文本请求。
+    async fn open_input_session(
+        &self,
+        _session_id: &str,
+        _sample_rate_override: Option<u32>,
+        _voice_override: Option<String>,
+    ) -> Result<Option<Box<dyn TtsInputSession>>, ClientError> {
+        Ok(None)
+    }
 
     /// 列出当前 TTS provider 已加载的音色。
     ///
@@ -669,6 +708,7 @@ pub fn build_tts_client(
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             timeout,
+            max_connections: cfg.max_connections,
         };
         info!(
             target: "voice_server.factory",
@@ -980,6 +1020,21 @@ pub fn validate_sample_rate_override(
 mod tests {
     use super::*;
     use futures_util::StreamExt;
+
+    #[tokio::test]
+    async fn incremental_tts_session_interface_defaults_to_none() {
+        let mut cfg = TtsConfig::default();
+        cfg.api_base = "http://127.0.0.1:0".into();
+        cfg.model = "m".into();
+        cfg.voice = "alex".into();
+
+        let client = build_tts_client(&cfg, None).expect("HTTP TTS client should build");
+        let session = client
+            .open_input_session("test-session", None, None)
+            .await
+            .expect("HTTP TTS should use the default incremental-session behavior");
+        assert!(session.is_none());
+    }
 
     #[test]
     fn tts_transport_info_resolves_http_and_websocket_endpoints() {

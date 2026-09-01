@@ -31,5 +31,5 @@ pub use funasr::{
     build_funasr_client, ArcFunasr, FunasrClient, FunasrConfig, FunasrMode, FunasrSession,
 };
 pub use llm::{build_llm_client, ArcLlm, HttpLlmClient, LlmClient};
-pub use tts::{build_tts_client, ArcTts, HttpTtsClient, TtsClient};
+pub use tts::{build_tts_client, ArcTts, HttpTtsClient, TtsClient, TtsInputSession};
 pub use tts_ws::{TtsWsClient, TtsWsConfig};

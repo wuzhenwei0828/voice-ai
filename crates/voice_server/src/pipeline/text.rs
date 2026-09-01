@@ -30,6 +30,45 @@ pub fn to_tts_text(input: &str) -> String {
     output.join(" ")
 }
 
+/// Removes decorative Markdown and emoji characters from one LLM delta.
+///
+/// This cleaner is intentionally stateless: a marker split across two deltas
+/// is removed independently in each delta rather than interpreted as syntax.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct IncrementalTtsCleaner;
+
+impl IncrementalTtsCleaner {
+    pub fn clean(delta: &str) -> String {
+        delta
+            .chars()
+            .filter(|ch| !is_incremental_decoration(*ch) && !is_emoji_char(*ch))
+            .collect()
+    }
+}
+
+fn is_incremental_decoration(ch: char) -> bool {
+    matches!(
+        ch,
+        '[' | ']'
+            | '(' | ')'
+            | '{' | '}'
+            | '<' | '>'
+            | '"' | '\''
+            | '\u{2018}'..='\u{201F}'
+            | '`'
+            | '\\'
+            | '*'
+            | '_'
+            | '~'
+            | '\u{3008}'..='\u{300D}'
+            | '\u{3010}'..='\u{3011}'
+            | '\u{3014}'..='\u{3015}'
+            | '\u{FF08}'..='\u{FF09}'
+            | '\u{FF3B}'..='\u{FF3D}'
+            | '\u{FF5B}'..='\u{FF5D}'
+    )
+}
+
 /// Holds short cleaned sentences until a TTS request has enough speech content.
 #[derive(Debug, Default)]
 pub struct TtsSentenceBuffer {
@@ -205,6 +244,25 @@ mod tests {
     #[test]
     fn removes_emoji_variation_and_zwj_components() {
         assert_eq!(to_tts_text("状态：👨‍💻，完成✅。"), "状态：，完成。");
+    }
+
+    #[test]
+    fn cleans_markdown_and_emoji_from_each_incremental_delta() {
+        assert_eq!(
+            IncrementalTtsCleaner::clean("请查看 [帮助](文档)😊**。"),
+            "请查看 帮助文档。"
+        );
+    }
+
+    #[test]
+    fn incremental_cleaner_is_stateless_between_deltas() {
+        assert_eq!(IncrementalTtsCleaner::clean("["), "");
+        assert_eq!(IncrementalTtsCleaner::clean("帮助]"), "帮助");
+    }
+
+    #[test]
+    fn incremental_cleaner_returns_empty_when_delta_has_only_decorations() {
+        assert_eq!(IncrementalTtsCleaner::clean("[](){}<>\\\"'`*_~😊"), "");
     }
 
     #[test]

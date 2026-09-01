@@ -2,7 +2,7 @@
 //!
 //! 配置来源（优先级从高到低）：
 //!   1. CLI 参数（--config、--port、--log-level）
-//!   2. 环境变量（VOICE_CONFIG / VOICE_LOG_LEVEL / VOICE_PORT / VOICE_*_URL 等）
+//!   2. 环境变量（VOICE_CONFIG / VOICE_LOG_LEVEL / HTTP_PORT / VOICE_*_URL 等）
 //!   3. 配置文件：默认 `<crate>/src/config/config.yaml`（in-crate），可用 --config / VOICE_CONFIG 覆盖
 //!   4. 内置默认值
 //!

@@ -18,7 +18,7 @@ webhttp = "0.1.12"
 webclient = "0.1.1"
 async-tungstenite = { version = "0.28", features = ["tokio-runtime", "tokio-rustls-webpki-roots"] }
 
-tokio = { version = "1.33", features = ["full"] }
+tokio = { version = "1.33", features = ["full", "test-util"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }

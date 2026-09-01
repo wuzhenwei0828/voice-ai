@@ -1,4 +1,4 @@
-// voice-app frontend — ASR 单能力 tab
+// voice-ai frontend — ASR 单能力 tab
 // 选文件 → POST /admin/asr → 流式显示识别结果（音频格式由后端处理）
 
 (function () {

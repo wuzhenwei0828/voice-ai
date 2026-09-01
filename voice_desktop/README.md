@@ -10,6 +10,11 @@ npm run electron
 npm run typecheck
 npm test
 npm run build
+npm run package:mac
+# Windows 安装包（需在 Windows 上执行）：npm run package:win
+# Linux 安装包（需在 Linux 上执行）：npm run package:linux
 ```
+
+The macOS Apple Silicon installer is written to `release/` as a `.dmg` file.
 
 Open settings in the app and enter the remote `voice_server` URL, for example `https://api.example.com`. Production deployments should use `https` and `wss`.

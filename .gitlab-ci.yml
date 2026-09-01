@@ -1,0 +1,32 @@
+stages:
+  - sync_github
+
+before_script:
+
+sync_github:
+  stage: sync_github
+  tags:
+    - rustservice
+  image: harbor.cowarobot.cn/softrepo/rust_build:1.94
+  script:
+    - echo "代码已合并到 main, 开始执行发布逻辑..."
+    - |
+      for i in {1..10}; do
+        if command -v docker >/dev/null 2>&1 && [ -S /var/run/docker.sock ]; then
+          echo "Docker is ready!"
+          break
+        fi
+        echo "Waiting for Docker..."
+        sleep 2
+      done
+    - docker info
+    - echo ${CI_PROJECT_NAME} ${CI_PROJECT_PATH} ${CI_PROJECT_DIR} ${CI_PROJECT_URL} ${CI_COMMIT_SHA}
+    - echo "${HARBORKEY}" | docker login harbor.cowarobot.cn -u 'robot$softpro+cibuild' --password-stdin
+    - rm -rf ${CI_PROJECT_NAME}
+    - git clone https://oauth2:${TOKEN}@git.cowarobot.com/${CI_PROJECT_PATH}
+    - cd ${CI_PROJECT_NAME}
+    - export CARGO_NET_GIT_FETCH_WITH_CLI=true
+    - export SWAGGER_UI_DOWNLOAD_URL=https://mirrors.cowarobot.cn/public/releases/swagger-api/swagger-ui/archive/refs/tags/swagger-ui-5.17.14.zip
+    - bash build_docker_images.sh -p
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"

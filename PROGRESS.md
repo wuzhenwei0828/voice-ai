@@ -1,4 +1,4 @@
-# voice-app 实施进度
+# voice-ai 实施进度
 
 > 用于跨会话继续工作时快速恢复上下文。每完成一项 / 改一个决策就在这里追加。
 > **最近更新**：2026-08-17（并发与线程安全 review + 修复 round 1 + 新增 qwen3-asr-flash-realtime 流式 ASR 接入）
@@ -33,7 +33,7 @@ Phase 4 生产化 ░░░░░░░░░░░░░░░░░░░░  
 ## 二、文件结构
 
 ```
-voice-app/
+voice-ai/
 ├── Cargo.toml                           workspace
 ├── README.md                            启动命令 + 端到端联调指南
 ├── PROGRESS.md                          ← 本文件
@@ -136,7 +136,7 @@ CLI 参数 > 环境变量 (VOICE_*) > YAML 配置文件 > 内置默认
 
 ```bash
 VOICE_LOG_LEVEL / VOICE_LOG_FILE      # log 段
-VOICE_PORT                            # server.port
+HTTP_PORT                             # server.port
 VOICE_<ASR|LLM|TTS>_URL               # endpoint
 VOICE_<ASR|LLM|TTS>_AUTHORIZATION     # authorization
 VOICE_<ASR|LLM|TTS>_MODEL             # model
@@ -219,7 +219,7 @@ VOICE_<ASR|LLM|TTS>_MODEL             # model
 
 ### 文档
 
-- `README.md` 的端到端命令还是用 `/tmp/voice-app-test/*.log` 路径，**没更新到 YAML + configs/ + logs/ 的新布局**
+- `README.md` 的端到端命令还是用 `/tmp/voice-ai-test/*.log` 路径，**没更新到 YAML + configs/ + logs/ 的新布局**
 - 没有架构图（流程图、状态机图）—— 按 diagram skill 可以补一份
 
 ---
@@ -231,7 +231,7 @@ VOICE_<ASR|LLM|TTS>_MODEL             # model
 1. **读本文档**（5 分钟）
 2. **跑一遍启动命令验证环境没坏**：
    ```bash
-   cd /Users/wuzhenwei/Code/github/voice-app
+   cd /Users/wuzhenwei/Code/github/voice-ai
    cargo run --release -p voice-server
    # 浏览器访问 http://127.0.0.1:8080
    ```

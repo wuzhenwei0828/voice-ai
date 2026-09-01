@@ -2,6 +2,9 @@ import { app, BrowserWindow } from 'electron';
 import path from 'node:path';
 
 const isDev = !app.isPackaged;
+const productName = 'Voice AI';
+
+app.setName(productName);
 
 function createWindow() {
   const window = new BrowserWindow({
@@ -9,7 +12,7 @@ function createWindow() {
     height: 760,
     minWidth: 760,
     minHeight: 560,
-    title: '语音知识助手',
+    title: productName,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,

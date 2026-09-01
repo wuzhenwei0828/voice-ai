@@ -1,4 +1,4 @@
-// voice-app frontend — LLM+TTS 单能力 tab
+// voice-ai frontend — LLM+TTS 单能力 tab
 // 输入文本 → POST /admin/llm_tts → 流式播放 audio chunk，同时拼 WAV 下载
 // （接口只输出 TTS 音频，LLM 中间文本在服务端日志可见）
 

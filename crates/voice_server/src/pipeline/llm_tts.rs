@@ -21,12 +21,12 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::client::{ArcLlm, ArcTts, ClientError};
-use crate::events::LlmEvent;
+use crate::client::{ArcLlm, ArcTts, ClientError, TtsInputSession};
+use crate::events::{LlmEvent, TtsEvent};
 
 use super::crossfade::SentenceCrossfader;
 use super::sentence::next_sentence_end;
-use super::text::{to_tts_text, TtsSentenceBuffer};
+use super::text::{to_tts_text, IncrementalTtsCleaner, TtsSentenceBuffer};
 
 /// `llm_tts_items()` 的输出事件，由各消费方映射成自己的 wire 格式
 /// （SSE data event / WS VoicePayload）。`Failed` 是终端事件（产出后流即结束）。
@@ -119,6 +119,24 @@ fn spawn_llm_reader(
     (rx, LlmReaderGuard(cancel))
 }
 
+async fn flush_incremental_sentence(
+    session: &mut dyn TtsInputSession,
+) -> Result<Vec<TtsEvent>, ClientError> {
+    session.flush().await?;
+    let mut events = Vec::new();
+    loop {
+        let event = session
+            .next_event()
+            .await
+            .ok_or_else(|| ClientError::Ws("TTS stream closed".into()))??;
+        let terminal = event.is_last;
+        events.push(event);
+        if terminal {
+            return Ok(events);
+        }
+    }
+}
+
 /// 把 llm + sentence-split + tts 三个阶段串成一条事件流，
 /// 供 /admin/llm_tts、/admin/asr_llm_tts 与 session.rs 的 WS pipeline 共用
 /// （后两者额外透出 Llm 文本事件）。
@@ -164,6 +182,17 @@ pub fn llm_tts_items(
         // 事件协议，因此外层消费者无需知道淡化细节。
         let mut fader = SentenceCrossfader::default();
         let mut short_sentence_buf = TtsSentenceBuffer::default();
+        let mut ws_session = match tts
+            .open_input_session(&sid, sample_rate_override, voice_override.clone())
+            .await
+        {
+            Ok(session) => session,
+            Err(e) => {
+                warn!(target: "voice_server.pipeline", stage = "tts_connect", session_id = %sid, "TTS 增量会话建立失败: {}", e);
+                yield LlmTtsItem::Failed { error: format!("tts error: {}", e), code: 1004 };
+                return;
+            }
+        };
 
         // 把一段 PCM 转成统一的 Tts 事件。TTS 可能返回空 chunk（例如只携带状态的
         // chunk），这类数据没有播放意义，所以不占用 seq，也不向下游发送。
@@ -187,18 +216,79 @@ pub fn llm_tts_items(
             let evt = match item {
                 LlmReaderItem::Event(event) => event,
                 LlmReaderItem::CallFailed(e) => {
+                    if let Some(session) = ws_session.as_mut() {
+                        let _ = session.close().await;
+                    }
                     warn!(target: "voice_server.pipeline", stage = "llm_call", session_id = %sid, "LLM 调用失败: {}", e);
                     yield LlmTtsItem::Failed { error: format!("llm error: {}", e), code: 1002 };
                     return;
                 }
                 LlmReaderItem::StreamFailed(e) => {
+                    if let Some(session) = ws_session.as_mut() {
+                        let _ = session.close().await;
+                    }
                     warn!(target: "voice_server.pipeline", stage = "llm_stream", session_id = %sid, "LLM 流错误: {}", e);
                     yield LlmTtsItem::Failed { error: format!("llm stream: {}", e), code: 1003 };
                     return;
                 }
             };
-            sentence_buf.push_str(&evt.delta);
             yield LlmTtsItem::Llm { delta: evt.delta.clone(), is_final: evt.is_final };
+
+            if let Some(session) = ws_session.as_mut() {
+                let cleaned = IncrementalTtsCleaner::clean(&evt.delta);
+                debug!(target: "voice_server.pipeline", session_id = %sid, original_chars = evt.delta.chars().count(), filtered_chars = cleaned.chars().count(), text_preview = %cleaned.chars().take(200).collect::<String>().replace('\n', "\\n"), "增量文本清洗");
+                if !cleaned.is_empty()
+                    && (!cleaned.trim().is_empty() || !sentence_buf.trim().is_empty())
+                {
+                    let mut remaining = cleaned;
+                    while !remaining.is_empty() {
+                        let combined = format!("{sentence_buf}{remaining}");
+                        if let Some(end) = next_sentence_end(&combined) {
+                            let already_sent = sentence_buf.len();
+                            let segment = combined[already_sent..end].to_string();
+                            if !segment.is_empty() {
+                                if let Err(e) = session.send_text(&segment).await {
+                                    let _ = session.close().await;
+                                    warn!(target: "voice_server.pipeline", stage = "tts_send_text", session_id = %sid, "TTS 增量文本发送失败: {}", e);
+                                    yield LlmTtsItem::Failed { error: format!("tts error: {}", e), code: 1004 };
+                                    return;
+                                }
+                            }
+                            remaining = combined[end..].to_string();
+                            sentence_buf.clear();
+
+                            let events = match flush_incremental_sentence(session.as_mut()).await {
+                                Ok(events) => events,
+                                Err(e) => {
+                                    let _ = session.close().await;
+                                    warn!(target: "voice_server.pipeline", stage = "tts_flush", session_id = %sid, "TTS 增量 flush 失败: {}", e);
+                                    yield LlmTtsItem::Failed { error: format!("tts error: {}", e), code: 1004 };
+                                    return;
+                                }
+                            };
+                            fader.begin_sentence();
+                            for t in events {
+                                emit_pcm!(fader.feed(&t.data));
+                            }
+                            emit_pcm!(fader.end_sentence());
+                        } else {
+                            if let Err(e) = session.send_text(&remaining).await {
+                                let _ = session.close().await;
+                                warn!(target: "voice_server.pipeline", stage = "tts_send_text", session_id = %sid, "TTS 增量文本发送失败: {}", e);
+                                yield LlmTtsItem::Failed { error: format!("tts error: {}", e), code: 1004 };
+                                return;
+                            }
+                            sentence_buf.push_str(&remaining);
+                            remaining.clear();
+                        }
+                    }
+                }
+
+                if evt.is_final { break; }
+                continue;
+            }
+
+            sentence_buf.push_str(&evt.delta);
 
             // 切出所有完整句。`next_sentence_end` 只返回安全的 UTF-8 字符边界，
             // 取出的 `sent` 立即从缓冲区移除，避免下一轮重复合成。
@@ -251,12 +341,35 @@ pub fn llm_tts_items(
         }
 
         // 收尾：LLM 结束时仍可能遗留没有句末标点的文本，例如“谢谢你的提问”。
-        // 不能丢弃这段内容，因此加入短句缓冲并在末尾 flush。此处沿用原有的宽松错误处理：
-        // 尾句合成失败时跳过尾句，仍发送 finish 和结束标记，避免客户端永远等不到结束。
-        let tail = to_tts_text(sentence_buf.trim());
-        if let Some(tail) = short_sentence_buf.push(&tail).or_else(|| short_sentence_buf.flush()) {
+        // 不能丢弃这段内容，因此在末尾 flush；失败时关闭增量会话并返回稳定错误。
+        let tail = if ws_session.is_some() {
+            sentence_buf.trim().to_string()
+        } else {
+            to_tts_text(sentence_buf.trim())
+        };
+        if let Some(tail) = if ws_session.is_some() {
+            (!tail.is_empty()).then_some(tail.clone())
+        } else {
+            short_sentence_buf.push(&tail).or_else(|| short_sentence_buf.flush())
+        } {
             info!(target: "voice_server.pipeline", stage = "tts_tail", session_id = %sid, sentence = %tail, "LLM 末尾残余句子送 TTS");
-            if let Ok(mut tts_stream) = tts.synthesize(&sid, &tail, sample_rate_override, voice_override.clone()).await {
+            if let Some(session) = ws_session.as_mut() {
+                match flush_incremental_sentence(session.as_mut()).await {
+                    Ok(events) => {
+                        fader.begin_sentence();
+                        for t in events {
+                            emit_pcm!(fader.feed(&t.data));
+                        }
+                        emit_pcm!(fader.end_sentence());
+                    }
+                    Err(e) => {
+                        let _ = session.close().await;
+                        warn!(target: "voice_server.pipeline", stage = "tts_tail", session_id = %sid, "TTS 增量尾句失败: {}", e);
+                        yield LlmTtsItem::Failed { error: "tts stream failed".into(), code: 1005 };
+                        return;
+                    }
+                }
+            } else if let Ok(mut tts_stream) = tts.synthesize(&sid, &tail, sample_rate_override, voice_override.clone()).await {
                 fader.begin_sentence();
                 while let Some(tts_item) = tts_stream.next().await {
                     if let Ok(t) = tts_item {
@@ -267,6 +380,11 @@ pub fn llm_tts_items(
                     }
                 }
                 emit_pcm!(fader.end_sentence());
+            }
+        }
+        if let Some(session) = ws_session.as_mut() {
+            if let Err(e) = session.finish().await {
+                warn!(target: "voice_server.pipeline", stage = "tts_finish", session_id = %sid, "TTS 增量会话归还连接失败: {}", e);
             }
         }
         // 最后一句扣留的句尾不再需要淡化，原样下发；finish 之后 fader 不再产生数据。
@@ -292,7 +410,7 @@ mod tests {
     use tokio::time::{timeout, Duration};
 
     use crate::client::llm::{BoxStream as LlmStream, ChatMessage, LlmClient};
-    use crate::client::tts::{BoxStream as TtsStream, TtsClient};
+    use crate::client::tts::{BoxStream as TtsStream, TtsClient, TtsInputSession};
     use crate::events::TtsEvent;
 
     struct BurstLlm {
@@ -342,6 +460,39 @@ mod tests {
         response: String,
     }
 
+    struct ChunkedLlm {
+        chunks: Vec<String>,
+    }
+
+    #[async_trait]
+    impl LlmClient for ChunkedLlm {
+        async fn chat(
+            &self,
+            _session_id: &str,
+            _prompt: &str,
+            _emotion_hint: Option<&str>,
+        ) -> Result<LlmStream<Result<LlmEvent, ClientError>>, ClientError> {
+            let chunks = self.chunks.clone();
+            let count = chunks.len();
+            Ok(Box::pin(stream::iter(chunks.into_iter().enumerate().map(
+                move |(index, delta)| {
+                    Ok(LlmEvent {
+                        delta,
+                        is_final: index + 1 == count,
+                    })
+                },
+            ))))
+        }
+
+        async fn chat_with_messages(
+            &self,
+            session_id: &str,
+            _messages: &[ChatMessage],
+        ) -> Result<LlmStream<Result<LlmEvent, ClientError>>, ClientError> {
+            self.chat(session_id, "", None).await
+        }
+    }
+
     #[async_trait]
     impl LlmClient for StaticLlm {
         async fn chat(
@@ -367,6 +518,91 @@ mod tests {
 
     struct RecordingTts {
         requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct RecordingIncrementalSession {
+        messages: Arc<Mutex<Vec<String>>>,
+        flush_count: Arc<AtomicUsize>,
+        finish_count: Arc<AtomicUsize>,
+        awaiting_done: bool,
+    }
+
+    #[async_trait]
+    impl TtsInputSession for RecordingIncrementalSession {
+        async fn send_text(&mut self, text: &str) -> Result<(), ClientError> {
+            assert!(
+                !self.awaiting_done,
+                "next sentence was sent before session.done"
+            );
+            self.messages.lock().unwrap().push(format!("text:{text}"));
+            Ok(())
+        }
+
+        async fn flush(&mut self) -> Result<(), ClientError> {
+            assert!(!self.awaiting_done);
+            self.awaiting_done = true;
+            self.flush_count.fetch_add(1, Ordering::SeqCst);
+            self.messages.lock().unwrap().push("input.done".into());
+            Ok(())
+        }
+
+        async fn next_event(&mut self) -> Option<Result<TtsEvent, ClientError>> {
+            if !self.awaiting_done {
+                return None;
+            }
+            self.awaiting_done = false;
+            Some(Ok(TtsEvent {
+                seq: 1,
+                data: vec![1, 0, 2, 0],
+                is_last: true,
+            }))
+        }
+
+        async fn close(&mut self) -> Result<(), ClientError> {
+            Ok(())
+        }
+
+        async fn finish(&mut self) -> Result<(), ClientError> {
+            self.finish_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct RecordingIncrementalTts {
+        messages: Arc<Mutex<Vec<String>>>,
+        flush_count: Arc<AtomicUsize>,
+        finish_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TtsClient for RecordingIncrementalTts {
+        async fn open_input_session(
+            &self,
+            _session_id: &str,
+            _sample_rate_override: Option<u32>,
+            _voice_override: Option<String>,
+        ) -> Result<Option<Box<dyn TtsInputSession>>, ClientError> {
+            Ok(Some(Box::new(RecordingIncrementalSession {
+                messages: Arc::clone(&self.messages),
+                flush_count: Arc::clone(&self.flush_count),
+                finish_count: Arc::clone(&self.finish_count),
+                awaiting_done: false,
+            })))
+        }
+
+        async fn synthesize(
+            &self,
+            _session_id: &str,
+            _text: &str,
+            _sample_rate_override: Option<u32>,
+            _voice_override: Option<String>,
+        ) -> Result<TtsStream<Result<TtsEvent, ClientError>>, ClientError> {
+            panic!("incremental path should not call synthesize")
+        }
+
+        fn default_voice_short(&self) -> &str {
+            "test"
+        }
     }
 
     #[async_trait]
@@ -420,6 +656,76 @@ mod tests {
     async fn merges_short_sentence_with_the_next_tts_request() {
         let requests = collect_tts_requests("好的。我马上处理。").await;
         assert_eq!(requests, vec!["好的。我马上处理。"]);
+    }
+
+    #[tokio::test]
+    async fn incremental_waits_for_session_done_before_next_sentence() {
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let flush_count = Arc::new(AtomicUsize::new(0));
+        let finish_count = Arc::new(AtomicUsize::new(0));
+        let mut items = Box::pin(llm_tts_items(
+            "prompt".into(),
+            None,
+            "test-session".into(),
+            Arc::new(StaticLlm {
+                response: "第一句。第二句。".into(),
+            }),
+            Arc::new(RecordingIncrementalTts {
+                messages: Arc::clone(&messages),
+                flush_count: Arc::clone(&flush_count),
+                finish_count: Arc::clone(&finish_count),
+            }),
+            None,
+            None,
+        ));
+        while items.next().await.is_some() {}
+
+        assert_eq!(
+            *messages.lock().unwrap(),
+            vec![
+                "text:第一句。".to_string(),
+                "input.done".to_string(),
+                "text:第二句。".to_string(),
+                "input.done".to_string(),
+            ]
+        );
+        assert_eq!(flush_count.load(Ordering::SeqCst), 2);
+        assert_eq!(finish_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn incremental_sends_each_delta_without_sentence_buffering() {
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let flush_count = Arc::new(AtomicUsize::new(0));
+        let finish_count = Arc::new(AtomicUsize::new(0));
+        let mut items = Box::pin(llm_tts_items(
+            "prompt".into(),
+            None,
+            "test-session".into(),
+            Arc::new(ChunkedLlm {
+                chunks: vec!["第一".into(), "句".into(), "。".into()],
+            }),
+            Arc::new(RecordingIncrementalTts {
+                messages: Arc::clone(&messages),
+                flush_count: Arc::clone(&flush_count),
+                finish_count: Arc::clone(&finish_count),
+            }),
+            None,
+            None,
+        ));
+        while items.next().await.is_some() {}
+
+        assert_eq!(
+            *messages.lock().unwrap(),
+            vec![
+                "text:第一".to_string(),
+                "text:句".to_string(),
+                "text:。".to_string(),
+                "input.done".to_string(),
+            ]
+        );
+        assert_eq!(flush_count.load(Ordering::SeqCst), 1);
+        assert_eq!(finish_count.load(Ordering::SeqCst), 1);
     }
 
     #[async_trait]

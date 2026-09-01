@@ -427,6 +427,9 @@ pub struct TtsConfig {
     #[serde(default)]
     /// TTS 传输方式：`http`（默认）或 `websocket`。
     pub transport: String,
+    #[serde(default = "default_tts_max_connections")]
+    /// WebSocket TTS 连接池最大并发连接数。
+    pub max_connections: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -438,6 +441,8 @@ pub struct TtsModelFormat {
 }
 
 fn default_tts_channels() -> u8 { 1 }
+
+fn default_tts_max_connections() -> usize { 4 }
 
 /// 模型专属的音频输出格式。
 ///
@@ -543,6 +548,7 @@ impl Default for TtsConfig {
             ref_text: None,
             x_vector_only_mode: None,
             transport: "http".into(),
+            max_connections: default_tts_max_connections(),
         }
     }
 }
@@ -550,7 +556,7 @@ impl Default for TtsConfig {
 impl VoiceConfig {
     /// 用环境变量覆盖 config：
     ///   - VOICE_LOG_LEVEL / VOICE_LOG_FILE       （log 段）
-    ///   - VOICE_PORT                              （server 段）
+    ///   - HTTP_PORT                               （server 段）
     ///   - VOICE_PROVIDER_API_BASE                 （provider 段）
     ///   - VOICE_PROVIDER_API_KEY                  （provider 段）
     ///   - VOICE_<ASR|LLM|TTS>_API_KEY             （per-section 覆盖）
@@ -564,7 +570,7 @@ impl VoiceConfig {
     ///   - VOICE_AGENT_MEMORY_TTL_SECS             （agent 段，TTL 覆盖）
     pub fn apply_env_overrides(&mut self) {
         self.log.apply_env_overrides();
-        if let Ok(v) = std::env::var("VOICE_PORT") {
+        if let Ok(v) = std::env::var("HTTP_PORT") {
             if let Ok(p) = v.parse() {
                 self.server.port = p;
             }
@@ -831,5 +837,20 @@ mod tests {
         cfg.apply_env_overrides();
         assert_eq!(cfg.tts.sample_rate, None);
         std::env::remove_var("VOICE_TTS_SAMPLE_RATE");
+    }
+
+    #[test]
+    fn apply_env_uses_http_port_and_ignores_voice_port() {
+        std::env::set_var("VOICE_PORT", "9124");
+        let mut cfg = VoiceConfig::default();
+        cfg.apply_env_overrides();
+        assert_eq!(cfg.server.port, 8080);
+
+        std::env::set_var("HTTP_PORT", "9123");
+        cfg.apply_env_overrides();
+        assert_eq!(cfg.server.port, 9123);
+
+        std::env::remove_var("HTTP_PORT");
+        std::env::remove_var("VOICE_PORT");
     }
 }

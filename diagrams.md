@@ -1,4 +1,4 @@
-# voice-app 业务流程图（含新增 `/stream/asr`）
+# voice-ai 业务流程图（含新增 `/stream/asr`）
 
 > 三张聚焦图：①架构总览 ②新建 `/stream/asr` 时序 ③WS 协议生命周期
 

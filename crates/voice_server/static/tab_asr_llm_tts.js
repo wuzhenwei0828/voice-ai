@@ -1,4 +1,4 @@
-// voice-app frontend — ASR→LLM→TTS 全链路 tab
+// voice-ai frontend — ASR→LLM→TTS 全链路 tab
 // 选文件 → POST /admin/asr_llm_tts → 按 stage 分发渲染 + TTS chunk 流式播放
 
 (function () {

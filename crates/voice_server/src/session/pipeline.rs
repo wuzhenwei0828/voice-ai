@@ -215,7 +215,7 @@ pub(super) async fn run_pipeline(
         // 空文本：不推任何 AsrPartial / AsrFinal、不注册为 current real、
         // 不打断任何正在跑的 pipeline、跳过整个 LLM/TTS 链路
         // （VAD 误切、上游返回 ""、纯噪声都属于这一类；省一次 LLM 调用 + 一次 TTS 调用）
-        warn!(
+        info!(
             target: "voice_server.session",
             session_id = %session_id,
             buffered_events = asr_events.len(),

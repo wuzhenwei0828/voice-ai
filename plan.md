@@ -98,7 +98,7 @@ cargo test --workspace                                   # 全量测试
 cargo test -p voice-providers asr::asr_ws_pool           # 新模块测试
 cargo test -p voice-server  live_asr                    # live_asr_api 残留测试
 git diff HEAD -- crates/voice-providers crates/voice-server   # diff 审计
-VOICE_PORT=8899 cargo run -p voice_server &
+HTTP_PORT=8899 cargo run -p voice_server &
 python3 -c 'import asyncio,json,websockets,msgpack;
 async def t():
     async with websockets.connect("ws://127.0.0.1:8899/ws/live-asr/web/x") as w:

@@ -44,13 +44,14 @@ tts:
   sample_rate: 24000
   channels: 1
   # transport: "websocket"   # 使用 /v1/audio/speech/stream 长连接
+  # max_connections: 4       # WebSocket TTS 连接池最大并发连接数
   # vLLM-Omni 扩展字段（均可省略，使用服务端默认）
   # speed: 1.0
   # task_type: "CustomVoice"  # CustomVoice | VoiceDesign | Base
   # language: "Auto"
   # instructions: ""
   # max_new_tokens: 2048
-  # stream_format: "sse"      # sse | audio
+  # stream_format: "sse"      # sse | audio,ws模式时配置成audio则stream_audio=true
   # ref_audio: "https://..."  # Base voice cloning
   # ref_text: "..."
   # x_vector_only_mode: false

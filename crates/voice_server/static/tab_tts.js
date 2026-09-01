@@ -1,4 +1,4 @@
-// voice-app frontend — TTS 单能力 tab
+// voice-ai frontend — TTS 单能力 tab
 // 输入文本 → POST /admin/tts → 流式播放 audio chunk，同时拼 WAV 下载
 
 (function () {

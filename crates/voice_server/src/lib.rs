@@ -37,7 +37,7 @@ pub use agent::{
 };
 pub use client::{
     build_asr_client, build_llm_client, build_tts_client, AsrClient, HttpAsrClient, HttpLlmClient,
-    HttpTtsClient, LlmClient, TtsClient, TtsWsClient, TtsWsConfig,
+    HttpTtsClient, LlmClient, TtsClient, TtsInputSession, TtsWsClient, TtsWsConfig,
 };
 pub use config::{
     AsrConfig, LlmConfig, ProviderConfig, ServerConfig, TtsConfig, VoiceConfig, REDIS_KEY_PREFIX,

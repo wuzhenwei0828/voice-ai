@@ -1,4 +1,4 @@
-// voice-app frontend — SSE 流解析 helper
+// voice-ai frontend — SSE 流解析 helper
 // 把 fetch response 的 body 流按 SSE 空行边界切成 JSON data 事件逐个 yield。
 // 用于消费 /admin/asr /admin/llm /admin/tts /admin/llm_tts /admin/asr_llm_tts。
 

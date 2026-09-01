@@ -1,4 +1,4 @@
-// voice-app web admin — 浏览器端 voice pipeline
+// voice-ai web admin — 浏览器端 voice pipeline
 // 流程：
 //   1. WS 连接 /ws/voice/web/admin/listener
 //   2. 发送 SessionStart (codec=pcm_s16le, sample_rate=16000, channels=1)
@@ -308,7 +308,7 @@
       if (el) el.hidden = (t !== name);
     });
     if (appMode === 'developer') {
-      try { localStorage.setItem('voice-app.activeTab', name); } catch (_) {}
+      try { localStorage.setItem('voice-ai.activeTab', name); } catch (_) {}
     }
   }
   document.querySelectorAll('.tab-btn').forEach((b) => {
@@ -316,7 +316,7 @@
   });
   let initialTab = 'pipeline';
   try {
-    const saved = localStorage.getItem('voice-app.activeTab');
+    const saved = localStorage.getItem('voice-ai.activeTab');
     if (saved && TABS.includes(saved)) initialTab = saved;
   } catch (_) {}
   developerTab = initialTab;
@@ -1164,22 +1164,6 @@
       showSafeError();
     }
   };
-
-  // ====== 调试：诊断 ws.send 行为 ======
-  // 测试 1：发送 native msgpack 编码结果
-  function testWsSendBinary() {
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      addMessage('error', 'WS 未连接');
-      return;
-    }
-    const obj = {Indication: {data: {type: 'session_start', session_id: 'web-admin', sample_rate: 16000, channels: 1, codec: 'pcm_s16le', language: 'zh-CN'}}};
-    const bytes = msgpackEncode(obj);
-    console.log('[DBG] sending bytes, length=', bytes.length, 'ctor=', bytes.constructor.name);
-    ws.send(bytes);
-    addMessage('system', '测试：发送 native msgpack 字节');
-  }
-  window.__testWs = { testWsSendBinary };
-  addMessage('system', '调试：控制台运行 __testWs.testWsSendBinary()');
 
   btnInterrupt.onclick = () => {
     sendInterrupt();

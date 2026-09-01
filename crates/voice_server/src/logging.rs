@@ -390,9 +390,9 @@ pub fn resolve_web_static_dir(explicit: Option<&str>) -> Option<PathBuf> {
 ///        - `./voice-<bin>.yml`
 ///        - `./configs/voice-<bin>.yaml`
 ///        - `./config/voice-<bin>.yaml`
-///        - `../configs/voice-<bin>.yaml`     (从 voice-app/configs/ 运行)
-///        - `../voice-<bin>.yaml`              (从 voice-app/crates/<x>/ 运行)
-///        - `$HOME/.config/voice-app/voice-<bin>.yaml`
+///        - `../configs/voice-<bin>.yaml`     (从 voice-ai/configs/ 运行)
+///        - `../voice-<bin>.yaml`              (从 voice-ai/crates/<x>/ 运行)
+///        - `$HOME/.config/voice-ai/voice-<bin>.yaml`
 ///   5. 全部找不到 → 返回 `default`（若提供）或 `./voice-<bin>.yaml`（不存在的占位，让 load_yaml 用默认）
 ///
 /// 返回的 PathBuf 始终是 Some，调用方决定是否警告"没找到"。
@@ -458,12 +458,8 @@ pub fn candidate_paths(bin_name: &str) -> Vec<PathBuf> {
 
     // 用户级配置
     if let Ok(home) = std::env::var("HOME") {
-        out.push(
-            PathBuf::from(home)
-                .join(".config")
-                .join("voice-app")
-                .join(&yaml),
-        );
+        let config_root = PathBuf::from(home).join(".config");
+        out.push(config_root.join("voice-ai").join(&yaml));
     }
 
     out
@@ -506,6 +502,18 @@ mod tests {
             default_config_path("voice_server"),
             PathBuf::from("voice-voice_server.yaml")
         );
+    }
+
+    #[test]
+    fn candidate_paths_only_use_voice_ai_user_config() {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME must be set for this test"));
+        let paths = candidate_paths("voice_server");
+        let filename = "voice-voice_server.yaml";
+        let voice_ai = home.join(".config").join("voice-ai").join(filename);
+        let voice_app = home.join(".config").join("voice-app").join(filename);
+
+        assert!(paths.contains(&voice_ai));
+        assert!(!paths.contains(&voice_app));
     }
 
     #[test]

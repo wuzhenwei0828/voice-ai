@@ -87,7 +87,7 @@ export function ConversationPage() {
   return <AppShell>
     <header>
       <div className="header-row">
-        <h1>语音知识助手</h1>
+        <h1>Voice AI</h1>
       </div>
       <div className="status-bar" aria-label="设备状态">
         <span className={`badge ${connClass}`}>{connText}</span>

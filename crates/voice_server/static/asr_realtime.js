@@ -1,4 +1,4 @@
-// voice-app frontend — 实时流式 ASR 页面（live-asr，wspool 复用）
+// voice-ai frontend — 实时流式 ASR 页面（live-asr，wspool 复用）
 //
 // 链路：麦克风 → AudioWorklet（16k 重采样 + s16le + 100ms 帧）→
 //       WS /ws/live-asr/web/<connid>（webhttp 既有路由）→ 服务端 live_asr_api →

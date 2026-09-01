@@ -1,4 +1,4 @@
-// voice-app frontend — LLM 单能力 tab
+// voice-ai frontend — LLM 单能力 tab
 // 输入 prompt → POST /admin/llm → 流式文本回复
 
 (function () {

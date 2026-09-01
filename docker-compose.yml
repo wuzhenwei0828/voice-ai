@@ -1,0 +1,14 @@
+services:
+  voice-ai:
+    image: ${VOICE_AI_IMAGE:-harbor.cowarobot.cn/softrepo/voice-ai:test_latest}
+    ports:
+      - "${VOICE_AI_HTTP_PORT:-8081}:8081"
+    environment:
+      HTTP_PORT: ${VOICE_AI_HTTP_PORT:-8081}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
