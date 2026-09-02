@@ -446,6 +446,7 @@ mod tests {
             &self,
             session_id: &str,
             _messages: &[ChatMessage],
+            _emotion_hint: Option<&str>,
         ) -> Result<LlmStream<Result<LlmEvent, ClientError>>, ClientError> {
             self.chat(session_id, "", None).await
         }
@@ -488,6 +489,7 @@ mod tests {
             &self,
             session_id: &str,
             _messages: &[ChatMessage],
+            _emotion_hint: Option<&str>,
         ) -> Result<LlmStream<Result<LlmEvent, ClientError>>, ClientError> {
             self.chat(session_id, "", None).await
         }
@@ -511,6 +513,7 @@ mod tests {
             &self,
             session_id: &str,
             _messages: &[ChatMessage],
+            _emotion_hint: Option<&str>,
         ) -> Result<LlmStream<Result<LlmEvent, ClientError>>, ClientError> {
             self.chat(session_id, "", None).await
         }

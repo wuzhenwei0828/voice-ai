@@ -758,16 +758,32 @@
       setStatus(speakerStatus, playing ? '扬声器：播放中' : '扬声器：空闲', playing ? 'badge-busy' : 'badge-online');
     },
   });
+  const ttsFirstAudioReceivedAt = new Map();
+  const ttsPlaybackReported = new Set();
 
   function playTtsAudio(dataBytes, _isLast, sampleRate = SAMPLE_RATE, channels = CHANNELS) {
     // 扬声器静音：直接丢掉这段 TTS 音频（不进队列，不消耗 audio 资源）
-    if (speakerMuted) return;
-    ttsPlayer.enqueue(dataBytes, sampleRate, channels);
+    if (speakerMuted) return undefined;
+    return ttsPlayer.enqueue(dataBytes, sampleRate, channels);
+  }
+
+  function reportPlaybackStarted(requestId, playbackStartedAt) {
+    requestId = Number(requestId || 0);
+    if (!requestId || ttsPlaybackReported.has(requestId) || !Number.isFinite(playbackStartedAt)) return;
+    const receivedAt = ttsFirstAudioReceivedAt.get(requestId);
+    if (receivedAt === undefined) return;
+    const delay = playbackStartedAt - receivedAt;
+    if (!Number.isFinite(delay) || delay < 0 || delay > 30000) return;
+    ttsPlaybackReported.add(requestId);
+    sendWsPayload({ type: 'playback_started', session_id: sessionId, request_id: requestId, delay_ms: Math.round(delay) });
+    ttsFirstAudioReceivedAt.delete(requestId);
   }
 
   function stopTtsPlayback() {
     stopProgressSpeech();
     ttsPlayer.stop();
+    ttsFirstAudioReceivedAt.clear();
+    ttsPlaybackReported.clear();
   }
 
   // ====== WebSocket ======
@@ -823,6 +839,8 @@
       ws.onclose = () => {
         setStatus(connStatus, 'WS：断开', 'badge-offline');
         addMessage('system', 'WS 已断开');
+        ttsFirstAudioReceivedAt.clear();
+        ttsPlaybackReported.clear();
         clearAgentPhase({ invalidate: true });
         stopMic();
       };
@@ -876,8 +894,17 @@
               if (!requestTracker.isCurrentRequest(payload.request_id)) break;
               if (payload.data && payload.data.length > 0) {
                 // 下行：服务端用 #[serde(with="serde_bytes")] 走 msgpack bin，JS 解码后已是 Uint8Array
-                playTtsAudio(payload.data, payload.is_last, payload.sample_rate || SAMPLE_RATE, payload.channels || CHANNELS);
+                const requestId = Number(payload.request_id || 0);
+                if (requestId && !ttsFirstAudioReceivedAt.has(requestId)) {
+                  const receivedAt = performance.now();
+                  ttsFirstAudioReceivedAt.set(requestId, receivedAt);
+                  window.setTimeout(() => {
+                    if (ttsFirstAudioReceivedAt.get(requestId) === receivedAt) ttsFirstAudioReceivedAt.delete(requestId);
+                  }, 30000);
+                }
+                const playbackStartedAt = playTtsAudio(payload.data, payload.is_last, payload.sample_rate || SAMPLE_RATE, payload.channels || CHANNELS);
                 if (!lastTtsFirstByteMs) lastTtsFirstByteMs = performance.now();
+                if (playbackStartedAt !== undefined) reportPlaybackStarted(requestId, playbackStartedAt);
               }
               if (payload.is_last) {
                 lastTtsFirstByteMs = null;

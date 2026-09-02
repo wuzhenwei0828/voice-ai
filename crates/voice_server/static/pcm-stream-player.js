@@ -26,12 +26,12 @@
       this.pending = combined;
       const frameBytes = 2 * safeChannels;
       const usableBytes = this.pending.byteLength - (this.pending.byteLength % frameBytes);
-      if (!usableBytes) return;
+      if (!usableBytes) return undefined;
       const pcm = this.pending.subarray(0, usableBytes);
       this.pending = this.pending.slice(usableBytes);
       const context = this.getContext();
       const frames = usableBytes / frameBytes;
-      if (!frames) return;
+      if (!frames) return undefined;
       const buffer = context.createBuffer(safeChannels, frames, sampleRate);
       const view = new DataView(pcm.buffer, pcm.byteOffset, pcm.byteLength);
       for (let channel = 0; channel < safeChannels; channel++) {
@@ -58,6 +58,8 @@
       } else if (context.state === 'suspended') {
         void context.resume();
       }
+      const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      return now + Math.max(0, startAt - context.currentTime) * 1000;
     }
 
     stop() {

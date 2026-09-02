@@ -64,8 +64,8 @@ pub mod audio;
 pub mod pipeline;
 pub mod state;
 
-use std::sync::Arc;
-use std::time::Instant;
+use std::{collections::HashSet, sync::Arc};
+use std::time::{Duration, Instant};
 
 use actix::prelude::Recipient;
 use parking_lot::Mutex;
@@ -77,7 +77,7 @@ use webhttp::websocket::OutMessage;
 
 use crate::agent::LlmAgent;
 use crate::client::{AsrClient, TtsClient};
-use crate::metrics::VoiceMetrics;
+use crate::metrics::{NoopMetricsSink, VoiceMetricsSink};
 use crate::trace_context::scope;
 
 pub use state::SessionState;
@@ -103,9 +103,10 @@ pub struct VoiceSession {
     current_real_cancel: Arc<Mutex<Option<CancellationToken>>>,
     /// 单会话内的 pipeline 请求序号；0 保留给没有请求序列的兼容事件。
     next_request_id: u64,
+    playback_reported: HashSet<u64>,
     trace_id: String,
     audio_buf: AudioAccumulator,
-    metrics: Arc<VoiceMetrics>,
+    metrics: Arc<dyn VoiceMetricsSink>,
     input_started_at: Option<Instant>,
     /// 最近一次通过最短时长校验的语音请求，供显式 Retry 重放。
     last_request_audio: Option<Vec<u8>>,
@@ -137,7 +138,7 @@ impl VoiceSession {
         tts: Arc<dyn TtsClient>,
         down_addr: Recipient<OutMessage>,
     ) -> Self {
-        Self::new_with_metrics(session_id, asr, llm, tts, down_addr, Arc::new(VoiceMetrics::new()))
+        Self::new_with_metrics(session_id, asr, llm, tts, down_addr, Arc::new(NoopMetricsSink))
     }
 
     pub fn new_with_metrics(
@@ -146,7 +147,7 @@ impl VoiceSession {
         llm: Arc<LlmAgent>,
         tts: Arc<dyn TtsClient>,
         down_addr: Recipient<OutMessage>,
-        metrics: Arc<VoiceMetrics>,
+        metrics: Arc<dyn VoiceMetricsSink>,
     ) -> Self {
         info!(target: "voice_server.session", session_id = %session_id, "VoiceSession 创建");
         Self {
@@ -156,6 +157,7 @@ impl VoiceSession {
             global_cancel: CancellationToken::new(),
             current_real_cancel: Arc::new(Mutex::new(None)),
             next_request_id: 0,
+            playback_reported: HashSet::new(),
             trace_id: crate::trace_context::new_trace_id(),
             audio_buf: AudioAccumulator::new(),
             metrics,
@@ -312,6 +314,7 @@ impl VoiceSession {
                 None
             }
             VoicePayload::Retry { .. } => {
+                self.metrics.request_retried();
                 let Some(audio) = self.last_request_audio.clone() else {
                     warn!(
                         target: "voice_server.session",
@@ -333,6 +336,23 @@ impl VoiceSession {
                 self.input_started_at = Some(Instant::now());
                 self.audio_buf.push(audio);
                 self.trigger_pipeline(TriggerReason::Retry)
+            }
+            VoicePayload::PlaybackStarted { request_id, delay_ms, .. } => {
+                const MAX_PLAYBACK_DELAY_MS: u64 = 30_000;
+                if request_id == 0 || request_id > self.next_request_id || delay_ms > MAX_PLAYBACK_DELAY_MS {
+                    warn!(
+                        target: "voice_server.session",
+                        session_id = %self.session_id,
+                        request_id,
+                        delay_ms,
+                        "忽略无效的客户端播放时延"
+                    );
+                    return None;
+                }
+                if self.playback_reported.insert(request_id) {
+                    self.metrics.observe_e2e_client_playback_delay(Duration::from_millis(delay_ms));
+                }
+                None
             }
             VoicePayload::SessionEnd { reason, .. } => {
                 info!(
@@ -523,6 +543,7 @@ mod tests {
             &self,
             _session_id: &str,
             _messages: &[ChatMessage],
+            _emotion_hint: Option<&str>,
         ) -> Result<LlmStream<Result<LlmEvent, ClientError>>, ClientError> {
             Ok(Box::pin(stream::empty()))
         }

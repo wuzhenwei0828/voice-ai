@@ -21,6 +21,8 @@ export class VoiceServerClient {
   private utteranceStartedAt?: number;
   private invalidatedRequestId = 0;
   private activeRequestId = 0;
+  private firstAudioReceivedAt = new Map<number, number>();
+  private playbackReported = new Set<number>();
   constructor(private readonly settings: Settings, private readonly callbacks: VoiceClientCallbacks) {}
 
   connect(sessionId = crypto.randomUUID()) {
@@ -29,6 +31,8 @@ export class VoiceServerClient {
     this.utteranceStartedAt = undefined;
     this.invalidatedRequestId = 0;
     this.activeRequestId = 0;
+    this.firstAudioReceivedAt.clear();
+    this.playbackReported.clear();
     this.callbacks.onState('connecting');
     console.info('[voice-ws] connecting', { sessionId });
     this.socket = new WebSocket(buildWsUrl(this.settings, sessionId));
@@ -50,6 +54,7 @@ export class VoiceServerClient {
     };
     this.socket.onclose = (event) => {
       console.info('[voice-ws] closed', { sessionId: this.sessionId, code: event.code, reason: event.reason });
+      this.clearPlaybackTimings();
       this.callbacks.onState('closed');
     };
   }
@@ -60,9 +65,21 @@ export class VoiceServerClient {
     this.send({ type: 'audio_chunk', session_id: this.sessionId, seq: this.audioSeq++, timestamp_ms: Date.now() - this.utteranceStartedAt, data: new Uint8Array(data), is_last: isLast });
     if (isLast) this.utteranceStartedAt = undefined;
   }
-  interrupt() { this.invalidatedRequestId = Math.max(this.invalidatedRequestId, this.activeRequestId); if (this.sessionId) this.send({ type: 'interrupt', session_id: this.sessionId }); }
+  interrupt() { this.invalidatedRequestId = Math.max(this.invalidatedRequestId, this.activeRequestId); this.clearPlaybackTimings(); if (this.sessionId) this.send({ type: 'interrupt', session_id: this.sessionId }); }
   retry() { if (this.sessionId) this.send({ type: 'retry', session_id: this.sessionId }); }
-  stop() { if (this.sessionId) this.send({ type: 'session_end', session_id: this.sessionId, reason: 'user' }); this.utteranceStartedAt = undefined; this.socket?.close(); }
+  stop() { this.clearPlaybackTimings(); if (this.sessionId) this.send({ type: 'session_end', session_id: this.sessionId, reason: 'user' }); this.utteranceStartedAt = undefined; this.socket?.close(); }
+
+  reportPlaybackStarted(requestId: number | undefined, playbackStartedAt = this.now()) {
+    if (!requestId || this.playbackReported.has(requestId) || !this.sessionId || this.socket?.readyState !== WebSocket.OPEN) return;
+    this.prunePlaybackTimings(playbackStartedAt);
+    const receivedAt = this.firstAudioReceivedAt.get(requestId);
+    if (receivedAt === undefined) return;
+    const delay = playbackStartedAt - receivedAt;
+    if (!Number.isFinite(delay) || delay < 0 || delay > 30_000) return;
+    this.playbackReported.add(requestId);
+    this.send({ type: 'playback_started', session_id: this.sessionId, request_id: requestId, delay_ms: Math.round(delay) });
+    this.firstAudioReceivedAt.delete(requestId);
+  }
   private send(payload: Record<string, unknown>) {
     if (this.socket?.readyState === WebSocket.OPEN) {
       const message = { ...payload, message_id: crypto.randomUUID() };
@@ -101,6 +118,13 @@ export class VoiceServerClient {
         const requestId = Number(raw.request_id ?? 0) || 0;
         if (requestId && requestId <= this.invalidatedRequestId) return;
         if (requestId) this.activeRequestId = Math.max(this.activeRequestId, requestId);
+        if (requestId && !this.firstAudioReceivedAt.has(requestId)) {
+          const receivedAt = this.now();
+          this.firstAudioReceivedAt.set(requestId, receivedAt);
+          setTimeout(() => {
+            if (this.firstAudioReceivedAt.get(requestId) === receivedAt) this.firstAudioReceivedAt.delete(requestId);
+          }, 30_000);
+        }
         event = { type: 'tts_audio', audio, seq: Number(raw.seq ?? 0), is_last: Boolean(raw.is_last), sample_rate: Number(raw.sample_rate ?? 0) || undefined, channels: Number(raw.channels ?? 0) || undefined, request_id: requestId || undefined };
       } else if (type === 'agent_status') {
         const requestId = Number(raw.request_id ?? 0) || 0;
@@ -118,6 +142,14 @@ export class VoiceServerClient {
         error: String(error),
       });
       this.callbacks.onEvent({ type: 'error', message: '收到无法解析的服务端消息' });
+    }
+  }
+
+  private now() { return typeof performance !== 'undefined' ? performance.now() : Date.now(); }
+  private clearPlaybackTimings() { this.firstAudioReceivedAt.clear(); this.playbackReported.clear(); }
+  private prunePlaybackTimings(now: number) {
+    for (const [requestId, receivedAt] of this.firstAudioReceivedAt) {
+      if (now - receivedAt > 30_000) this.firstAudioReceivedAt.delete(requestId);
     }
   }
 }

@@ -64,6 +64,8 @@ pub struct VoiceConfig {
     #[serde(default)]
     pub llm: LlmConfig,
     #[serde(default)]
+    pub llm_strong: Option<LlmConfig>,
+    #[serde(default)]
     pub tts: TtsConfig,
     /// Redis 连接配置（横切：agent / 未来的 cache / rate-limit 等共用）
     #[serde(default)]
@@ -324,6 +326,8 @@ pub struct LlmConfig {
     #[serde(default)]
     pub top_p: Option<f64>,
     #[serde(default)]
+    pub top_k: Option<u32>,
+    #[serde(default)]
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub include_usage: bool,
@@ -366,6 +370,7 @@ impl Default for LlmConfig {
             max_completion_tokens: None,
             temperature: None,
             top_p: None,
+            top_k: None,
             reasoning_effort: None,
             include_usage: false,
         }
@@ -577,7 +582,8 @@ impl VoiceConfig {
     ///   - VOICE_<ASR|LLM|TTS>_API_KEY             （per-section 覆盖）
     ///   - VOICE_<ASR|LLM|TTS>_MODEL               （per-section）
     ///   - VOICE_LLM_{API_BASE,TIMEOUT_MS,HEADERS}  （LLM 连接覆盖；HEADERS 是 JSON object）
-    ///   - VOICE_LLM_{MAX_COMPLETION_TOKENS,TEMPERATURE,TOP_P,REASONING_EFFORT,INCLUDE_USAGE}
+    ///   - VOICE_LLM_{MAX_COMPLETION_TOKENS,TEMPERATURE,TOP_P,TOP_K,REASONING_EFFORT,INCLUDE_USAGE}
+    ///   - VOICE_LLM_STRONG_*                      （strong LLM 独立覆盖）
     ///   - VOICE_TTS_VOICE                          （tts 段）
     ///   - VOICE_TTS_SAMPLE_RATE                    （tts 段，u32；非法值忽略）
     ///   - VOICE_REDIS_URL                          （redis 顶层段，连接 URL）
@@ -605,6 +611,10 @@ impl VoiceConfig {
         }
         apply_section_env(&mut self.asr, "ASR");
         apply_section_env_llm(&mut self.llm, "LLM");
+        if self.llm_strong.is_some() || has_llm_env("LLM_STRONG") {
+            let strong = self.llm_strong.get_or_insert_with(|| self.llm.clone());
+            apply_section_env_llm(strong, "LLM_STRONG");
+        }
         apply_section_env_tts(&mut self.tts, "TTS");
         apply_redis_env(&mut self.redis);
         apply_agent_env(&mut self.agent);
@@ -737,6 +747,17 @@ fn apply_section_env_llm(c: &mut LlmConfig, prefix: &str) {
             ),
         }
     }
+    if let Ok(v) = std::env::var(format!("VOICE_{}_TOP_K", prefix)) {
+        match v.trim().parse() {
+            Ok(n) => c.top_k = Some(n),
+            Err(_) => tracing::warn!(
+                target: "voice_server.config",
+                env = format!("VOICE_{}_TOP_K", prefix),
+                raw = %v,
+                "LLM top_k 环境变量无法解析为 u32，忽略"
+            ),
+        }
+    }
     if let Ok(v) = std::env::var(format!("VOICE_{}_REASONING_EFFORT", prefix)) {
         c.reasoning_effort = Some(v);
     }
@@ -745,6 +766,24 @@ fn apply_section_env_llm(c: &mut LlmConfig, prefix: &str) {
             c.include_usage = include_usage;
         }
     }
+}
+
+fn has_llm_env(prefix: &str) -> bool {
+    [
+        "API_BASE",
+        "API_KEY",
+        "TIMEOUT_MS",
+        "HEADERS",
+        "MODEL",
+        "MAX_COMPLETION_TOKENS",
+        "TEMPERATURE",
+        "TOP_P",
+        "TOP_K",
+        "REASONING_EFFORT",
+        "INCLUDE_USAGE",
+    ]
+    .iter()
+    .any(|suffix| std::env::var_os(format!("VOICE_{prefix}_{suffix}")).is_some())
 }
 fn apply_section_env_tts(c: &mut TtsConfig, prefix: &str) {
     if let Ok(v) = std::env::var(format!("VOICE_{}_API_KEY", prefix)) {
@@ -778,6 +817,7 @@ impl Default for VoiceConfig {
             provider: None,
             asr: AsrConfig::default(),
             llm: LlmConfig::default(),
+            llm_strong: None,
             tts: TtsConfig::default(),
             redis: RedisConfig::default(),
             agent: AgentConfig::default(),
@@ -800,6 +840,9 @@ pub fn tts_parts(cfg: &TtsConfig, provider: Option<&ProviderConfig>) -> (OpenAIC
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static LLM_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvGuard(Vec<&'static str>);
 
@@ -870,6 +913,26 @@ mod tests {
     }
 
     #[test]
+    fn parses_fast_and_strong_llm_config() {
+        let yaml = r#"
+            llm:
+              model: "Qwen/Qwen3-8B"
+              top_k: 20
+            llm_strong:
+              model: "Qwen/Qwen3-30B-A3B"
+              top_k: 30
+        "#;
+
+        let cfg: VoiceConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(cfg.llm.model, "Qwen/Qwen3-8B");
+        assert_eq!(cfg.llm.top_k, Some(20));
+        let strong = cfg.llm_strong.as_ref().expect("strong config");
+        assert_eq!(strong.model, "Qwen/Qwen3-30B-A3B");
+        assert_eq!(strong.top_k, Some(30));
+    }
+
+    #[test]
     fn env_only_provider_settings_create_provider() {
         let _guard = EnvGuard::new(vec!["VOICE_PROVIDER_API_BASE", "VOICE_PROVIDER_API_KEY"]);
         std::env::set_var("VOICE_PROVIDER_API_BASE", "https://provider.test/v1");
@@ -885,6 +948,7 @@ mod tests {
 
     #[test]
     fn llm_environment_overrides_all_supported_options() {
+        let _lock = LLM_ENV_LOCK.lock().unwrap();
         let keys = vec![
             "VOICE_LLM_API_BASE",
             "VOICE_LLM_API_KEY",
@@ -894,6 +958,7 @@ mod tests {
             "VOICE_LLM_MAX_COMPLETION_TOKENS",
             "VOICE_LLM_TEMPERATURE",
             "VOICE_LLM_TOP_P",
+            "VOICE_LLM_TOP_K",
             "VOICE_LLM_REASONING_EFFORT",
             "VOICE_LLM_INCLUDE_USAGE",
         ];
@@ -906,6 +971,7 @@ mod tests {
         std::env::set_var("VOICE_LLM_MAX_COMPLETION_TOKENS", "384");
         std::env::set_var("VOICE_LLM_TEMPERATURE", "0.3");
         std::env::set_var("VOICE_LLM_TOP_P", "0.8");
+        std::env::set_var("VOICE_LLM_TOP_K", "20");
         std::env::set_var("VOICE_LLM_REASONING_EFFORT", "medium");
         std::env::set_var("VOICE_LLM_INCLUDE_USAGE", "true");
         let mut cfg = VoiceConfig::default();
@@ -923,8 +989,40 @@ mod tests {
         assert_eq!(cfg.llm.max_completion_tokens, Some(384));
         assert_eq!(cfg.llm.temperature, Some(0.3));
         assert_eq!(cfg.llm.top_p, Some(0.8));
+        assert_eq!(cfg.llm.top_k, Some(20));
         assert_eq!(cfg.llm.reasoning_effort.as_deref(), Some("medium"));
         assert!(cfg.llm.include_usage);
+    }
+
+    #[test]
+    fn strong_llm_environment_overrides_do_not_change_fast_config() {
+        let _lock = LLM_ENV_LOCK.lock().unwrap();
+        let keys = vec![
+            "VOICE_LLM_STRONG_MODEL",
+            "VOICE_LLM_STRONG_TIMEOUT_MS",
+            "VOICE_LLM_STRONG_TOP_K",
+        ];
+        let _guard = EnvGuard::new(keys);
+        std::env::set_var("VOICE_LLM_STRONG_MODEL", "strong-env-model");
+        std::env::set_var("VOICE_LLM_STRONG_TIMEOUT_MS", "90000");
+        std::env::set_var("VOICE_LLM_STRONG_TOP_K", "40");
+        let mut cfg = VoiceConfig {
+            llm: LlmConfig {
+                model: "fast-model".into(),
+                top_k: Some(20),
+                ..LlmConfig::default()
+            },
+            ..VoiceConfig::default()
+        };
+
+        cfg.apply_env_overrides();
+
+        assert_eq!(cfg.llm.model, "fast-model");
+        assert_eq!(cfg.llm.top_k, Some(20));
+        let strong = cfg.llm_strong.as_ref().expect("env creates strong config");
+        assert_eq!(strong.model, "strong-env-model");
+        assert_eq!(strong.timeout_ms, Some(90000));
+        assert_eq!(strong.top_k, Some(40));
     }
 
     #[test]

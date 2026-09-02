@@ -245,9 +245,13 @@ voice_requests_timeout_total / voice_requests_total
 - 可通过 `trace_id`/`request_id` 从指标异常跳转到对应结构化日志和完整链路。
 - 用户主动打断、超时、Provider 错误和连接池等待不会被归类为正常成功请求。
 
-## 12. 待确认事项
+## 12. 实现状态
 
-- 客户端是否需要上报 `client_audio_started_at`，用于统计服务端首包到实际播放的延迟。
+- [x] Server pipeline、ASR、LLM、TTS WebSocket 和结果分类指标已通过 `VoiceMetricsSink` 接入。
+- [x] TTS WebSocket 连接池 Gauge、等待/回收/失效 Counter，以及音频时长、chunk 间隔、实时率指标已接入。
+- [x] 客户端使用 `playback_started` 事件上报首个可播放 PCM 到实际排程播放的本地相对毫秒数；Server 做 0-30 秒边界校验、按 `request_id` 去重，不把 ID 作为指标标签。
+- [x] Prometheus 暴露地址为 `/metrics/voice`；业务逻辑只依赖 `VoiceMetricsSink`，测试和关闭指标使用 `NoopMetricsSink`。
+- [ ] OpenTelemetry exporter 尚未启用，后续可新增 sink adapter，不改业务埋点调用方。
 - 是否将静音检测完成作为 `input_ended_at`，还是继续以 `is_last=true` 作为统一口径。
 - 线上 SLO 的目标值和 Histogram bucket 边界，需要根据一段真实流量基线确定。
 

@@ -67,6 +67,13 @@ pub enum VoicePayload {
     Retry {
         session_id: String,
     },
+    /// 客户端在实际开始播放首个可播放 PCM chunk 后回传的相对时延。
+    PlaybackStarted {
+        session_id: String,
+        request_id: u64,
+        /// 从服务端首个 TTS 音频到客户端开始播放的毫秒数，服务端限制最大 30 秒。
+        delay_ms: u64,
+    },
 
     // ---- 下行：服务端 → 客户端（握手 ack）----
     /// 服务端处理 `SessionStart` 后返回的握手 ack。
@@ -155,6 +162,7 @@ impl VoicePayload {
             VoicePayload::SessionEnd { .. } => "session_end",
             VoicePayload::Interrupt { .. } => "interrupt",
             VoicePayload::Retry { .. } => "retry",
+            VoicePayload::PlaybackStarted { .. } => "playback_started",
             VoicePayload::SessionAck { .. } => "session_ack",
             VoicePayload::AudioChunk { .. } => "audio_chunk",
             VoicePayload::AsrPartial { .. } => "asr_partial",
@@ -172,6 +180,7 @@ impl VoicePayload {
             | VoicePayload::SessionEnd { session_id, .. }
             | VoicePayload::Interrupt { session_id }
             | VoicePayload::Retry { session_id }
+            | VoicePayload::PlaybackStarted { session_id, .. }
             | VoicePayload::AudioChunk { session_id, .. }
             | VoicePayload::AsrPartial { session_id, .. }
             | VoicePayload::LlmDelta { session_id, .. }
@@ -467,6 +476,28 @@ mod tests {
                 assert_eq!(tool.as_deref(), Some("knowledge_search"));
                 assert_eq!(request_id, 7);
                 assert!(!done);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_playback_started() {
+        let payload = VoicePayload::PlaybackStarted {
+            session_id: "s".into(),
+            request_id: 7,
+            delay_ms: 125,
+        };
+        let (_, decoded) = decode_payload(&encode_indication(&payload).unwrap()).unwrap();
+        match decoded {
+            VoicePayload::PlaybackStarted {
+                session_id,
+                request_id,
+                delay_ms,
+            } => {
+                assert_eq!(session_id, "s");
+                assert_eq!(request_id, 7);
+                assert_eq!(delay_ms, 125);
             }
             other => panic!("unexpected payload: {other:?}"),
         }

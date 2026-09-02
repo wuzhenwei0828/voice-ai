@@ -22,7 +22,7 @@ use webhttp::websocket::OutMessage;
 
 use crate::client::{asr::wrap_pcm_as_wav, AsrClient, LlmClient, TtsClient};
 use crate::events::AsrEvent;
-use crate::metrics::VoiceMetrics;
+use crate::metrics::{PipelineMetricsGuard, PipelineResult, VoiceMetricsSink};
 use crate::pipeline::{llm_tts_items, LlmTtsItem};
 use crate::utils::postprocess_utils::{
     format_asr_hint, parse_asr_text, rich_transcription_postprocess,
@@ -66,7 +66,7 @@ pub(super) async fn run_pipeline(
     down_addr: Recipient<OutMessage>,
     cancel: CancellationToken,
     current_real_cancel: Arc<Mutex<Option<CancellationToken>>>,
-    metrics: Arc<VoiceMetrics>,
+    metrics: Arc<dyn VoiceMetricsSink>,
     input_started_at: Instant,
     input_ended_at: Instant,
 ) {
@@ -74,7 +74,7 @@ pub(super) async fn run_pipeline(
     // 所有结果都通过 `down_addr` 发送 VoicePayload；因此每个 return 都代表该请求结束。
     // request_id 会被原样带到所有下行事件，供客户端把并发/打断后的消息归属到正确请求。
     info!(target: "voice_server.session", session_id = %session_id, "pipeline 开始");
-    let mut metric_guard = metrics.start_pipeline(input_started_at, input_ended_at);
+    let mut metric_guard = PipelineMetricsGuard::start(metrics.clone(), input_started_at, input_ended_at);
 
     // ===== 阶段 1：ASR —— 先识别，再决定是否进入后续链路 =====
     // 先通知前端进入“正在理解”，后续 ASR partial 会在拿到最终文本后一次性 flush。
@@ -87,6 +87,7 @@ pub(super) async fn run_pipeline(
         AgentPhase::Transcribing,
         false,
     ) {
+        metric_guard.set_result(PipelineResult::Cancelled);
         return;
     }
 
@@ -111,12 +112,14 @@ pub(super) async fn run_pipeline(
     let mut asr_stream = match tokio::select! {
         _ = cancel.cancelled() => {
             warn!(target: "voice_server.session", session_id = %session_id, "ASR 建连阶段被取消");
+            metric_guard.set_result(PipelineResult::Cancelled);
             return;
         }
         r = tokio::time::timeout(asr_timeout, asr.recognize(&session_id, None, wav)) => {
             match r {
                 Ok(inner) => inner,
                 Err(_elapsed) => {
+                    metric_guard.set_result(PipelineResult::Timeout);
                     error!(
                         target: "voice_server.session",
                         session_id = %session_id,
@@ -144,6 +147,7 @@ pub(super) async fn run_pipeline(
     } {
         Ok(s) => s,
         Err(e) => {
+            metric_guard.set_result(PipelineResult::Failed);
             error!(target: "voice_server.session", session_id = %session_id, "ASR 调用失败: {}", e);
             if !send_agent_status(
                 &down_addr,
@@ -174,6 +178,7 @@ pub(super) async fn run_pipeline(
         tokio::select! {
             _ = cancel.cancelled() => {
                 warn!(target: "voice_server.session", session_id = %session_id, "ASR 阶段被取消");
+                metric_guard.set_result(PipelineResult::Cancelled);
                 return;
             }
             evt = asr_stream.next() => {
@@ -195,6 +200,7 @@ pub(super) async fn run_pipeline(
                         }
                     }
                     Some(Err(e)) => {
+                        metric_guard.set_result(PipelineResult::Failed);
                         error!(target: "voice_server.session", session_id = %session_id, "ASR 流错误: {}", e);
                         if !send_agent_status(
                             &down_addr,
@@ -232,6 +238,7 @@ pub(super) async fn run_pipeline(
             buffered_events = asr_events.len(),
             "ASR 最终文本为空，跳过 LLM/TTS（不推任何 ASR 事件、不打断其他 pipeline）"
         );
+        metric_guard.set_result(PipelineResult::EmptyResponse);
         return;
     }
 
@@ -257,6 +264,7 @@ pub(super) async fn run_pipeline(
             session_id = %session_id,
             "ASR 文本仅含标签，跳过 LLM/TTS"
         );
+        metric_guard.set_result(PipelineResult::EmptyResponse);
         return;
     }
     info!(target: "voice_server.session", session_id = %session_id, asr_text = %prompt, "ASR final 完成，进入 LLM");
@@ -265,6 +273,7 @@ pub(super) async fn run_pipeline(
     // 前端不需要关心 ASR 的内部控制 token
     for e in asr_events {
         if cancel.is_cancelled() {
+            metric_guard.set_result(PipelineResult::Cancelled);
             return;
         }
         send_down(
@@ -308,9 +317,11 @@ pub(super) async fn run_pipeline(
         AgentPhase::Composing,
         false,
     ) {
+        metric_guard.set_result(PipelineResult::Cancelled);
         return;
     }
 
+    // 模型路由由单个 LlmAgent 内部完成；session pipeline 只消费统一的 LLM 流。
     // ===== 阶段 2+3：LLM → 切句 → TTS =====
     // 这里复用共享的 llm_tts_items：它负责网络流、切句、crossfade、base64 和 seq；
     // 本函数只负责把抽象事件映射成 WS 的 VoicePayload，并在每个 await 上响应取消。
@@ -331,13 +342,13 @@ pub(super) async fn run_pipeline(
     let mut speaking_sent = false;
     let mut llm_first_token_recorded = false;
     let mut llm_completed_recorded = false;
-    let mut tts_completed_recorded = false;
     // 消费共享管线事件。select! 同时监听 cancel 和 items.next()，保证 LLM/TTS 任一
     // 网络 await 期间都能被用户的新语音打断。
     while let Some(item) = {
         tokio::select! {
             _ = cancel.cancelled() => {
                 warn!(target: "voice_server.session", session_id = %session_id, "pipeline 被取消");
+                metric_guard.set_result(PipelineResult::Cancelled);
                 return;
             }
             evt = items.next() => evt,
@@ -353,9 +364,10 @@ pub(super) async fn run_pipeline(
                     }
                     if is_final && !llm_completed_recorded {
                         llm_completed_recorded = true;
-                        metrics.observe_llm_duration(llm_started_at.elapsed());
+                        metrics.observe_llm_complete(llm_started_at.elapsed());
                     }
                     if cancel.is_cancelled() {
+                        metric_guard.set_result(PipelineResult::Cancelled);
                         return;
                     }
                     send_down(
@@ -377,7 +389,6 @@ pub(super) async fn run_pipeline(
                 if !audio.is_empty() && !metric_guard.has_first_audio() {
                     let first_audio_at = Instant::now();
                     metric_guard.record_first_audio(first_audio_at);
-                    metrics.observe_tts_first_audio(llm_started_at.elapsed());
                 }
                 // 第一块音频到达才切换到 Speaking，避免 TTS 尚未产出时提前显示“正在回答”。
                 if !speaking_sent {
@@ -389,6 +400,7 @@ pub(super) async fn run_pipeline(
                         AgentPhase::Speaking,
                         false,
                     ) {
+                        metric_guard.set_result(PipelineResult::Cancelled);
                         return;
                     }
                     speaking_sent = true;
@@ -404,11 +416,8 @@ pub(super) async fn run_pipeline(
                     tts_format.0.or(client_tts_sample_rate),
                     Some(tts_format.1),
                 ) {
+                    metric_guard.set_result(PipelineResult::Cancelled);
                     return;
-                }
-                if is_last && !tts_completed_recorded {
-                    tts_completed_recorded = true;
-                    metrics.observe_tts_generation(llm_started_at.elapsed());
                 }
                 if is_last
                     && !send_agent_status(
@@ -427,6 +436,7 @@ pub(super) async fn run_pipeline(
                 // 共享管线已经把失败阶段映射为稳定错误码；WS 侧统一隐藏内部错误文本，
                 // 只记录日志并返回面向用户的安全提示。
                 error!(target: "voice_server.session", session_id = %session_id, code, %error, "pipeline 失败");
+                metric_guard.set_result(PipelineResult::Failed);
                 if !send_agent_status(
                     &down_addr,
                     &session_id,
@@ -448,7 +458,7 @@ pub(super) async fn run_pipeline(
             }
         }
     }
-    metric_guard.finish("success", Instant::now());
+    metric_guard.finish(PipelineResult::Success, Instant::now());
     info!(target: "voice_server.session", session_id = %session_id, "pipeline 全部完成");
 }
 
@@ -573,6 +583,7 @@ mod tests {
     use crate::client::llm::{BoxStream as LlmStream, ChatMessage};
     use crate::client::{AsrClient, LlmClient, TtsClient};
     use crate::events::{AsrEvent, LlmEvent, TtsEvent};
+    use crate::metrics::VoiceMetrics;
 
     use super::*;
 
@@ -638,6 +649,7 @@ mod tests {
             &self,
             _session_id: &str,
             _messages: &[ChatMessage],
+            _emotion_hint: Option<&str>,
         ) -> Result<LlmStream<Result<LlmEvent, ClientError>>, ClientError> {
             Ok(Self::response())
         }
@@ -697,6 +709,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let down_addr = CaptureActor { tx }.start().recipient();
         let request_id = 42;
+        let metrics = Arc::new(VoiceMetrics::new());
 
         run_pipeline(
             "session-1".to_string(),
@@ -712,7 +725,7 @@ mod tests {
             down_addr,
             CancellationToken::new(),
             Arc::new(Mutex::new(None)),
-            Arc::new(VoiceMetrics::new()),
+            metrics.clone(),
             Instant::now(),
             Instant::now(),
         )
@@ -801,6 +814,12 @@ mod tests {
                 ..
             })
         ));
+
+        let metric_text = metrics.render();
+        assert!(metric_text.contains("voice_e2e_input_to_tts_first_audio_seconds_count 1"));
+        assert!(metric_text.contains("voice_asr_duration_seconds_count 1"));
+        assert!(metric_text.contains("voice_llm_time_to_first_token_seconds_count 1"));
+        assert!(metric_text.contains("voice_requests_success_total 1"));
     }
 
     #[actix::test]

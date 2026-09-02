@@ -27,6 +27,7 @@ use super::tts::{BoxStream, TtsClient, TtsInputSession};
 use crate::client::error::ClientError;
 use crate::trace_context::current_trace_id;
 use crate::events::TtsEvent;
+use crate::metrics::{NoopMetricsSink, VoiceMetricsSink};
 
 pub type WsStream = async_tungstenite::WebSocketStream<
     async_tungstenite::tokio::ClientStream<tokio::net::TcpStream>,
@@ -229,9 +230,28 @@ struct TtsWsPool {
     max_connections: usize,
 }
 
+struct PoolWaitGuard {
+    metrics: Arc<dyn VoiceMetricsSink>,
+    started_at: Instant,
+}
+
+impl PoolWaitGuard {
+    fn new(metrics: Arc<dyn VoiceMetricsSink>) -> Self {
+        metrics.tts_ws_pool_wait_started();
+        Self { metrics, started_at: Instant::now() }
+    }
+}
+
+impl Drop for PoolWaitGuard {
+    fn drop(&mut self) {
+        self.metrics.tts_ws_pool_wait_finished(self.started_at.elapsed());
+    }
+}
+
 pub struct TtsWsClient {
     cfg: TtsWsConfig,
     pool: Arc<TtsWsPool>,
+    metrics: Arc<dyn VoiceMetricsSink>,
 }
 
 struct TtsWsLease {
@@ -253,9 +273,12 @@ pub struct TtsWsInputSession {
     utterance_text: String,
     utterance_state: UtteranceState,
     utterance_started_at: Option<Instant>,
+    input_started_at: Option<Instant>,
     closed: bool,
     seq: u32,
     first_audio_logged: bool,
+    audio_bytes: u64,
+    last_audio_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +290,10 @@ enum UtteranceState {
 impl TtsWsClient {
     /// 创建客户端。连接延迟到第一次 `open_input_session`/`synthesize`。
     pub fn new(cfg: TtsWsConfig) -> Self {
+        Self::new_with_metrics(cfg, Arc::new(NoopMetricsSink))
+    }
+
+    pub fn new_with_metrics(cfg: TtsWsConfig, metrics: Arc<dyn VoiceMetricsSink>) -> Self {
         let max_connections = cfg.max_connections.max(1);
         Self {
             cfg,
@@ -275,6 +302,7 @@ impl TtsWsClient {
                 notify: Notify::new(),
                 max_connections,
             }),
+            metrics,
         }
     }
     async fn connect(
@@ -282,6 +310,7 @@ impl TtsWsClient {
         voice: Option<&str>,
         sample_rate_override: Option<u32>,
     ) -> Result<WsStream, ClientError> {
+        self.metrics.tts_ws_connect();
         info!(
             target: "voice_server.tts.ws",
             endpoint = %self.cfg.endpoint,
@@ -428,15 +457,18 @@ impl TtsWsClient {
                     let generation = 1;
                     let lease_id = 1;
                     entries.push(Arc::clone(&entry));
+                    self.metrics.tts_ws_pool_connection_opened();
                     (entry, true, generation, lease_id)
                 } else {
                     drop(entries);
+                    let _wait = PoolWaitGuard::new(Arc::clone(&self.metrics));
                     tokio::time::timeout(self.cfg.timeout, notified)
                         .await
                         .map_err(|_| ClientError::Ws("TTS WebSocket pool wait timed out".into()))?;
                     continue;
                 }
             };
+            self.refresh_pool_gauges().await;
 
             if needs_connect {
                 info!(target: "voice_server.tts.ws", session_id, pool_size = self.pool.max_connections, "TTS WebSocket 预留连接并开始握手");
@@ -446,8 +478,11 @@ impl TtsWsClient {
                         let mut meta = entry.meta.lock().await;
                         meta.state = ConnectionState::InUse;
                         meta.last_sent_at = Instant::now();
+                        drop(meta);
+                        self.refresh_pool_gauges().await;
                     }
                     Err(error) => {
+                        self.metrics.tts_ws_connect_failed();
                         {
                             let mut meta = entry.meta.lock().await;
                             meta.state = ConnectionState::Closed;
@@ -456,6 +491,9 @@ impl TtsWsClient {
                         }
                         let mut entries = self.pool.entries.lock().await;
                         entries.retain(|candidate| !Arc::ptr_eq(candidate, &entry));
+                        drop(entries);
+                        self.metrics.tts_ws_pool_connection_closed();
+                        self.refresh_pool_gauges().await;
                         self.pool.notify.notify_waiters();
                         return Err(error);
                     }
@@ -497,6 +535,10 @@ impl TtsWsClient {
     }
 
     async fn invalidate(&self, entry: &Arc<TtsWsEntry>) {
+        let was_open = {
+            let meta = entry.meta.lock().await;
+            meta.state != ConnectionState::Closed
+        };
         {
             let mut meta = entry.meta.lock().await;
             meta.state = ConnectionState::Closed;
@@ -515,8 +557,30 @@ impl TtsWsClient {
             let _ = ws.close(None).await;
         }
         let mut entries = self.pool.entries.lock().await;
+        let removed = entries.iter().any(|candidate| Arc::ptr_eq(candidate, entry));
         entries.retain(|candidate| !Arc::ptr_eq(candidate, entry));
+        if removed && was_open {
+            self.metrics.tts_ws_pool_connection_closed();
+            self.metrics.tts_ws_pool_invalidated();
+        }
         self.pool.notify.notify_waiters();
+        drop(entries);
+        self.refresh_pool_gauges().await;
+    }
+
+    async fn refresh_pool_gauges(&self) {
+        let entries = self.pool.entries.lock().await.clone();
+        let mut active = 0i64;
+        let mut idle = 0i64;
+        for entry in entries {
+            match entry.meta.lock().await.state {
+                ConnectionState::Connecting | ConnectionState::InUse => active += 1,
+                ConnectionState::Idle => idle += 1,
+                ConnectionState::Closed => {}
+            }
+        }
+        self.metrics.tts_ws_pool_active(active);
+        self.metrics.tts_ws_pool_idle(idle);
     }
 
     fn schedule_reap(self: &Arc<Self>, entry: Arc<TtsWsEntry>, generation: u64, lease_id: u64) {
@@ -550,7 +614,11 @@ impl TtsWsClient {
                 }
                 let mut entries = client.pool.entries.lock().await;
                 entries.retain(|candidate| !Arc::ptr_eq(candidate, &entry));
+                client.metrics.tts_ws_pool_connection_closed();
+                client.metrics.tts_ws_pool_reaped();
                 client.pool.notify.notify_waiters();
+                drop(entries);
+                client.refresh_pool_gauges().await;
             }
         });
     }
@@ -593,6 +661,9 @@ impl TtsClient for TtsWsClient {
             closed: false,
             seq: 0,
             first_audio_logged: false,
+            input_started_at: None,
+            audio_bytes: 0,
+            last_audio_at: None,
         })))
     }
 
@@ -616,6 +687,9 @@ impl TtsClient for TtsWsClient {
             closed: false,
             seq: 0,
             first_audio_logged: false,
+            input_started_at: None,
+            audio_bytes: 0,
+            last_audio_at: None,
         };
         let session_id = session_id.to_string();
         let text = text.to_string();
@@ -655,6 +729,7 @@ impl TtsWsClient {
         Self {
             cfg: self.cfg.clone(),
             pool: Arc::clone(&self.pool),
+            metrics: Arc::clone(&self.metrics),
         }
     }
 }
@@ -743,14 +818,20 @@ impl TtsWsLease {
 
     async fn release(&self) {
         self.released.store(true, Ordering::Release);
-        let mut meta = self.entry.meta.lock().await;
-        if meta.state == ConnectionState::InUse
+        let released = {
+            let mut meta = self.entry.meta.lock().await;
+            if meta.state == ConnectionState::InUse
             && meta.generation == self.generation
             && meta.lease_id == self.lease_id
-        {
-            meta.state = ConnectionState::Idle;
-            meta.owner_session_id = None;
-            meta.idle_since = Some(Instant::now());
+            {
+                meta.state = ConnectionState::Idle;
+                meta.owner_session_id = None;
+                meta.idle_since = Some(Instant::now());
+                true
+            } else { false }
+        };
+        if released {
+            self.client.refresh_pool_gauges().await;
             self.client
                 .schedule_reap(Arc::clone(&self.entry), self.generation, self.lease_id);
             self.client.pool.notify.notify_one();
@@ -829,7 +910,11 @@ impl super::tts::TtsInputSession for TtsWsInputSession {
                 .send(Message::Text(msg.into()), "input.text")
                 .await?;
         }
+        if self.input_started_at.is_none() {
+            self.input_started_at = Some(Instant::now());
+        }
         self.utterance_text.push_str(text);
+        self.client.metrics.tts_input_chars(text.chars().count() as u64);
         Ok(())
     }
 
@@ -878,7 +963,12 @@ impl super::tts::TtsInputSession for TtsWsInputSession {
                 .await?;
         }
         self.utterance_started_at = Some(Instant::now());
+        if let Some(started) = self.input_started_at.take() {
+            self.client.metrics.observe_tts_input_wait(started.elapsed());
+        }
         self.first_audio_logged = false;
+        self.audio_bytes = 0;
+        self.last_audio_at = None;
         self.utterance_state = UtteranceState::WaitingForDone;
         Ok(())
     }
@@ -914,9 +1004,19 @@ impl super::tts::TtsInputSession for TtsWsInputSession {
             };
             match next {
                 Ok(ServerMessage::Audio(bytes)) => {
+                    self.client.metrics.tts_audio_chunk(bytes.len() as u64);
+                    let now = Instant::now();
+                    if let Some(previous) = self.last_audio_at {
+                        self.client.metrics.observe_tts_audio_chunk_interval(now.duration_since(previous));
+                    }
+                    self.last_audio_at = Some(now);
+                    self.audio_bytes = self.audio_bytes.saturating_add(bytes.len() as u64);
                     self.seq = self.seq.saturating_add(1);
                     if !self.first_audio_logged {
                         self.first_audio_logged = true;
+                        if let Some(started) = self.utterance_started_at {
+                            self.client.metrics.observe_tts_first_audio(started.elapsed());
+                        }
                         info!(
                             target: "voice_server.tts.ws",
                             session_id = %self.session_id,
@@ -935,6 +1035,7 @@ impl super::tts::TtsInputSession for TtsWsInputSession {
                     continue;
                 }
                 Ok(ServerMessage::AudioDone { error: true }) => {
+                    self.client.metrics.tts_provider_error();
                     self.client.invalidate(&entry).await;
                     self.lease = None;
                     self.config_sent = false;
@@ -942,6 +1043,17 @@ impl super::tts::TtsInputSession for TtsWsInputSession {
                     return Some(Err(ClientError::Ws("TTS audio generation failed".into())));
                 }
                 Ok(ServerMessage::SessionDone) => {
+                    if let Some(started) = self.utterance_started_at {
+                        let generation_duration = started.elapsed();
+                        self.client.metrics.observe_tts_complete(generation_duration);
+                        let sample_rate = self.sample_rate_override.or(self.client.cfg.sample_rate).unwrap_or(24_000).max(1) as f64;
+                        let channels = self.client.cfg.channels.max(1) as f64;
+                        let audio_duration = Duration::from_secs_f64(self.audio_bytes as f64 / (sample_rate * channels * 2.0));
+                        self.client.metrics.observe_tts_audio_duration(audio_duration);
+                        if generation_duration > Duration::ZERO {
+                            self.client.metrics.observe_tts_realtime_factor(audio_duration.as_secs_f64() / generation_duration.as_secs_f64());
+                        }
+                    }
                     info!(
                         target: "voice_server.tts.ws",
                         session_id = %self.session_id,
@@ -952,6 +1064,8 @@ impl super::tts::TtsInputSession for TtsWsInputSession {
                     self.utterance_state = UtteranceState::Collecting;
                     self.utterance_started_at = None;
                     self.first_audio_logged = false;
+                    self.audio_bytes = 0;
+                    self.last_audio_at = None;
                     self.seq = self.seq.saturating_add(1);
                     return Some(Ok(TtsEvent {
                         seq: self.seq,
@@ -960,6 +1074,7 @@ impl super::tts::TtsInputSession for TtsWsInputSession {
                     }));
                 }
                 Ok(ServerMessage::Error(message)) => {
+                    self.client.metrics.tts_provider_error();
                     warn!(target: "voice_server.tts.ws", session_id = %self.session_id, error = %message, "TTS WebSocket 回复错误");
                     self.client.invalidate(&entry).await;
                     self.lease = None;

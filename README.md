@@ -19,7 +19,7 @@ voice-ai/
     │       ├── client/                   # ASR / LLM / TTS client 与协议实现
     │       ├── session/                  # VoiceSession 状态机与完整流水线
     │       ├── pipeline/                 # LLM → TTS 增量处理与音频拼接
-    │       ├── agent/                    # Agent 记忆、Prompt 与搜索边界
+    │       ├── agent/                    # Agent 记忆、模型路由与搜索边界
     │       ├── service.rs                # VoiceService 实现
     │       ├── config/                   # YAML 配置与模板
     │       └── bin/voice_server.rs       # 启动入口
@@ -67,12 +67,20 @@ RUST_LOG=info cargo run --release -p voice_server
 # VOICE_LLM_MAX_COMPLETION_TOKENS=512
 # VOICE_LLM_TEMPERATURE=0.7
 # VOICE_LLM_TOP_P=0.9
+# VOICE_LLM_TOP_K=20
 # VOICE_LLM_REASONING_EFFORT=low
 # VOICE_LLM_INCLUDE_USAGE=true
+# VOICE_LLM_STRONG_MODEL=Qwen/Qwen3-30B-A3B
+# VOICE_LLM_STRONG_TIMEOUT_MS=180000
+# VOICE_LLM_STRONG_TOP_K=20
 # VOICE_TTS_MODEL=model-name
 # VOICE_TTS_VOICE=vivian
 # VOICE_TTS_SAMPLE_RATE=24000
 ```
+
+LLM 使用两个独立配置：`llm` 是 fast，`llm_strong` 是 strong。首版路由只计算 ASR final 执行 `trim()` 后的 Unicode 字符数：少于 15 字走 fast，达到或超过 15 字走 strong。两份完整 System Prompt 位于 `crates/voice_server/src/client/prompt.yaml`，分别在两个 `HttpLlmClient` 构造时固定，`LlmAgent` 不读取或拼接 Prompt。
+
+fast 请求不注册工具，当前 strong 也未实现 `tools` / `tool_calls` 执行协议。未配置 `llm_strong` 时，strong 路由复用 fast 的模型连接参数，但仍使用 strong Prompt。
 
 启动后检查服务：
 

@@ -85,6 +85,28 @@ describe('voice MessagePack protocol', () => {
 });
 
 describe('streaming TTS playback', () => {
+  it('reports one bounded playback-start delay for the first playable chunk', () => {
+    const sent: Uint8Array[] = [];
+    const client = new VoiceServerClient({ baseUrl: 'http://localhost', token: '' }, {
+      onState: () => {}, onEvent: () => {},
+    });
+    (client as any).sessionId = 's';
+    (client as any).socket = { readyState: WebSocket.OPEN, send: (data: Uint8Array) => sent.push(data) };
+    const audio = encodeVoiceIndication({
+      type: 'tts_audio', session_id: 's', seq: 1, data: new Uint8Array([0, 0]),
+      is_last: false, request_id: 7,
+    });
+    (client as any).handleMessage(audio.buffer);
+    const firstAudioAt = (client as any).firstAudioReceivedAt.get(7);
+    expect(firstAudioAt).toEqual(expect.any(Number));
+    (client as any).reportPlaybackStarted(7, firstAudioAt + 25);
+    (client as any).reportPlaybackStarted(7, firstAudioAt + 30);
+    expect(sent).toHaveLength(1);
+    expect(decodeVoiceMessage(sent[0])).toMatchObject({
+      type: 'playback_started', session_id: 's', request_id: 7, delay_ms: 25,
+    });
+  });
+
   it('starts playback when the first PCM chunk arrives', () => {
     const starts: number[] = [];
     const context = {

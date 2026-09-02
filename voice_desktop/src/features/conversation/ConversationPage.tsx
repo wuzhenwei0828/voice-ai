@@ -63,7 +63,10 @@ export function ConversationPage() {
           if (event.type === 'error') dispatch({ type: 'server_error', message: event.message });
           else if (event.type === 'agent_status') dispatch({ type: 'agent_status', phase: event.phase, done: event.done });
           else if (event.type === 'tts_audio') {
-            if (!speakerMutedRef.current) player.current.enqueue(event.audio, event.sample_rate, event.channels, event.is_last);
+            if (!speakerMutedRef.current) {
+              const playbackStartedAt = player.current.enqueue(event.audio, event.sample_rate, event.channels, event.is_last);
+              if (playbackStartedAt !== undefined) nextClient.reportPlaybackStarted(event.request_id, playbackStartedAt);
+            }
           } else if (event.type === 'asr_partial' || event.type === 'asr_final' || event.type === 'llm_delta') dispatch({ type: event.type, text: event.text });
         },
       });

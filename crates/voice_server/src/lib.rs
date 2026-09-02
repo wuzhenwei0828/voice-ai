@@ -9,7 +9,7 @@
 //!
 //! 关键模块：
 //!   - `client`       ASR / LLM / TTS 客户端 trait + HTTP 实现
-//!   - `agent`        LlmAgent：短期记忆 + 多轮对话 + 提示词注入
+//!   - `agent`        LlmAgent：短期记忆 + 多轮对话 + fast/strong 模型路由
 //!   - `events`       wire-event 共享类型（AsrEvent / LlmEvent / TtsEvent / AsrSegment）
 //!   - `session`      VoiceSession: 每连接一个 Actor，管理状态机 + pipeline
 //!   - `service`      VoiceService: 实现 webhttp::ServiceCallback
@@ -34,12 +34,13 @@ pub mod session;
 pub mod utils;
 
 pub use agent::{
-    InMemoryStore, KnowledgeSearch, LlmAgent, MemoryStore, NoopKnowledgeSearch, RedisStore,
-    SearchError, SearchResult, Source,
+    InMemoryStore, KnowledgeSearch, LlmAgent, MemoryStore, ModelRouter, NoopKnowledgeSearch,
+    RedisStore, SearchError, SearchResult, Source, DEFAULT_STRONG_MIN_CHARS,
 };
 pub use client::{
-    build_asr_client, build_llm_client, build_tts_client, AsrClient, HttpAsrClient, HttpLlmClient,
-    HttpTtsClient, LlmClient, TtsClient, TtsInputSession, TtsWsClient, TtsWsConfig,
+    build_asr_client, build_llm_client, build_llm_client_with_prompt, build_tts_client,
+    build_tts_client_with_metrics, AsrClient, HttpAsrClient, HttpLlmClient, HttpTtsClient,
+    LlmClient, LlmPromptTemplates, ModelTier, TtsClient, TtsInputSession, TtsWsClient, TtsWsConfig,
 };
 pub use config::{
     AsrConfig, LlmConfig, ProviderConfig, ServerConfig, TtsConfig, VoiceConfig, REDIS_KEY_PREFIX,
@@ -49,6 +50,9 @@ pub use logging::{
     candidate_paths, default_config_path, init_logging, load_yaml, resolve_config_path,
     resolve_web_static_dir, LogConfig, LogFormat,
 };
-pub use metrics::VoiceMetrics;
+pub use metrics::{
+    EscalationReason, NoopMetricsSink, PipelineResult, PrometheusMetricsSink, VoiceMetrics,
+    VoiceMetricsSink,
+};
 pub use service::VoiceService;
 pub use session::{SessionState, VoiceSession};

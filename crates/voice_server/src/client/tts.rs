@@ -679,6 +679,14 @@ pub fn build_tts_client(
     cfg: &TtsConfig,
     provider: Option<&ProviderConfig>,
 ) -> anyhow::Result<Arc<dyn TtsClient>> {
+    build_tts_client_with_metrics(cfg, provider, Arc::new(crate::metrics::NoopMetricsSink))
+}
+
+pub fn build_tts_client_with_metrics(
+    cfg: &TtsConfig,
+    provider: Option<&ProviderConfig>,
+    metrics: Arc<dyn crate::metrics::VoiceMetricsSink>,
+) -> anyhow::Result<Arc<dyn TtsClient>> {
     let (resolved, path) = cfg.resolved(provider);
     let timeout = resolved.timeout();
     if cfg.transport_kind() == "websocket" {
@@ -721,7 +729,7 @@ pub fn build_tts_client(
             stream_audio = ws_cfg.stream_audio,
             "构造 TTS WebSocket 客户端"
         );
-        return Ok(Arc::new(TtsWsClient::new(ws_cfg)));
+        return Ok(Arc::new(TtsWsClient::new_with_metrics(ws_cfg, metrics)));
     }
     let base_url = resolved.api_base.clone();
     let api_key = resolved.api_key.clone();

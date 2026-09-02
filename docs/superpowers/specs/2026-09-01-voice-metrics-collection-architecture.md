@@ -126,6 +126,8 @@ scrape_configs:
 
 `/metrics/voice` 只返回聚合后的 Counter/Histogram，不返回单次请求详情。Scrape 失败不会影响业务请求；业务埋点失败也不能阻断 pipeline。
 
+当前启动摘要会同时打印通用 `/metrics` 与语音专用 `/metrics/voice` 地址。客户端播放延迟通过 `playback_started` 事件上报本地相对 `delay_ms`；Server 只接受 0-30 秒值并按 `request_id` 去重。
+
 ### 4.2 Metric Types
 
 | 数据 | 类型 | 说明 |

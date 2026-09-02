@@ -14,7 +14,10 @@ use std::sync::Arc;
 use clap::Parser;
 use tracing::info;
 
-use voice_server::{init_logging, load_yaml, resolve_config_path, resolve_web_static_dir, VoiceConfig, VoiceService};
+use voice_server::{
+    init_logging, load_yaml, resolve_config_path, resolve_web_static_dir, LlmAgent,
+    LlmPromptTemplates, VoiceConfig, VoiceService,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "voice_server", about = "Voice server entry point")]
@@ -107,6 +110,9 @@ async fn main() -> anyhow::Result<()> {
         asr_endpoint = %cfg.asr.resolved(cfg.provider.as_ref()).api_base,
         llm_kind = "http",
         llm_endpoint = %cfg.llm.resolved(cfg.provider.as_ref()).api_base,
+        llm_fast_model = %cfg.llm.model,
+        llm_strong_model = %cfg.llm_strong.as_ref().map(|config| config.model.as_str()).unwrap_or(cfg.llm.model.as_str()),
+        llm_route_strong_min_chars = voice_server::DEFAULT_STRONG_MIN_CHARS,
         tts_kind = cfg.tts.transport_kind(),
         tts_endpoint = %cfg.tts.resolved_endpoint(provider_cfg),
         "voice_server 配置加载完成"
@@ -114,8 +120,34 @@ async fn main() -> anyhow::Result<()> {
 
     // 5. 构造客户端
     let asr = voice_server::build_asr_client(&cfg.asr, provider_cfg)?;
-    let llm = voice_server::build_llm_client(&cfg.llm, provider_cfg)?;
-    let tts = voice_server::build_tts_client(&cfg.tts, provider_cfg)?;
+    let prompts = LlmPromptTemplates::from_embedded()?;
+    let fast_llm = voice_server::build_llm_client_with_prompt(
+        &cfg.llm,
+        provider_cfg,
+        Arc::<str>::from(prompts.fast),
+    )?;
+    let strong_cfg = match cfg.llm_strong.as_ref() {
+        Some(config) => config,
+        None => {
+            tracing::warn!(
+                target: "voice_server.factory",
+                model = %cfg.llm.model,
+                "未配置 llm_strong，strong 路由复用 fast 模型参数"
+            );
+            &cfg.llm
+        }
+    };
+    let strong_llm = voice_server::build_llm_client_with_prompt(
+        strong_cfg,
+        provider_cfg,
+        Arc::<str>::from(prompts.strong),
+    )?;
+    let metrics = std::sync::Arc::new(voice_server::VoiceMetrics::new());
+    let tts = voice_server::build_tts_client_with_metrics(
+        &cfg.tts,
+        provider_cfg,
+        metrics.clone(),
+    )?;
 
     // 5.5 LlmAgent：根据 cfg.agent.memory_backend 选择 in-memory 或 redis store
     //   redis 配置在顶层 cfg.redis（URL / 全局前缀 / 默认 TTL），
@@ -166,14 +198,19 @@ async fn main() -> anyhow::Result<()> {
             ));
         }
     };
-    let agent = std::sync::Arc::new(voice_server::LlmAgent::with_store(llm.clone(), store));
+    let agent = std::sync::Arc::new(LlmAgent::with_models_and_metrics(
+        fast_llm.clone(),
+        strong_llm,
+        store,
+        metrics.clone(),
+    ));
 
     let static_dir =
         resolve_web_static_dir(cli.web_static_dir.as_deref()).unwrap_or_else(|| std::path::PathBuf::from("./static"));
     info!(target: "voice_server.web", static_dir = %static_dir.display(), "web demo 静态目录解析结果");
 
     let service = Arc::new(
-        VoiceService::new(asr, llm, agent, tts)
+        VoiceService::new_with_metrics(asr, fast_llm, agent, tts, metrics)
             .with_web_static_dir(&static_dir),
     );
 
@@ -192,6 +229,7 @@ async fn main() -> anyhow::Result<()> {
         target: "voice_server",
         web_api = format!("http://127.0.0.1:{}/health", cfg.server.port),
         metrics = format!("http://127.0.0.1:{}/metrics", cfg.server.port),
+        voice_metrics = format!("http://127.0.0.1:{}/metrics/voice", cfg.server.port),
         static_files = format!("http://127.0.0.1:{}/", cfg.server.port),
         "HTTP 路由"
     );
@@ -204,7 +242,15 @@ async fn main() -> anyhow::Result<()> {
     info!(
         target: "voice_server",
         asr = format!("{} (http)", cfg.asr.resolved(cfg.provider.as_ref()).api_base),
-        llm = format!("{} (http)", cfg.llm.resolved(cfg.provider.as_ref()).api_base),
+        llm = format!(
+            "{} (http; fast={}, strong={})",
+            cfg.llm.resolved(cfg.provider.as_ref()).api_base,
+            cfg.llm.model,
+            cfg.llm_strong
+                .as_ref()
+                .map(|config| config.model.as_str())
+                .unwrap_or(cfg.llm.model.as_str())
+        ),
         tts = format!(
             "{} ({})",
             cfg.tts.resolved_endpoint(provider_cfg),

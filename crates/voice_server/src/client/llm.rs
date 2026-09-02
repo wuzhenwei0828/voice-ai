@@ -29,8 +29,23 @@ use crate::events::LlmEvent;
 pub type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
 pub type ArcLlm = Arc<dyn LlmClient>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelTier {
+    Fast,
+    Strong,
+}
+
+impl ModelTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Strong => "strong",
+        }
+    }
+}
+
 /// 单条 chat 消息（OpenAI-compat 协议）。`role` 取 `"system"` / `"user"` / `"assistant"`。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
@@ -38,8 +53,7 @@ pub struct ChatMessage {
 
 #[async_trait]
 pub trait LlmClient: Send + Sync {
-    /// 便利方法：单轮对话。`emotion_hint`（可包含情绪和事件）会作为 system message
-    /// 拼到 prompt 前面。内部会构造 `[hint_system?, user]` 两/一条消息后转给 [`chat_with_messages`]。
+    /// 便利方法：单轮对话。内部构造 user message 后转给 [`chat_with_messages`]。
     async fn chat(
         &self,
         session_id: &str,
@@ -47,22 +61,24 @@ pub trait LlmClient: Send + Sync {
         emotion_hint: Option<&str>,
     ) -> Result<BoxStream<Result<LlmEvent, ClientError>>, ClientError>;
 
-    /// 原始入口：调用方（典型场景：agent 多轮对话）预构造消息数组（含历史 + system + 当前 user），
-    /// 直接发给上游 LLM；本方法不做 emotion system 等封装。
+    /// 原始入口：调用方预构造历史和当前 user。具体 client 负责注入其固定 System Prompt。
     async fn chat_with_messages(
         &self,
         session_id: &str,
         messages: &[ChatMessage],
+        emotion_hint: Option<&str>,
     ) -> Result<BoxStream<Result<LlmEvent, ClientError>>, ClientError>;
 }
 
 pub struct HttpLlmClient {
+    system_prompt_template: Option<Arc<str>>,
     api_base: String,
     api_key: String,
     model: String,
     max_completion_tokens: Option<u32>,
     temperature: Option<f64>,
     top_p: Option<f64>,
+    top_k: Option<u32>,
     reasoning_effort: Option<String>,
     include_usage: bool,
     headers: reqwest::header::HeaderMap,
@@ -81,6 +97,14 @@ impl HttpLlmClient {
     }
 
     pub fn from_config(resolved: ProviderConfig, cfg: &LlmConfig) -> Self {
+        Self::from_config_with_prompt(resolved, cfg, None)
+    }
+
+    pub fn from_config_with_prompt(
+        resolved: ProviderConfig,
+        cfg: &LlmConfig,
+        system_prompt_template: Option<Arc<str>>,
+    ) -> Self {
         let api_base = resolved.api_base.clone();
         let api_key = resolved.api_key.clone();
         let headers = resolved.to_header_map();
@@ -93,17 +117,39 @@ impl HttpLlmClient {
             .build()
             .expect("reqwest client builder");
         Self {
+            system_prompt_template,
             api_base,
             api_key,
             model: cfg.model.clone(),
             max_completion_tokens: cfg.max_completion_tokens,
             temperature: cfg.temperature,
             top_p: cfg.top_p,
+            top_k: cfg.top_k,
             reasoning_effort: cfg.reasoning_effort.clone(),
             include_usage: cfg.include_usage,
             headers,
             http,
         }
+    }
+
+    fn messages_with_system_prompt(
+        &self,
+        messages: &[ChatMessage],
+        emotion_hint: Option<&str>,
+    ) -> Vec<ChatMessage> {
+        let Some(template) = &self.system_prompt_template else {
+            return messages.to_vec();
+        };
+        let emotion = emotion_hint
+            .filter(|value| !value.is_empty())
+            .unwrap_or("无");
+        let mut rendered = Vec::with_capacity(messages.len() + 1);
+        rendered.push(ChatMessage {
+            role: "system".into(),
+            content: template.replace("{emotion}", emotion),
+        });
+        rendered.extend_from_slice(messages);
+        rendered
     }
 
     fn request_body<'a>(&'a self, messages: &'a [ChatMessage]) -> ChatReq<'a> {
@@ -114,6 +160,7 @@ impl HttpLlmClient {
             max_completion_tokens: self.max_completion_tokens,
             temperature: self.temperature,
             top_p: self.top_p,
+            top_k: self.top_k,
             reasoning_effort: self.reasoning_effort.as_deref(),
             stream_options: self.include_usage.then_some(ChatStreamOptions {
                 include_usage: true,
@@ -153,6 +200,8 @@ struct ChatReq<'a> {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -254,6 +303,71 @@ fn non_blank_text(value: Option<String>) -> Option<String> {
     value.filter(|text| !text.trim().is_empty())
 }
 
+const THINK_OPEN_TAG: &str = "<think>";
+const THINK_CLOSE_TAG: &str = "</think>";
+
+#[derive(Debug, Default)]
+struct ThinkTagFilter {
+    pending: String,
+    in_think: bool,
+}
+
+impl ThinkTagFilter {
+    fn push(&mut self, delta: &str) -> String {
+        self.pending.push_str(delta);
+        let mut visible = String::new();
+
+        loop {
+            let tag = if self.in_think {
+                THINK_CLOSE_TAG
+            } else {
+                THINK_OPEN_TAG
+            };
+            if let Some(position) = find_ascii_case_insensitive(&self.pending, tag) {
+                if !self.in_think {
+                    visible.push_str(&self.pending[..position]);
+                }
+                self.pending.drain(..position + tag.len());
+                self.in_think = !self.in_think;
+                continue;
+            }
+
+            let retained = matching_tag_prefix_suffix_len(&self.pending, tag);
+            let consumed = self.pending.len() - retained;
+            if !self.in_think {
+                visible.push_str(&self.pending[..consumed]);
+            }
+            self.pending.drain(..consumed);
+            break;
+        }
+
+        visible
+    }
+
+    fn finish(&mut self) -> String {
+        if self.in_think {
+            self.pending.clear();
+            return String::new();
+        }
+        std::mem::take(&mut self.pending)
+    }
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    haystack.to_ascii_lowercase().find(needle)
+}
+
+fn matching_tag_prefix_suffix_len(value: &str, tag: &str) -> usize {
+    (1..tag.len())
+        .rev()
+        .find(|&length| {
+            value
+                .get(value.len().saturating_sub(length)..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(&tag[..length]))
+        })
+        .unwrap_or(0)
+}
+
 fn parse_stream_payload(payload: &[u8]) -> Result<Option<ParsedChatOutput>, ClientError> {
     if payload.is_empty() || payload == b"[DONE]" {
         return Ok(None);
@@ -307,31 +421,20 @@ fn parse_non_stream_response(body: &[u8]) -> Result<ParsedChatOutput, ClientErro
 
 #[async_trait]
 impl LlmClient for HttpLlmClient {
-    /// 便利方法：单轮对话。构造 ASR 参考 system + user 两条消息后转给 [`chat_with_messages`]。
+    /// 便利方法：单轮对话。构造 user message 后转给 [`chat_with_messages`]。
     async fn chat(
         &self,
         session_id: &str,
         prompt: &str,
         emotion_hint: Option<&str>,
     ) -> Result<BoxStream<Result<LlmEvent, ClientError>>, ClientError> {
-        // ASR 参考：仅用于辅助理解语气/场景，禁止 LLM 主动泄露识别结果
-        let mut messages: Vec<ChatMessage> = Vec::with_capacity(2);
-        if let Some(e) = emotion_hint {
-            messages.push(ChatMessage {
-                role: "system".to_string(),
-                content: format!(
-                    "[ASR参考信号] 以下内容由语音识别模型推断，仅供理解语气和场景参考，可能不准确：\n{e}\n\
-                     请自然回答用户，不要在回复中提及、复述或暗示这些信号，\
-                     不要把事件当作用户明确说出的事实，也不要解释判断过程。"
-                ),
-            });
-        }
-        messages.push(ChatMessage {
+        let messages = vec![ChatMessage {
             role: "user".to_string(),
             content: prompt.to_string(),
-        });
+        }];
 
-        self.chat_with_messages(session_id, &messages).await
+        self.chat_with_messages(session_id, &messages, emotion_hint)
+            .await
     }
 
     /// 原始入口：调用方预构造消息数组，直接发给上游 LLM。
@@ -340,10 +443,12 @@ impl LlmClient for HttpLlmClient {
         &self,
         session_id: &str,
         messages: &[ChatMessage],
+        emotion_hint: Option<&str>,
     ) -> Result<BoxStream<Result<LlmEvent, ClientError>>, ClientError> {
         let url = format!("{}/chat/completions", self.api_base.trim_end_matches('/'));
 
-        let body = self.request_body(messages);
+        let messages = self.messages_with_system_prompt(messages, emotion_hint);
+        let body = self.request_body(&messages);
 
         let messages_count = messages.len();
         let has_system = messages.iter().any(|m| m.role == "system");
@@ -455,6 +560,7 @@ impl LlmClient for HttpLlmClient {
             Box::pin(stream! {
                 let mut chunk_count: u32 = 0;
                 let mut total_delta_chars: usize = 0;
+                let mut think_filter = ThinkTagFilter::default();
                 while let Some(chunk_res) = byte_stream.next().await {
                     let chunk = match chunk_res {
                         Ok(c) => c,
@@ -488,8 +594,11 @@ impl LlmClient for HttpLlmClient {
                                             "收到 LLM reasoning_content"
                                         );
                                     }
-                                    let delta = parsed.delta;
+                                    let mut delta = think_filter.push(&parsed.delta);
                                     let is_final = parsed.is_final;
+                                    if is_final {
+                                        delta.push_str(&think_filter.finish());
+                                    }
                                     if !delta.is_empty() || is_final {
                                         chunk_count += 1;
                                         total_delta_chars += delta.chars().count();
@@ -557,6 +666,11 @@ impl LlmClient for HttpLlmClient {
             }
             let delta = parsed.delta;
             let is_final = parsed.is_final;
+            let mut think_filter = ThinkTagFilter::default();
+            let mut delta = think_filter.push(&delta);
+            if is_final {
+                delta.push_str(&think_filter.finish());
+            }
             Box::pin(stream! {
                 yield Ok(LlmEvent { delta, is_final });
             })
@@ -570,6 +684,22 @@ pub fn build_llm_client(
     cfg: &LlmConfig,
     provider: Option<&ProviderConfig>,
 ) -> anyhow::Result<Arc<dyn LlmClient>> {
+    build_llm_client_inner(cfg, provider, None)
+}
+
+pub fn build_llm_client_with_prompt(
+    cfg: &LlmConfig,
+    provider: Option<&ProviderConfig>,
+    system_prompt_template: Arc<str>,
+) -> anyhow::Result<Arc<dyn LlmClient>> {
+    build_llm_client_inner(cfg, provider, Some(system_prompt_template))
+}
+
+fn build_llm_client_inner(
+    cfg: &LlmConfig,
+    provider: Option<&ProviderConfig>,
+    system_prompt_template: Option<Arc<str>>,
+) -> anyhow::Result<Arc<dyn LlmClient>> {
     let resolved = cfg.resolved(provider);
     let timeout_ms = resolved.timeout_ms;
 
@@ -582,12 +712,113 @@ pub fn build_llm_client(
         "构造 HttpLlmClient（手搓 reqwest，drop stream 立即关闭 HTTP 连接）"
     );
 
-    Ok(Arc::new(HttpLlmClient::from_config(resolved, cfg)))
+    Ok(Arc::new(HttpLlmClient::from_config_with_prompt(
+        resolved,
+        cfg,
+        system_prompt_template,
+    )))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn think_filter_removes_inline_reasoning_from_visible_content() {
+        let mut filter = ThinkTagFilter::default();
+
+        let mut visible = filter.push("<think>内部推理</think>最终答案");
+        visible.push_str(&filter.finish());
+
+        assert_eq!(visible, "最终答案");
+    }
+
+    #[test]
+    fn think_filter_handles_tags_split_across_stream_deltas() {
+        let mut filter = ThinkTagFilter::default();
+        let mut visible = String::new();
+
+        for delta in ["<thi", "nk>内部", "推理</th", "ink>答", "案"] {
+            visible.push_str(&filter.push(delta));
+        }
+        visible.push_str(&filter.finish());
+
+        assert_eq!(visible, "答案");
+    }
+
+    #[test]
+    fn think_filter_handles_case_insensitive_split_tags() {
+        let mut filter = ThinkTagFilter::default();
+        let mut visible = String::new();
+
+        for delta in ["<THI", "NK>内部", "</TH", "INK>答案"] {
+            visible.push_str(&filter.push(delta));
+        }
+        visible.push_str(&filter.finish());
+
+        assert_eq!(visible, "答案");
+    }
+
+    #[test]
+    fn think_filter_drops_unclosed_reasoning_at_stream_end() {
+        let mut filter = ThinkTagFilter::default();
+
+        let mut visible = filter.push("开场<think>尚未结束的内部推理");
+        visible.push_str(&filter.finish());
+
+        assert_eq!(visible, "开场");
+    }
+
+    #[test]
+    fn client_prepends_fixed_prompt_and_renders_emotion() {
+        let client = HttpLlmClient::from_config_with_prompt(
+            ProviderConfig::default(),
+            &LlmConfig {
+                model: "fast".into(),
+                ..LlmConfig::default()
+            },
+            Some(Arc::<str>::from("固定提示。推断信息：{emotion}")),
+        );
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "你好".into(),
+        }];
+
+        let rendered = client.messages_with_system_prompt(&messages, Some("开心"));
+
+        assert_eq!(rendered[0].role, "system");
+        assert_eq!(rendered[0].content, "固定提示。推断信息：开心");
+        assert_eq!(rendered[1], messages[0]);
+    }
+
+    #[test]
+    fn client_renders_missing_emotion_as_none() {
+        let client = HttpLlmClient::from_config_with_prompt(
+            ProviderConfig::default(),
+            &LlmConfig {
+                model: "fast".into(),
+                ..LlmConfig::default()
+            },
+            Some(Arc::<str>::from("推断信息：{emotion}")),
+        );
+
+        let rendered = client.messages_with_system_prompt(&[], None);
+
+        assert_eq!(rendered[0].content, "推断信息：无");
+    }
+
+    #[test]
+    fn client_without_prompt_preserves_caller_messages() {
+        let client = HttpLlmClient::from_config(ProviderConfig::default(), &LlmConfig::default());
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "你好".into(),
+        }];
+
+        let rendered = client.messages_with_system_prompt(&messages, Some("开心"));
+
+        assert_eq!(rendered, messages);
+    }
 
     #[test]
     fn parses_standard_stream_content_and_finish_reason() {
@@ -797,6 +1028,7 @@ mod tests {
             max_completion_tokens: Some(256),
             temperature: Some(0.2),
             top_p: Some(0.85),
+            top_k: Some(20),
             reasoning_effort: Some("low".into()),
             include_usage: true,
             ..LlmConfig::default()
@@ -818,6 +1050,7 @@ mod tests {
                 "max_completion_tokens": 256,
                 "temperature": 0.2,
                 "top_p": 0.85,
+                "top_k": 20,
                 "reasoning_effort": "low",
                 "stream_options": {"include_usage": true}
             })

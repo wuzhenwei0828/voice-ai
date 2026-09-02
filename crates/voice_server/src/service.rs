@@ -21,7 +21,7 @@ use crate::agent::LlmAgent;
 use crate::client::ArcAsr;
 use crate::client::ArcLlm;
 use crate::client::ArcTts;
-use crate::metrics::VoiceMetrics;
+use crate::metrics::{VoiceMetrics, VoiceMetricsSink};
 use crate::session::VoiceSession;
 use crate::trace_context::new_trace_id;
 
@@ -34,6 +34,7 @@ pub struct VoiceService {
     pub tts: ArcTts,
     /// Prometheus collectors for server-side voice pipeline timings.
     pub metrics: Arc<VoiceMetrics>,
+    metrics_sink: Arc<dyn VoiceMetricsSink>,
     /// session_id -> VoiceSession
     sessions: DashMap<String, VoiceSession>,
     /// web admin 静态文件目录（None = 不挂载）
@@ -49,8 +50,19 @@ pub struct VoiceService {
 
 impl VoiceService {
     pub fn new(asr: ArcAsr, llm: ArcLlm, agent: Arc<LlmAgent>, tts: ArcTts) -> Self {
-        let pipeline_tasks = Arc::new(Mutex::new(JoinSet::new()));
         let metrics = Arc::new(VoiceMetrics::new());
+        Self::new_with_metrics(asr, llm, agent, tts, metrics)
+    }
+
+    pub fn new_with_metrics(
+        asr: ArcAsr,
+        llm: ArcLlm,
+        agent: Arc<LlmAgent>,
+        tts: ArcTts,
+        metrics: Arc<VoiceMetrics>,
+    ) -> Self {
+        let pipeline_tasks = Arc::new(Mutex::new(JoinSet::new()));
+        let metrics_sink: Arc<dyn VoiceMetricsSink> = metrics.clone();
 
         // janitor：循环 join_next，已完成的任务自动从 set 移除；panic 转 error 日志。
         // 注意：这是 minimal 版本 —— shutdown 时不等待 in-flight pipeline 退出，
@@ -95,6 +107,7 @@ impl VoiceService {
             agent,
             tts,
             metrics,
+            metrics_sink,
             sessions: DashMap::new(),
             web_static_dir: None,
             pipeline_tasks,
@@ -215,7 +228,7 @@ impl ServiceCallback for VoiceService {
                         self.agent.clone(),
                         self.tts.clone(),
                         addr,
-                        self.metrics.clone(),
+                        self.metrics_sink.clone(),
                     )
                 });
 
