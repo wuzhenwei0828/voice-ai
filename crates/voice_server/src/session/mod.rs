@@ -283,6 +283,7 @@ impl VoiceSession {
                 timestamp_ms,
                 data,
                 is_last,
+                message_id,
                 ..
             } => {
                 let audio_received_at = Instant::now();
@@ -301,7 +302,15 @@ impl VoiceSession {
                 }
                 if self.audio_buf.len() == 0 {
                     self.input_started_at = Some(Instant::now());
-                    self.current_message_id = Some(self.trace_id.clone());
+                    // 优先用客户端 utterance_message_id（与 audio_chunk.message_id 对齐），
+                    // 旧客户端/缺字段时（message_id 为空串）兜底用服务端 trace_id。
+                    self.current_message_id = Some(
+                        if !message_id.is_empty() {
+                            message_id
+                        } else {
+                            self.trace_id.clone()
+                        },
+                    );
                 }
                 self.audio_buf.push(data);
                 if is_last {

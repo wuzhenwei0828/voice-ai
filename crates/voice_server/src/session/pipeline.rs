@@ -72,7 +72,7 @@ pub(super) async fn run_pipeline(
     // 这是一次 utterance（用户一段语音）的完整生命周期。函数本身不返回业务数据，
     // 所有结果都通过 `down_addr` 发送 VoicePayload；因此每个 return 都代表该请求结束。
     // request_id 仅用于服务端内部取消和指标，不进入任何下行事件。
-    info!(target: "voice_server.session", session_id = %session_id, "pipeline 开始");
+    info!(target: "voice_server.session", session_id = %session_id, message_id = %message_id, "pipeline 开始");
     let mut metric_guard =
         PipelineMetricsGuard::start(metrics.clone(), input_started_at, input_ended_at);
 
@@ -97,6 +97,7 @@ pub(super) async fn run_pipeline(
     debug!(
         target: "voice_server.session",
         session_id = %session_id,
+        message_id = %message_id,
         pcm_bytes = audio.len(),
         wav_bytes = wav.len(),
         sample_rate, channels,
@@ -111,7 +112,7 @@ pub(super) async fn run_pipeline(
     metrics.observe_queue(asr_started_at.duration_since(input_ended_at));
     let mut asr_stream = match tokio::select! {
         _ = cancel.cancelled() => {
-            warn!(target: "voice_server.session", session_id = %session_id, "ASR 建连阶段被取消");
+            warn!(target: "voice_server.session", session_id = %session_id, message_id = %message_id, "ASR 建连阶段被取消");
             metric_guard.set_result(PipelineResult::Cancelled);
             return;
         }
@@ -123,6 +124,7 @@ pub(super) async fn run_pipeline(
                     error!(
                         target: "voice_server.session",
                         session_id = %session_id,
+                        message_id = %message_id,
                         timeout_secs = asr_timeout.as_secs(),
                         "ASR recognize 超时"
                     );
@@ -149,7 +151,7 @@ pub(super) async fn run_pipeline(
         Ok(s) => s,
         Err(e) => {
             metric_guard.set_result(PipelineResult::Failed);
-            error!(target: "voice_server.session", session_id = %session_id, "ASR 调用失败: {}", e);
+            error!(target: "voice_server.session", session_id = %session_id, message_id = %message_id, "ASR 调用失败: {}", e);
             if !send_agent_status(
                 &down_addr,
                 &session_id,
@@ -179,7 +181,7 @@ pub(super) async fn run_pipeline(
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
-                warn!(target: "voice_server.session", session_id = %session_id, "ASR 阶段被取消");
+                warn!(target: "voice_server.session", session_id = %session_id, message_id = %message_id, "ASR 阶段被取消");
                 metric_guard.set_result(PipelineResult::Cancelled);
                 return;
             }
@@ -203,7 +205,7 @@ pub(super) async fn run_pipeline(
                     }
                     Some(Err(e)) => {
                         metric_guard.set_result(PipelineResult::Failed);
-                        error!(target: "voice_server.session", session_id = %session_id, "ASR 流错误: {}", e);
+                        error!(target: "voice_server.session", session_id = %session_id, message_id = %message_id, "ASR 流错误: {}", e);
                         if !send_agent_status(
                             &down_addr,
                             &session_id,
@@ -222,7 +224,7 @@ pub(super) async fn run_pipeline(
                         return;
                     }
                     None => {
-                        warn!(target: "voice_server.session", session_id = %session_id, "ASR 流提前结束");
+                        warn!(target: "voice_server.session", session_id = %session_id, message_id = %message_id, "ASR 流提前结束");
                         break;
                     }
                 }
@@ -238,6 +240,7 @@ pub(super) async fn run_pipeline(
         info!(
             target: "voice_server.session",
             session_id = %session_id,
+            message_id = %message_id,
             buffered_events = asr_events.len(),
             "ASR 最终文本为空，跳过 LLM/TTS（不推任何 ASR 事件、不打断其他 pipeline）"
         );
@@ -254,6 +257,7 @@ pub(super) async fn run_pipeline(
         info!(
             target: "voice_server.session",
             session_id = %session_id,
+            message_id = %message_id,
             emotion = ?parsed.emotion,
             events = ?parsed.event,
             "ASR 文本含情绪/事件信号"
@@ -265,12 +269,13 @@ pub(super) async fn run_pipeline(
         warn!(
             target: "voice_server.session",
             session_id = %session_id,
+            message_id = %message_id,
             "ASR 文本仅含标签，跳过 LLM/TTS"
         );
         metric_guard.set_result(PipelineResult::EmptyResponse);
         return;
     }
-    info!(target: "voice_server.session", session_id = %session_id, asr_text = %prompt, "ASR final 完成，进入 LLM");
+    info!(target: "voice_server.session", session_id = %session_id, message_id = %message_id, asr_text = %prompt, "ASR final 完成，进入 LLM");
 
     // 非空：把缓冲的 ASR 事件按顺序推给前端 —— 用剥掉 `<|...|>` 标签后的纯文本，
     // 前端不需要关心 ASR 的内部控制 token
@@ -305,6 +310,7 @@ pub(super) async fn run_pipeline(
         info!(
             target: "voice_server.session",
             session_id = %session_id,
+            message_id = %message_id,
             "ASR 拿到文本，打断上一个 LLM/TTS pipeline"
         );
         prev.cancel();
@@ -347,7 +353,7 @@ pub(super) async fn run_pipeline(
     while let Some(item) = {
         tokio::select! {
             _ = cancel.cancelled() => {
-                warn!(target: "voice_server.session", session_id = %session_id, "pipeline 被取消");
+                warn!(target: "voice_server.session", session_id = %session_id, message_id = %message_id, "pipeline 被取消");
                 metric_guard.set_result(PipelineResult::Cancelled);
                 return;
             }
@@ -442,7 +448,7 @@ pub(super) async fn run_pipeline(
             LlmTtsItem::Failed { error, code } => {
                 // 共享管线已经把失败阶段映射为稳定错误码；WS 侧统一隐藏内部错误文本，
                 // 只记录日志并返回面向用户的安全提示。
-                error!(target: "voice_server.session", session_id = %session_id, code, %error, "pipeline 失败");
+                error!(target: "voice_server.session", session_id = %session_id, message_id = %message_id, code, %error, "pipeline 失败");
                 metric_guard.set_result(PipelineResult::Failed);
                 if !send_agent_status(
                     &down_addr,
@@ -467,7 +473,7 @@ pub(super) async fn run_pipeline(
         }
     }
     metric_guard.finish(PipelineResult::Success, Instant::now());
-    info!(target: "voice_server.session", session_id = %session_id, "pipeline 全部完成");
+    info!(target: "voice_server.session", session_id = %session_id, message_id = %message_id, "pipeline 全部完成");
 }
 
 fn agent_label(phase: AgentPhase) -> &'static str {
@@ -542,6 +548,7 @@ pub(super) fn send_down(addr: &Recipient<OutMessage>, p: VoicePayload) -> bool {
         Ok(bytes) => {
             let kind = p.type_name();
             let session_id = p.session_id().map(str::to_owned);
+            let message_id = p.message_id().map(str::to_owned);
             let bytes_len = bytes.len();
             // 注：Recipient::do_send 返回 ()，无法获知失败 —— 用 try_send 接住 SendError
             // （SendError 的 Display 只输出变体名 "receiver is full" / "receiver is gone"），
@@ -552,6 +559,7 @@ pub(super) fn send_down(addr: &Recipient<OutMessage>, p: VoicePayload) -> bool {
                         target: "voice_server.session",
                         direction = "outbound",
                         session_id = ?session_id,
+                        message_id = ?message_id,
                         kind,
                         bytes = bytes_len,
                         "WS 发送消息"
@@ -563,6 +571,7 @@ pub(super) fn send_down(addr: &Recipient<OutMessage>, p: VoicePayload) -> bool {
                         target: "voice_server.session",
                         direction = "outbound",
                         session_id = ?session_id,
+                        message_id = ?message_id,
                         kind,
                         bytes = bytes_len,
                         "WS 发送消息失败（客户端可能已断开）: {}", e
@@ -576,6 +585,7 @@ pub(super) fn send_down(addr: &Recipient<OutMessage>, p: VoicePayload) -> bool {
                 target: "voice_server.session",
                 direction = "outbound",
                 session_id = ?p.session_id(),
+                message_id = ?p.message_id(),
                 kind = p.type_name(),
                 "WS 发送消息编码失败: {}", e
             );

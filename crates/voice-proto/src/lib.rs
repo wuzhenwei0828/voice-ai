@@ -113,6 +113,11 @@ pub enum VoicePayload {
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
         is_last: bool,
+        /// 客户端为本段 utterance 生成的关联 ID（与 asr_partial / llm_delta /
+        /// tts_audio / agent_status 共享同一 ID）。`#[serde(default)]` 让旧客户端
+        /// / 旧消息可正常反序列化（旧消息会落到空串，由调用方兜底）。
+        #[serde(default)]
+        message_id: String,
     },
 
     // ---- 下行：服务端 → 客户端（流式结果）----
@@ -206,6 +211,27 @@ impl VoicePayload {
             | VoicePayload::AgentStatus { session_id, .. }
             | VoicePayload::SessionAck { session_id, .. } => Some(session_id),
             VoicePayload::Error { .. } => None,
+        }
+    }
+
+    /// 取出 `message_id`（如有）。Error 变体是 `Option<String>`，其它变体一定有。
+    /// 用于把同一句话的上行音频、下行 ASR/LLM/TTS/状态关联起来。
+    pub fn message_id(&self) -> Option<&str> {
+        match self {
+            VoicePayload::AsrPartial { message_id, .. }
+            | VoicePayload::LlmDelta { message_id, .. }
+            | VoicePayload::TtsAudio { message_id, .. }
+            | VoicePayload::AgentStatus { message_id, .. } => Some(message_id),
+            VoicePayload::Error { message_id, .. } => message_id.as_deref(),
+            // 上行 / 控制类不带 message_id
+            VoicePayload::SessionStart { .. }
+            | VoicePayload::SessionEnd { .. }
+            | VoicePayload::Interrupt { .. }
+            | VoicePayload::Retry { .. }
+            | VoicePayload::PlaybackStarted { .. }
+            | VoicePayload::ClientMetricReport { .. }
+            | VoicePayload::AudioChunk { .. }
+            | VoicePayload::SessionAck { .. } => None,
         }
     }
 }
