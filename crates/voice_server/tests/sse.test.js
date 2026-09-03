@@ -8,7 +8,7 @@ global.fetch = async () => ({
   ok: true,
   json: async () => ({ sample_rate: 16000, channels: 1 }),
 });
-require('./sse.js');
+require('../static/js/shared/sse.js');
 
 function mockResponse(chunks) {
   let index = 0;

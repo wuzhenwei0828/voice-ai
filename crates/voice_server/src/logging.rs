@@ -9,6 +9,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use file_rotate::compression::Compression;
+use file_rotate::suffix::AppendCount;
+use file_rotate::{ContentLimit, FileRotate};
 use serde::{Deserialize, Serialize};
 use time::format_description::BorrowedFormatItem;
 use time::macros::format_description;
@@ -70,7 +73,7 @@ pub struct LogConfig {
     /// trace | debug | info | warn | error
     #[serde(default = "default_log_level")]
     pub level: String,
-    /// 日志文件路径；空字符串 = stdout，特殊值 "stderr" = stderr，否则按天滚动写文件
+    /// 日志文件路径；空字符串 = stdout，特殊值 "stderr" = stderr，否则按大小切文件（默认 20 MB / 文件，保留 5 份，过期文件后缀 .1 / .2 / .3 …）
     #[serde(default)]
     pub file: String,
     #[serde(default)]
@@ -81,6 +84,12 @@ pub struct LogConfig {
     /// 每条日志是否带上源码文件 + 行号（默认 true；生产环境可关掉省点开销）
     #[serde(default = "default_with_location")]
     pub with_location: bool,
+    /// 单文件最大字节数，达到即触发轮转（默认 20 MiB）
+    #[serde(default = "default_max_size_bytes")]
+    pub max_size_bytes: usize,
+    /// 最多保留几个轮转文件（含当前写入的主文件）；超过的最老文件被丢弃（默认 5）
+    #[serde(default = "default_max_files")]
+    pub max_files: usize,
 }
 
 impl Default for LogConfig {
@@ -91,6 +100,8 @@ impl Default for LogConfig {
             format: default_log_format(),
             also_stdout: default_also_stdout(),
             with_location: default_with_location(),
+            max_size_bytes: default_max_size_bytes(),
+            max_files: default_max_files(),
         }
     }
 }
@@ -106,6 +117,12 @@ fn default_also_stdout() -> bool {
 }
 fn default_with_location() -> bool {
     true
+}
+fn default_max_size_bytes() -> usize {
+    20 * 1024 * 1024
+}
+fn default_max_files() -> usize {
+    5
 }
 
 impl LogConfig {
@@ -158,6 +175,33 @@ fn normalize_path(p: &Path) -> PathBuf {
     out
 }
 
+// ===== FileWriter：把 FileRotate 包成 MakeWriter =====
+//
+// FileRotate 只 impl `io::Write`，不 impl `MakeWriter`；
+// tracing-subscriber 的 `with_writer` 需要 MakeWriter，所以加一层薄包装。
+#[derive(Clone)]
+struct FileWriter {
+    inner: Arc<Mutex<FileRotate<AppendCount>>>,
+}
+
+impl std::io::Write for FileWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.lock().unwrap().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.lock().unwrap().flush()
+    }
+}
+
+impl<'a> MakeWriter<'a> for FileWriter {
+    type Writer = FileWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 // ===== Tee writer：同一条日志同时写文件和控制台 =====
 //
 // 文件不能带 ANSI 转义（否则 [2m/[32m 等控制符会写进文件），
@@ -165,7 +209,7 @@ fn normalize_path(p: &Path) -> PathBuf {
 // 如需在终端看颜色，请把 `log.file` 留空（纯 stdout 模式）。
 #[derive(Clone)]
 struct TeeWriter {
-    file: Arc<Mutex<std::fs::File>>,
+    file: FileWriter,
 }
 
 impl std::io::Write for TeeWriter {
@@ -173,12 +217,12 @@ impl std::io::Write for TeeWriter {
         let mut out = std::io::stdout().lock();
         out.write_all(buf)?;
         out.flush()?;
-        self.file.lock().unwrap().write(buf)
+        self.file.write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         std::io::stdout().flush()?;
-        self.file.lock().unwrap().flush()
+        self.file.flush()
     }
 }
 
@@ -192,6 +236,10 @@ impl<'a> MakeWriter<'a> for TeeWriter {
 
 /// 根据 LogConfig 初始化全局 tracing subscriber。
 /// 重复调用静默成功（try_init）。
+///
+/// 文件模式按大小切（默认 20 MB / 文件，保留 5 份；通过 `LogConfig.max_size_bytes` /
+/// `LogConfig.max_files` 可覆盖）。轮转时当前文件被改名为 `<path>.1`、`.2` …，
+/// 超过 `max_files` 的最老文件被丢弃。
 ///
 /// 因 `tracing_subscriber::Layer` 是 generic over Subscriber，
 /// 这里把 stdout/file 两种情况拆成独立分支各自构建 Layer，
@@ -207,19 +255,26 @@ pub fn init_logging(cfg: &LogConfig) -> anyhow::Result<()> {
     // 用 fmt() 直接构建 subscriber，绕过 tracing-log。
 
     if use_file {
-        // cfg.file 是文件路径（如 ./logs/voice-server.log）；父目录不存在则创建
-        let log_path = Path::new(&cfg.file);
-        if let Some(parent) = log_path.parent() {
+        // cfg.file 是日志路径（如 /app/logs/voice-server.log）；按大小切。
+        // AppendCount::new(2) 让后缀左补 0 到 2 位宽度（如 .01, .02 …）；
+        // 但 .1/.2/.3 这种单数字也接受，这里为简洁用默认值 0（不补零）。
+        let path = Path::new(&cfg.file);
+        if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| anyhow::anyhow!("create log dir {}: {}", parent.display(), e))?;
             }
         }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-            .map_err(|e| anyhow::anyhow!("open log file {}: {}", log_path.display(), e))?;
+        let file = FileRotate::new(
+            path,
+            AppendCount::new(cfg.max_files),
+            ContentLimit::Bytes(cfg.max_size_bytes),
+            Compression::None,
+            None,
+        );
+        let writer = FileWriter {
+            inner: Arc::new(Mutex::new(file)),
+        };
 
         // 文件输出统一关掉 ANSI（避免 [2m/[32m 等控制符写进文件；
         // 即便 cfg.also_stdout = true，tee 模式下控制台也只能拿到纯文本）
@@ -228,7 +283,7 @@ pub fn init_logging(cfg: &LogConfig) -> anyhow::Result<()> {
                 fmt::Subscriber::builder()
                     .with_env_filter(env_filter)
                     .with_writer(TeeWriter {
-                        file: Arc::new(Mutex::new(file)),
+                        file: writer.clone(),
                     })
                     .with_ansi(false)
                     .with_timer(ShortLocalTime)
@@ -240,7 +295,7 @@ pub fn init_logging(cfg: &LogConfig) -> anyhow::Result<()> {
             LogFormat::Json => tracing::subscriber::set_global_default(
                 fmt::Subscriber::builder()
                     .with_env_filter(env_filter)
-                    .with_writer(file)
+                    .with_writer(writer)
                     .with_ansi(false)
                     .with_timer(ShortLocalTime)
                     .with_file(cfg.with_location)
@@ -252,7 +307,7 @@ pub fn init_logging(cfg: &LogConfig) -> anyhow::Result<()> {
                 fmt::Subscriber::builder()
                     .with_env_filter(env_filter)
                     .with_writer(TeeWriter {
-                        file: Arc::new(Mutex::new(file)),
+                        file: writer.clone(),
                     })
                     .with_ansi(false)
                     .with_timer(ShortLocalTime)
@@ -265,7 +320,7 @@ pub fn init_logging(cfg: &LogConfig) -> anyhow::Result<()> {
             LogFormat::Text => tracing::subscriber::set_global_default(
                 fmt::Subscriber::builder()
                     .with_env_filter(env_filter)
-                    .with_writer(file)
+                    .with_writer(writer)
                     .with_ansi(false)
                     .with_timer(ShortLocalTime)
                     .with_target(true)
@@ -524,6 +579,8 @@ mod tests {
             format: LogFormat::Text,
             also_stdout: true,
             with_location: true,
+            max_size_bytes: default_max_size_bytes(),
+            max_files: default_max_files(),
         };
         l.resolve_relative_paths(Path::new("/tmp/configs"));
         assert_eq!(l.file, "/tmp/logs/x.log");
@@ -535,6 +592,8 @@ mod tests {
             format: LogFormat::Text,
             also_stdout: true,
             with_location: true,
+            max_size_bytes: default_max_size_bytes(),
+            max_files: default_max_files(),
         };
         l.resolve_relative_paths(Path::new("/tmp/configs"));
         assert_eq!(l.file, "/var/log/x.log");
@@ -546,6 +605,8 @@ mod tests {
             format: LogFormat::Text,
             also_stdout: true,
             with_location: true,
+            max_size_bytes: default_max_size_bytes(),
+            max_files: default_max_files(),
         };
         l.resolve_relative_paths(Path::new("/tmp/configs"));
         assert_eq!(l.file, "");
@@ -557,6 +618,8 @@ mod tests {
             format: LogFormat::Text,
             also_stdout: true,
             with_location: true,
+            max_size_bytes: default_max_size_bytes(),
+            max_files: default_max_files(),
         };
         l.resolve_relative_paths(Path::new("/tmp/configs"));
         assert_eq!(l.file, "stdout");

@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { createTraceId, fetchWithTrace } = require('./trace-context.js');
+const { createTraceId, fetchWithTrace } = require('../static/js/core/trace-context.js');
 
 test('createTraceId returns a UUID', () => {
   assert.match(createTraceId(), /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);

@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createClientMetricReport, executeRetry, shouldStopPlaybackForAsr, trySendWebSocket } = require('./app.js');
+const { createClientMetricReport, executeRetry, shouldStopPlaybackForAsr, trySendWebSocket } = require('../static/js/core/app.js');
 
 test('returns false when browser websocket send throws synchronously', () => {
   assert.equal(trySendWebSocket({ send: () => { throw new Error('closed'); } }, new Uint8Array([1])), false);

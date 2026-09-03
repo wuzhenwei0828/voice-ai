@@ -4,7 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 global.window = {};
-require('./pcm-stream-player.js');
+require('../static/js/shared/pcm-stream-player.js');
 
 function fakeAudioContext() {
   const starts = [];

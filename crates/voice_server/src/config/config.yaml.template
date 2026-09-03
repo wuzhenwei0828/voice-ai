@@ -4,7 +4,7 @@
 
 log:
   level: info
-  file: ../../logs/voice-server.log          # 相对 src/config/config.yaml → crates/voice-server/logs/
+  file: ../../logs/voice-server.log          # 相对 src/config/config.yaml → crates/voice-server/logs/；按大小切，20MB/文件，保留 5 份
   format: text                             # text | json
 
 server:

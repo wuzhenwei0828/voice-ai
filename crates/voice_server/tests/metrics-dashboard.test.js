@@ -7,7 +7,7 @@ const {
   parsePrometheus,
   histogramQuantile,
   buildDashboardSnapshot,
-} = require('./metrics-dashboard.js');
+} = require('../static/js/metrics/metrics-dashboard.js');
 
 const fixture = `
 # HELP voice_requests_total Voice requests
