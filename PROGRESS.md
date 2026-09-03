@@ -258,3 +258,12 @@ file.write_all(&pcm_bytes)?;
 - 全 workspace 测试 162 / 0 失败；既有页面/接口冒烟全 200/400 语义不变
 - 全部「不改动已有功能」：diff 审计通过，已有文件只新增 pub mod / match arm / route / 依赖行
 - 真实 DashScope 联调待拿 API key + workspace_id 验证（与项目现状一致，voice-providers 一直未做真实联调）
+
+### 2026-09-03 移除 FunASR 流式客户端 + 整条 live-asr 链路
+
+- 删除 `crates/voice_server/src/client/funasr/`（mod / protocol / ws，约 1265 行）—— 直连本地 FunASR runtime WSS 的流式客户端
+- 删除 `crates/voice_server/src/live_asr/`（mod / config / runtime，约 1341 行）—— `/ws/live-asr/<actor>/<connid>` 端点、`AsrLiveCfg` 配置与每会话状态机
+- 删除前端 `static/asr_realtime.{html,js}` 与 `diagrams/funasr-flow.{mmd,html}`
+- 接线点清理：`lib.rs` 去 `pub mod live_asr`；`client/mod.rs` 去 `pub mod funasr` 及 `FunasrClient` 等 re-export；`service.rs` 去 `business == "live-asr"` 路由分支；`favicon.test.js` 页面列表去 `asr_realtime.html`；`config/config.yaml` 删 `asr_live` 段（该文件在 .gitignore 内）
+- **保留**：`client/asr.rs`（HTTP 一次性 ASR，走 funasr-server multipart）、`utils/postprocess_utils.rs`（SenseVoice 输出清洗）、`client/error.rs` 的上游错误体解析 —— 均非流式客户端，仍被主链路使用
+- `/ws/voice/*` 主 pipeline 与 `/admin/*` 不受影响；`cargo test --workspace` 178 / 0 失败，`favicon.test.js` 2 / 2 通过

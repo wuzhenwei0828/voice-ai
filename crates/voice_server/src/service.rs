@@ -212,13 +212,6 @@ impl ServiceCallback for VoiceService {
                     "WS 收到消息"
                 );
 
-                // live-asr 业务：复用 webhttp 路由 + voice-providers WsConnPool 跨会话复用
-                // （公共协议：fun-asr / qwen-audio-3.0 / paraformer，docs L3289）
-                if business == "live-asr" {
-                    crate::live_asr::handle_message(addr, session_id, payload, trace_id);
-                    return Ok(ActorMsg::Ok);
-                }
-
                 // 找/建 session
                 let mut entry = self.sessions.entry(session_id.clone()).or_insert_with(|| {
                     info!(target: "voice_server.service", session_id = %session_id, "新建 VoiceSession");

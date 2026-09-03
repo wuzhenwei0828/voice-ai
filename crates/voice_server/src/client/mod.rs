@@ -10,7 +10,6 @@
 //!
 //! 模块组织：
 //!   - `asr.rs`         HttpAsrClient（手搓 reqwest multipart，支持 FunASR 私有扩展 spk/tags）
-//!   - `funasr.rs`      FunasrClient（直连本地 FunASR 部署，docs/FunASR/runtime/docs/websocket_protocol_zh.md）
 //!   - `llm.rs`         HttpLlmClient
 //!   - `prompt.yaml`     fast / strong 两份完整 System Prompt
 //!   - `tts.rs`         HttpTtsClient（手搓 reqwest：Voice 枚举不兼容 siliconflow 自定义 voice 字符串）
@@ -21,7 +20,6 @@
 
 pub mod asr;
 pub mod error;
-pub mod funasr;
 pub mod llm;
 pub mod prompt;
 pub mod tts;
@@ -29,9 +27,6 @@ pub mod tts_ws;
 
 pub use asr::{build_asr_client, ArcAsr, AsrClient, HttpAsrClient};
 pub use error::ClientError;
-pub use funasr::{
-    build_funasr_client, ArcFunasr, FunasrClient, FunasrConfig, FunasrMode, FunasrSession,
-};
 pub use llm::{
     build_llm_client, build_llm_client_with_prompt, ArcLlm, HttpLlmClient, LlmClient, ModelTier,
 };

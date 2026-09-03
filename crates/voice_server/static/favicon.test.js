@@ -6,7 +6,7 @@ const test = require('node:test');
 const staticDir = __dirname;
 
 test('web pages declare the shared browser icons', () => {
-  for (const page of ['index.html', 'asr_realtime.html']) {
+  for (const page of ['index.html']) {
     const html = fs.readFileSync(path.join(staticDir, page), 'utf8');
     assert.match(html, /rel="icon" type="image\/svg\+xml" href="favicon\.svg"/);
     assert.match(html, /rel="icon" type="image\/png" sizes="32x32" href="favicon-32x32\.png"/);
