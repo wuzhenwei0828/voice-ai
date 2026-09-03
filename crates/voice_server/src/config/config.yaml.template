@@ -22,12 +22,12 @@ provider:
 
 # ASR：multipart/form-data 上传音频 → {"text": "..."}
 asr:
-  api_base: "http://127.0.0.1:8000/sensevoice/v1"
-  model: "sensevoice"
-  # language: "zh"              # 强制语种（auto / zh / en / yue / ja / ko / nospeech）
+  api_base: "https://asr.softtest.cowarobot.com/api/v1/sensevoice"
+  # model: "sensevoicesmall"
+  # language: "zh"              # 强制语种（auto / zh / en / yue / ja / ko / nospeech），缺省 = 模型自动检测
   # response_format: "json"     # json | text | verbose_json，缺省 = json
-  # spk: true                    # 说话人分离（首请求 +1~3s 懒加载 cam++ 模型）
-  # tags: true                   # 保留 SenseVoice 标签，缺省剥离
+  # spk: true                   # 说话人分离（首请求 +1~3s 懒加载 cam++ 模型）
+  tags: true                  # 保留 <|zh|><|HAPPY|> 等 SenseVoice 标签
 
 # LLM：流式 chat completion
 llm:
@@ -55,21 +55,22 @@ llm_strong:
 
 # TTS：文本 → 音频（vLLM-Omni OpenAI-compatible speech API）
 tts:
-  model: "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+  api_base: "https://tts.softtest.cowarobot.com/api/v1/tts"
+  # model: "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
   voice: "vivian"
-  response_format: "wav"
+  response_format: "pcm"
   stream: true
   sample_rate: 24000
   channels: 1
-  # transport: "websocket"   # 使用 /v1/audio/speech/stream 长连接
-  # max_connections: 4       # WebSocket TTS 连接池最大并发连接数
+  transport: "websocket"   # 使用 /v1/audio/speech/stream 长连接
+  max_connections: 4        # WebSocket TTS 连接池最大并发连接数
   # vLLM-Omni 扩展字段（均可省略，使用服务端默认）
   # speed: 1.0
   # task_type: "CustomVoice"  # CustomVoice | VoiceDesign | Base
   # language: "Auto"
   # instructions: ""
   # max_new_tokens: 2048
-  # stream_format: "sse"      # sse | audio,ws模式时配置成audio则stream_audio=true
+  stream_format: "audio"      # sse | audio ,ws模式时配置成audio则stream_audio=true
   # ref_audio: "https://..."  # Base voice cloning
   # ref_text: "..."
   # x_vector_only_mode: false

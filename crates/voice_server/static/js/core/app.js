@@ -116,6 +116,30 @@
            location.host + '/ws/voice/web/' + sid;
   }
 
+  // ====== 假 token（临时占位，等真鉴权接入后替换来源即可）======
+  // 后端 webhttp 在 ws_entry 里从 Sec-WebSocket-Protocol 头读取 token：
+  //   crates/voice_server/src/whttp/websocket/api.rs::ws_entry
+  // 浏览器 WebSocket API 不允许携带自定义 header，所以借用"子协议"字段传 token。
+  // 第一次进页面生成，存到 localStorage，后续访问复用同一个 —— 这样服务端日志按
+  // token 能关联同一浏览器的多次会话，便于排查。
+  function getOrCreateFakeToken() {
+    const KEY = 'voice-ai.fakeWsToken';
+    let stored = null;
+    try { stored = localStorage.getItem(KEY); } catch (_) {}
+    if (stored) return stored;
+    const bytes = new Uint8Array(16);
+    if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+      crypto.getRandomValues(bytes);
+    } else {
+      for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+    }
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+    const token = `fake-${hex.slice(0, 8)}-${hex.slice(8, 16)}-${Date.now().toString(36)}`;
+    try { localStorage.setItem(KEY, token); } catch (_) {}
+    return token;
+  }
+  const FAKE_WS_TOKEN = getOrCreateFakeToken();
+
   // ====== 元素 ======
   const $ = (id) => document.getElementById(id);
   const convLog = $('conv-log');
@@ -816,7 +840,8 @@
 
   function connect() {
     return new Promise((resolve, reject) => {
-      ws = new WebSocket(buildWsUrl(sessionId));
+      // 第二个参数 = WebSocket subprotocols 列表；后端 ws_entry 把它当 token 读
+      ws = new WebSocket(buildWsUrl(sessionId), [FAKE_WS_TOKEN]);
       ws.binaryType = 'arraybuffer';
 
       ws.onopen = () => {

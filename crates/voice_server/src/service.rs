@@ -199,18 +199,33 @@ impl ServiceCallback for VoiceService {
                         return Ok(ActorMsg::Ok);
                     }
                 };
-                info!(
-                    target: "voice_server.service",
-                    direction = "inbound",
-                    business = %business,
-                    actor = %actor,
-                    connid = %connid,
-                    session_id = %session_id,
-                    message_id = %trace_id,
-                    kind = p.type_name(),
-                    bytes = payload.len(),
-                    "WS 收到消息"
-                );
+                if p.type_name() == "audio_chunk" {
+                    debug!(
+                        target: "voice_server.service",
+                        direction = "inbound",
+                        business = %business,
+                        actor = %actor,
+                        connid = %connid,
+                        session_id = %session_id,
+                        message_id = %trace_id,
+                        kind = p.type_name(),
+                        bytes = payload.len(),
+                        "WS 收到消息"
+                    );
+                } else {
+                    info!(
+                        target: "voice_server.service",
+                        direction = "inbound",
+                        business = %business,
+                        actor = %actor,
+                        connid = %connid,
+                        session_id = %session_id,
+                        message_id = %trace_id,
+                        kind = p.type_name(),
+                        bytes = payload.len(),
+                        "WS 收到消息"
+                    );
+                }
 
                 // 找/建 session
                 let mut entry = self.sessions.entry(session_id.clone()).or_insert_with(|| {
