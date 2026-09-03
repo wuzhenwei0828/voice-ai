@@ -22,8 +22,8 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tracing::{info, warn};
 
-use crate::client::error::{parse_openai_error, ClientError};
 use crate::client::apply_trace_header;
+use crate::client::error::{parse_openai_error, ClientError};
 use crate::client::tts_ws::{TtsWsClient, TtsWsConfig};
 use crate::config::{ProviderConfig, TtsConfig};
 use crate::events::TtsEvent;
@@ -60,7 +60,9 @@ pub trait TtsInputSession: Send {
 
 #[async_trait]
 pub trait TtsClient: Send + Sync {
-    fn output_format(&self) -> (Option<u32>, u8) { (None, 1) }
+    fn output_format(&self) -> (Option<u32>, u8) {
+        (None, 1)
+    }
 
     /// 打开增量输入会话。
     ///
@@ -68,7 +70,6 @@ pub trait TtsClient: Send + Sync {
     async fn open_input_session(
         &self,
         _session_id: &str,
-        _sample_rate_override: Option<u32>,
         _voice_override: Option<String>,
     ) -> Result<Option<Box<dyn TtsInputSession>>, ClientError> {
         Ok(None)
@@ -86,20 +87,14 @@ pub trait TtsClient: Send + Sync {
 
     /// 合成一段文本到音频流。
     ///
-    /// `sample_rate_override`：端侧（浏览器）SessionStart 上报的 TTS 输出采样率。
-    /// - `Some(n)` —— 优先用端侧值（**覆盖** `TtsConfig.sample_rate`）
-    /// - `None` —— 用配置 `TtsConfig.sample_rate`（兜底）
-    ///
     /// `voice_override`：端侧（前端下拉框）选中的音色**短名**（如 `alex`）。
     /// - `Some("alex")` —— 用该短名（拼上 `model` 前缀后发给 provider）
     /// - `None` —— 用配置 `TtsConfig.voice` 默认（拼上 `model` 前缀）
     ///
-    /// 调用方（`session.rs` / admin handler）应把"端侧值（可能为 None）"原样透传。
     async fn synthesize(
         &self,
         session_id: &str,
         text: &str,
-        sample_rate_override: Option<u32>,
         voice_override: Option<String>,
     ) -> Result<BoxStream<Result<TtsEvent, ClientError>>, ClientError>;
 
@@ -356,7 +351,9 @@ fn parse_vllm_sse_stream(input: &[u8]) -> BoxStream<Result<TtsEvent, ClientError
 
 #[async_trait]
 impl TtsClient for HttpTtsClient {
-    fn output_format(&self) -> (Option<u32>, u8) { (self.sample_rate, self.channels) }
+    fn output_format(&self) -> (Option<u32>, u8) {
+        (self.sample_rate, self.channels)
+    }
 
     fn default_voice_short(&self) -> &str {
         &self.voice_short
@@ -408,17 +405,8 @@ impl TtsClient for HttpTtsClient {
         &self,
         session_id: &str,
         text: &str,
-        sample_rate_override: Option<u32>,
         voice_override: Option<String>,
     ) -> Result<BoxStream<Result<TtsEvent, ClientError>>, ClientError> {
-        // ===== 解析 effective sample_rate =====
-        // 优先级：端侧 override > 配置 sample_rate（兜底）
-        let effective_sample_rate = sample_rate_override.or(self.sample_rate);
-
-        // 端侧 override 与 response_format 的兼容性校验（仅 override 时校验，
-        // 配置 fallback 已在 build_tts_client 时校验过，这里不重复）。
-        validate_sample_rate_override(sample_rate_override, &self.response_format)?;
-
         // Voice values are model-specific in vLLM-Omni (for example "vivian").
         let effective_voice_short = voice_override.as_deref().unwrap_or(&self.voice_short);
         let effective_voice = effective_voice_short;
@@ -467,13 +455,14 @@ impl TtsClient for HttpTtsClient {
             ref_audio: self.ref_audio.clone(),
             ref_text: self.ref_text.clone(),
             x_vector_only_mode: self.x_vector_only_mode,
-            sample_rate: effective_sample_rate,
+            sample_rate: self.sample_rate,
         };
-        let mut req = apply_trace_header(self
-            .client
-            .request(reqwest::Method::POST, &url)
-            .header("x-session-id", session_id)
-            .json(&body));
+        let mut req = apply_trace_header(
+            self.client
+                .request(reqwest::Method::POST, &url)
+                .header("x-session-id", session_id)
+                .json(&body),
+        );
         if let Some(key) = &self.api_key {
             // 如果用户已经在 key 里写了 "Bearer xxx"，原样发；
             // 否则 SDK 习惯是只发 token，由服务端加 Bearer —— 我们这里也加
@@ -517,9 +506,7 @@ impl TtsClient for HttpTtsClient {
             voice_short_config = %self.voice_short,
             response_format = %self.response_format,
             stream = self.stream,
-            sample_rate = effective_sample_rate,
-            sample_rate_override,
-            sample_rate_config = self.sample_rate,
+            sample_rate = self.sample_rate,
             api_key_present = self.api_key.is_some(),
             api_key_len = self.api_key.as_deref().map(|k| k.len()).unwrap_or(0),
             extra_headers_count = self.extra_headers.len(),
@@ -995,36 +982,6 @@ pub fn supported_voice_shorts() -> Vec<&'static str> {
     v
 }
 
-/// 校验端侧 `sample_rate_override` 与 `response_format` 的兼容性。
-///
-/// - `None`：端侧没上报，跳过校验（HttpTtsClient 会自动走配置兜底）
-/// - `Some(sr)`：sr 必须在该 response_format 的支持列表里；否则 `Err(Config)`
-/// - `response_format` 为空（配置层未指定）：不校验，透传给 provider（与 build_tts_client 行为一致）
-///
-/// 抽出独立函数便于直接单测；synthesize 主路径只 `?` 一下。
-pub fn validate_sample_rate_override(
-    sample_rate_override: Option<u32>,
-    response_format: &str,
-) -> Result<(), ClientError> {
-    if let Some(sr) = sample_rate_override {
-        if !response_format.is_empty() {
-            let supported = supported_sample_rates(response_format);
-            if !supported.is_empty() && !supported.contains(&sr) {
-                let default_sr = default_sample_rate(response_format);
-                let detail = match default_sr {
-                    Some(d) => format!("，默认 {} Hz", d),
-                    None => String::new(),
-                };
-                return Err(ClientError::Config(format!(
-                    "TTS sample_rate {} Hz 与 response_format '{}' 不兼容；该格式支持的采样率为 {:?}{}",
-                    sr, response_format, supported, detail
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1039,7 +996,7 @@ mod tests {
 
         let client = build_tts_client(&cfg, None).expect("HTTP TTS client should build");
         let session = client
-            .open_input_session("test-session", None, None)
+            .open_input_session("test-session", None)
             .await
             .expect("HTTP TTS should use the default incremental-session behavior");
         assert!(session.is_none());
@@ -1051,7 +1008,10 @@ mod tests {
         cfg.api_base = "http://127.0.0.1:8091/v1".into();
 
         assert_eq!(cfg.transport_kind(), "http");
-        assert_eq!(cfg.resolved_endpoint(None), "http://127.0.0.1:8091/v1/audio/speech");
+        assert_eq!(
+            cfg.resolved_endpoint(None),
+            "http://127.0.0.1:8091/v1/audio/speech"
+        );
 
         cfg.transport = "websocket".into();
         assert_eq!(cfg.transport_kind(), "websocket");
@@ -1192,63 +1152,6 @@ mod tests {
 
         let client = build_tts_client(&cfg, None).expect("model-specific voice should be accepted");
         assert_eq!(client.default_voice_short(), "snake_oil");
-    }
-
-    // ===== validate_sample_rate_override（端侧 override 的请求期校验）=====
-
-    #[test]
-    fn validate_override_none_passes() {
-        // None = 端侧没上报，直接放行（HttpTtsClient 会走配置兜底）
-        assert!(validate_sample_rate_override(None, "wav").is_ok());
-        assert!(validate_sample_rate_override(None, "").is_ok());
-        assert!(validate_sample_rate_override(None, "flac").is_ok());
-    }
-
-    #[test]
-    fn validate_override_compatible_rate_passes() {
-        // wav/pcm 支持 [8000, 16000, 24000, 32000, 44100]
-        for fmt in ["wav", "pcm", "WAV", "PCM"] {
-            for sr in [8000u32, 16000, 24000, 32000, 44100] {
-                assert!(
-                    validate_sample_rate_override(Some(sr), fmt).is_ok(),
-                    "{fmt} + {sr} should pass"
-                );
-            }
-        }
-        // opus 仅 48000
-        assert!(validate_sample_rate_override(Some(48000), "opus").is_ok());
-        // mp3 仅 [32000, 44100]
-        for sr in [32000u32, 44100] {
-            assert!(validate_sample_rate_override(Some(sr), "mp3").is_ok());
-        }
-    }
-
-    #[test]
-    fn validate_override_incompatible_rate_bails() {
-        // opus + 16000 → 不兼容
-        let err = validate_sample_rate_override(Some(16000), "opus").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("16000"), "msg should mention rate: {msg}");
-        assert!(msg.contains("opus"), "msg should mention format: {msg}");
-        // mp3 + 24000 → 不兼容
-        let err = validate_sample_rate_override(Some(24000), "mp3").unwrap_err();
-        assert!(err.to_string().contains("24000"));
-        // wav + 48000 → 不在 wav 支持列表
-        let err = validate_sample_rate_override(Some(48000), "wav").unwrap_err();
-        assert!(err.to_string().contains("48000"));
-    }
-
-    #[test]
-    fn validate_override_empty_response_format_passes_through() {
-        // response_format 为空 → 不校验（与 build_tts_client 行为一致）
-        assert!(validate_sample_rate_override(Some(12345), "").is_ok());
-    }
-
-    #[test]
-    fn validate_override_unknown_response_format_passes_through() {
-        // 未知格式（flac / aac）→ supported_sample_rates 返回空，保守放行
-        assert!(validate_sample_rate_override(Some(12345), "flac").is_ok());
-        assert!(validate_sample_rate_override(Some(12345), "aac").is_ok());
     }
 
     // ===== SUPPORTED_VOICES / is_supported_voice / lookup_voice =====

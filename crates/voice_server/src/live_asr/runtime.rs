@@ -80,6 +80,7 @@ pub(super) struct LiveAsrState {
     pub(super) recv_task: Option<actix_rt::task::JoinHandle<()>>,
     pub(super) pending_audio: Vec<u8>,
     pub(super) pending_is_last: bool,
+    pub(super) current_message_id: Option<String>,
     pub(super) failed: bool,
     pub(super) finished: bool,
 }
@@ -91,6 +92,7 @@ impl LiveAsrState {
             recv_task: None,
             pending_audio: Vec::new(),
             pending_is_last: false,
+            current_message_id: None,
             failed: false,
             finished: false,
         }

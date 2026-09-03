@@ -29,8 +29,8 @@ pub mod logging;
 pub mod metrics;
 pub mod pipeline;
 pub mod service;
-pub mod trace_context;
 pub mod session;
+pub mod trace_context;
 pub mod utils;
 
 pub use agent::{

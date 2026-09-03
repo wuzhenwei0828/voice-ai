@@ -64,15 +64,15 @@ pub mod audio;
 pub mod pipeline;
 pub mod state;
 
-use std::{collections::HashSet, sync::Arc};
 use std::time::{Duration, Instant};
+use std::{collections::HashMap, sync::Arc};
 
 use actix::prelude::Recipient;
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn, Instrument};
-use voice_proto::VoicePayload;
+use voice_proto::{ClientMetricKind, VoicePayload};
 use webhttp::websocket::OutMessage;
 
 use crate::agent::LlmAgent;
@@ -103,21 +103,20 @@ pub struct VoiceSession {
     current_real_cancel: Arc<Mutex<Option<CancellationToken>>>,
     /// 单会话内的 pipeline 请求序号；0 保留给没有请求序列的兼容事件。
     next_request_id: u64,
-    playback_reported: HashSet<u64>,
+    client_metrics_reported: HashMap<(String, ClientMetricKind), Instant>,
     trace_id: String,
     audio_buf: AudioAccumulator,
     metrics: Arc<dyn VoiceMetricsSink>,
     input_started_at: Option<Instant>,
     /// 最近一次通过最短时长校验的语音请求，供显式 Retry 重放。
     last_request_audio: Option<Vec<u8>>,
+    /// 当前音频轮次对应的客户端 message_id。
+    current_message_id: Option<String>,
+    /// 最近一次有效语音请求的 message_id，供 Retry 复用。
+    last_request_message_id: Option<String>,
     /// 从 SessionStart 记下，用于包 WAV 头给 ASR（siliconflow 等 provider 按文件后缀选解码器）
     sample_rate: u32,
     channels: u16,
-    /// 端侧（浏览器）SessionStart 上报的 TTS 输出采样率（Hz）。
-    /// - `Some(n)` —— 传给 HttpTtsClient 当 override，**覆盖** `tts.sample_rate` 配置
-    /// - `None` / `Some(0)` —— 端侧没上报或上报 0，让 HttpTtsClient 走配置兜底
-    /// 注：把 None 和 Some(0) 合并存为 None（写时归一化），简化下游判断
-    client_tts_sample_rate: Option<u32>,
     /// 端侧（前端 voice 下拉）选中的 TTS 音色**短名**（如 `"alex"`）。
     /// - `Some(short)` —— 传给 HttpTtsClient 当 override，HttpTtsClient 拼 model 前缀后发给 provider
     /// - `None` / 空串 —— 端侧没传，让 HttpTtsClient 走配置 `tts.voice` 兜底
@@ -131,6 +130,39 @@ pub struct VoiceSession {
 }
 
 impl VoiceSession {
+    const CLIENT_METRIC_TTL: Duration = Duration::from_secs(30);
+    const MAX_CLIENT_METRIC_REPORTS: usize = 4096;
+
+    fn remember_client_metric_once(
+        &mut self,
+        message_id: String,
+        metric: ClientMetricKind,
+        now: Instant,
+    ) -> bool {
+        self.client_metrics_reported.retain(|_, reported_at| {
+            now.saturating_duration_since(*reported_at) <= Self::CLIENT_METRIC_TTL
+        });
+        if self
+            .client_metrics_reported
+            .contains_key(&(message_id.clone(), metric))
+        {
+            return false;
+        }
+        if self.client_metrics_reported.len() >= Self::MAX_CLIENT_METRIC_REPORTS {
+            if let Some(oldest) = self
+                .client_metrics_reported
+                .iter()
+                .min_by_key(|(_, reported_at)| *reported_at)
+                .map(|(key, _)| key.clone())
+            {
+                self.client_metrics_reported.remove(&oldest);
+            }
+        }
+        self.client_metrics_reported
+            .insert((message_id, metric), now);
+        true
+    }
+
     pub fn new(
         session_id: String,
         asr: Arc<dyn AsrClient>,
@@ -138,7 +170,14 @@ impl VoiceSession {
         tts: Arc<dyn TtsClient>,
         down_addr: Recipient<OutMessage>,
     ) -> Self {
-        Self::new_with_metrics(session_id, asr, llm, tts, down_addr, Arc::new(NoopMetricsSink))
+        Self::new_with_metrics(
+            session_id,
+            asr,
+            llm,
+            tts,
+            down_addr,
+            Arc::new(NoopMetricsSink),
+        )
     }
 
     pub fn new_with_metrics(
@@ -157,15 +196,16 @@ impl VoiceSession {
             global_cancel: CancellationToken::new(),
             current_real_cancel: Arc::new(Mutex::new(None)),
             next_request_id: 0,
-            playback_reported: HashSet::new(),
+            client_metrics_reported: HashMap::new(),
             trace_id: crate::trace_context::new_trace_id(),
             audio_buf: AudioAccumulator::new(),
             metrics,
             input_started_at: None,
             last_request_audio: None,
+            current_message_id: None,
+            last_request_message_id: None,
             sample_rate: 0,
             channels: 0,
-            client_tts_sample_rate: None,
             client_voice: None,
             asr,
             llm,
@@ -216,12 +256,9 @@ impl VoiceSession {
                 channels,
                 codec,
                 language,
-                tts_sample_rate,
                 voice,
                 ..
             } => {
-                // 端侧上报的 tts_sample_rate：None / Some(0) 都视为"没上报"，存 None 走配置兜底
-                let tts_sr = tts_sample_rate.filter(|&n| n > 0);
                 // 端侧上报的 voice：None / 空串都视为"没上报"，存 None 走配置兜底
                 let voice_short = voice.filter(|s| !s.trim().is_empty());
                 info!(
@@ -231,14 +268,12 @@ impl VoiceSession {
                     channels,
                     codec = %codec,
                     language = %language,
-                    client_tts_sample_rate = ?tts_sr,
                     client_voice = ?voice_short,
                     "收到 SessionStart"
                 );
                 // 记下格式参数，供后续 pipeline 包 WAV 头喂给 ASR
                 self.sample_rate = sample_rate;
                 self.channels = channels as u16;
-                self.client_tts_sample_rate = tts_sr;
                 self.client_voice = voice_short;
                 self.transition(SessionState::Listening);
                 None
@@ -250,6 +285,7 @@ impl VoiceSession {
                 is_last,
                 ..
             } => {
+                let audio_received_at = Instant::now();
                 let bytes = data.len();
                 debug!(
                     target: "voice_server.session",
@@ -265,10 +301,11 @@ impl VoiceSession {
                 }
                 if self.audio_buf.len() == 0 {
                     self.input_started_at = Some(Instant::now());
+                    self.current_message_id = Some(self.trace_id.clone());
                 }
                 self.audio_buf.push(data);
                 if is_last {
-                    self.trigger_pipeline(TriggerReason::ClientIsLast)
+                    self.trigger_pipeline(TriggerReason::ClientIsLast, audio_received_at)
                 } else if self.audio_buf.elapsed_ms() >= MAX_UTTERANCE_MS {
                     warn!(
                         target: "voice_server.session",
@@ -277,7 +314,7 @@ impl VoiceSession {
                         limit_ms = MAX_UTTERANCE_MS as u64,
                         "单句超长，服务端强制触发"
                     );
-                    self.trigger_pipeline(TriggerReason::DurationCap)
+                    self.trigger_pipeline(TriggerReason::DurationCap, audio_received_at)
                 } else if self.audio_buf.len() >= MAX_AUDIO_BYTES {
                     warn!(
                         target: "voice_server.session",
@@ -286,7 +323,7 @@ impl VoiceSession {
                         limit = MAX_AUDIO_BYTES,
                         "缓冲超限，服务端强制触发"
                     );
-                    self.trigger_pipeline(TriggerReason::BufferCap)
+                    self.trigger_pipeline(TriggerReason::BufferCap, audio_received_at)
                 } else {
                     None
                 }
@@ -308,7 +345,7 @@ impl VoiceSession {
                         session_id: self.session_id.clone(),
                         delta: "[已打断]".to_string(),
                         is_final: true,
-                        request_id: 0,
+                        message_id: self.last_request_message_id.clone().unwrap_or_default(),
                     },
                 );
                 None
@@ -335,22 +372,78 @@ impl VoiceSession {
                 let _ = self.audio_buf.drain();
                 self.input_started_at = Some(Instant::now());
                 self.audio_buf.push(audio);
-                self.trigger_pipeline(TriggerReason::Retry)
+                self.current_message_id = self.last_request_message_id.clone();
+                self.trigger_pipeline(TriggerReason::Retry, Instant::now())
             }
-            VoicePayload::PlaybackStarted { request_id, delay_ms, .. } => {
+            VoicePayload::PlaybackStarted {
+                message_id,
+                request_id,
+                delay_ms,
+                ..
+            } => {
                 const MAX_PLAYBACK_DELAY_MS: u64 = 30_000;
-                if request_id == 0 || request_id > self.next_request_id || delay_ms > MAX_PLAYBACK_DELAY_MS {
+                let metric_message_id = if message_id.is_empty() {
+                    if request_id == 0 {
+                        String::new()
+                    } else {
+                        format!("legacy-request-{request_id}")
+                    }
+                } else {
+                    message_id
+                };
+                if metric_message_id.is_empty() || delay_ms > MAX_PLAYBACK_DELAY_MS {
                     warn!(
                         target: "voice_server.session",
                         session_id = %self.session_id,
-                        request_id,
+                        message_id = %metric_message_id,
                         delay_ms,
                         "忽略无效的客户端播放时延"
                     );
                     return None;
                 }
-                if self.playback_reported.insert(request_id) {
-                    self.metrics.observe_e2e_client_playback_delay(Duration::from_millis(delay_ms));
+                if self.remember_client_metric_once(
+                    metric_message_id,
+                    ClientMetricKind::FirstAudioReceivedToPlayback,
+                    Instant::now(),
+                ) {
+                    self.metrics
+                        .observe_client_first_audio_received_to_playback(Duration::from_millis(
+                            delay_ms,
+                        ));
+                }
+                None
+            }
+            VoicePayload::ClientMetricReport {
+                message_id,
+                metric,
+                duration_ms,
+                ..
+            } => {
+                const MAX_CLIENT_DURATION_MS: f64 = 30_000.0;
+                if message_id.is_empty()
+                    || !duration_ms.is_finite()
+                    || !(0.0..=MAX_CLIENT_DURATION_MS).contains(&duration_ms)
+                {
+                    warn!(
+                        target: "voice_server.session",
+                        session_id = %self.session_id,
+                        message_id = %message_id,
+                        metric = ?metric,
+                        duration_ms,
+                        "忽略无效的客户端时延指标"
+                    );
+                    return None;
+                }
+                if self.remember_client_metric_once(message_id, metric, Instant::now()) {
+                    let duration = Duration::from_secs_f64(duration_ms / 1_000.0);
+                    match metric {
+                        ClientMetricKind::FirstAudioReceivedToPlayback => self
+                            .metrics
+                            .observe_client_first_audio_received_to_playback(duration),
+                        ClientMetricKind::InputEndToFinalAudioSent => self
+                            .metrics
+                            .observe_client_input_end_to_final_audio_sent(duration),
+                    }
                 }
                 None
             }
@@ -376,7 +469,11 @@ impl VoiceSession {
         }
     }
 
-    fn trigger_pipeline(&mut self, reason: TriggerReason) -> Option<JoinHandle<()>> {
+    fn trigger_pipeline(
+        &mut self,
+        reason: TriggerReason,
+        input_ended_at: Instant,
+    ) -> Option<JoinHandle<()>> {
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
         let request_id = self.next_request_id;
 
@@ -384,8 +481,12 @@ impl VoiceSession {
         let bytes_before = self.audio_buf.len();
         let elapsed_before = self.audio_buf.elapsed_ms();
         let input_started_at = self.input_started_at.take().unwrap_or_else(Instant::now);
-        let input_ended_at = Instant::now();
         let audio = self.audio_buf.drain();
+        let message_id = self
+            .current_message_id
+            .take()
+            .or_else(|| self.last_request_message_id.clone())
+            .unwrap_or_else(crate::trace_context::new_trace_id);
         if audio.len() < MIN_UTTERANCE_BYTES {
             warn!(
                 target: "voice_server.session",
@@ -399,6 +500,7 @@ impl VoiceSession {
             return None;
         }
         self.last_request_audio = Some(audio.clone());
+        self.last_request_message_id = Some(message_id.clone());
         info!(
             target: "voice_server.session",
             session_id = %self.session_id,
@@ -422,8 +524,6 @@ impl VoiceSession {
         let session_id = self.session_id.clone();
         let sample_rate = self.sample_rate;
         let channels = self.channels;
-        // 端侧上报的 TTS 输出采样率（None = 走配置兜底）
-        let client_tts_sample_rate = self.client_tts_sample_rate;
         // 端侧上报的 TTS 音色短名（None = 走配置兜底）
         let client_voice = self.client_voice.clone();
         let asr = self.asr.clone();
@@ -440,28 +540,30 @@ impl VoiceSession {
             request_id,
             trace_id = %trace_id,
         );
-        let handle = tokio::spawn(scope(trace_id, async move {
-            run_pipeline(
-                session_id,
-                request_id,
-                audio,
-                sample_rate,
-                channels,
-                client_tts_sample_rate,
-                client_voice,
-                asr,
-                llm,
-                tts,
-                down_addr,
-                cancel,
-                current_real_cancel,
-                metrics,
-                input_started_at,
-                input_ended_at,
-            )
-            .await;
-        })
-        .instrument(span));
+        let handle = tokio::spawn(
+            scope(trace_id, async move {
+                run_pipeline(
+                    session_id,
+                    request_id,
+                    message_id,
+                    audio,
+                    sample_rate,
+                    channels,
+                    client_voice,
+                    asr,
+                    llm,
+                    tts,
+                    down_addr,
+                    cancel,
+                    current_real_cancel,
+                    metrics,
+                    input_started_at,
+                    input_ended_at,
+                )
+                .await;
+            })
+            .instrument(span),
+        );
 
         self.transition(SessionState::Listening);
 
@@ -497,12 +599,13 @@ mod tests {
     use async_trait::async_trait;
     use futures_util::{stream, Stream};
     use tokio::sync::mpsc;
-    use voice_proto::{decode_payload, AgentPhase};
+    use voice_proto::{decode_payload, AgentPhase, ClientMetricKind};
 
     use crate::client::error::ClientError;
     use crate::client::llm::{BoxStream as LlmStream, ChatMessage};
     use crate::client::{LlmClient, TtsClient};
     use crate::events::{AsrEvent, LlmEvent, TtsEvent};
+    use crate::metrics::VoiceMetrics;
 
     use super::*;
 
@@ -557,7 +660,6 @@ mod tests {
             &self,
             _session_id: &str,
             _text: &str,
-            _sample_rate_override: Option<u32>,
             _voice_override: Option<String>,
         ) -> Result<Pin<Box<dyn Stream<Item = Result<TtsEvent, ClientError>> + Send>>, ClientError>
         {
@@ -587,6 +689,43 @@ mod tests {
     }
 
     #[actix::test]
+    async fn client_metric_reports_are_bounded_and_deduplicated_per_kind() {
+        let metrics = Arc::new(VoiceMetrics::new());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let down_addr = CaptureActor { tx }.start().recipient();
+        let mut session = VoiceSession::new_with_metrics(
+            "session-1".to_string(),
+            Arc::new(CountingFailingAsr {
+                calls: Arc::new(AtomicUsize::new(0)),
+                wav_inputs: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(LlmAgent::new(Arc::new(UnusedLlm))),
+            Arc::new(UnusedTts),
+            down_addr,
+            metrics.clone(),
+        );
+
+        for (metric, duration_ms) in [
+            (ClientMetricKind::FirstAudioReceivedToPlayback, 25.0),
+            (ClientMetricKind::FirstAudioReceivedToPlayback, 30.0),
+            (ClientMetricKind::InputEndToFinalAudioSent, 2.5),
+            (ClientMetricKind::InputEndToFinalAudioSent, f64::NAN),
+            (ClientMetricKind::InputEndToFinalAudioSent, 30_001.0),
+        ] {
+            session.on_payload(VoicePayload::ClientMetricReport {
+                session_id: "session-1".to_string(),
+                message_id: "message-1".to_string(),
+                metric,
+                duration_ms,
+            });
+        }
+
+        let output = metrics.render();
+        assert!(output.contains("voice_client_first_audio_received_to_playback_seconds_count 1"));
+        assert!(output.contains("voice_client_input_end_to_final_audio_sent_seconds_count 1"));
+    }
+
+    #[actix::test]
     async fn retry_replays_the_last_valid_request_with_a_new_request_id() {
         let calls = Arc::new(AtomicUsize::new(0));
         let wav_inputs = Arc::new(Mutex::new(Vec::new()));
@@ -610,7 +749,6 @@ mod tests {
             channels: 1,
             codec: "pcm_s16le".to_string(),
             language: "zh-CN".to_string(),
-            tts_sample_rate: None,
             voice: None,
         });
 
@@ -638,21 +776,23 @@ mod tests {
         assert_eq!(inputs[0], inputs[1]);
         drop(inputs);
 
-        let mut request_ids = Vec::new();
-        while request_ids.len() < 2 {
+        let mut message_ids = Vec::new();
+        while message_ids.len() < 2 {
             let payload = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
                 .await
                 .expect("retry statuses should arrive")
                 .expect("capture actor should remain available");
             if let VoicePayload::AgentStatus {
                 phase: AgentPhase::Transcribing,
-                request_id,
+                message_id,
                 ..
             } = payload
             {
-                request_ids.push(request_id);
+                message_ids.push(message_id);
             }
         }
-        assert_eq!(request_ids, [1, 2]);
+        assert_eq!(message_ids.len(), 2);
+        assert!(!message_ids[0].is_empty());
+        assert_eq!(message_ids[0], message_ids[1]);
     }
 }

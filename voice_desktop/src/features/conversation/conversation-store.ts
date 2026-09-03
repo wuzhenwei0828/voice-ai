@@ -9,6 +9,9 @@ const PHASE_COPY: Record<string, PhaseCopy> = {
   speaking: { label: '正在回答', substatus: '可随时打断', state: 'speaking' },
   error: { label: '暂时遇到问题', substatus: '请稍后再试', state: 'error' },
 };
+export function shouldStopPlaybackForAsr(text: string, messageId: string, currentMessageId: string | undefined): boolean {
+  return Boolean(text.trim()) && Boolean(messageId) && messageId !== currentMessageId;
+}
 export function getPhaseCopy(phase: string): PhaseCopy { return PHASE_COPY[phase] ?? { label: '正在处理', substatus: '', state: 'thinking' }; }
 export function conversationReducer(state: ConversationState, action: { type: string; text?: string; message?: string; phase?: string; done?: boolean }): ConversationState {
   switch (action.type) {

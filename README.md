@@ -2,6 +2,86 @@
 
 终端语音 → 服务端 ASR → LLM → TTS → 回放的完整链路，端到端跑通。
 
+## 当前语音对话流程
+
+下面的流程图按当前代码实现整理，主入口是浏览器或 Electron 端连接
+`/ws/voice/web/{session_id}` 后发送 `audio_chunk`。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as 端侧<br/>VoiceServerClient / static app.js
+    participant W as VoiceService.wsdata
+    participant S as VoiceSession
+    participant P as run_pipeline
+    participant A as LlmAgent
+    participant L as HttpLlmClient<br/>fast / strong
+    participant T as TTS Client
+
+    C->>C: VAD 起句时生成一个 message_id
+    loop 句内音频帧
+        C->>W: audio_chunk(message_id, data, is_last)
+        W->>W: decode_message_id
+        W->>S: on_payload_with_trace_id(payload, message_id)
+        S->>S: 首帧记录 message_id，持续累积音频
+    end
+
+    S->>P: is_last / 时长上限 / 缓冲上限触发 pipeline<br/>内部生成 request_id
+    P-->>C: agent_status(transcribing, message_id)
+    P->>P: ASR recognize
+
+    alt 最终文本为空或仅含 ASR 标签
+        P->>P: 丢弃缓冲的 ASR 事件<br/>不打断旧 pipeline，不进入 LLM/TTS
+    else 最终文本非空
+        P-->>C: 依次下发缓冲的 asr_partial / asr_final(message_id)
+        alt 首个非空 ASR，且 message_id != currentMessageId
+            C->>C: currentMessageId = message_id
+            C->>C: 停止当前 TTS 播放队列
+        else 空 ASR 或相同 message_id
+            C->>C: 不停止或不重复停止
+        end
+        P->>P: 用 current_real_cancel<br/>取消同会话上一个真实 LLM/TTS pipeline
+        opt 旧 pipeline 已发送或仍在途的结果
+            P-->>C: old llm_delta(old message_id)
+            C->>C: WebSocket 收到并完成解码
+            C->>C: old message_id != currentMessageId<br/>事件分发前丢弃，不更新 UI
+        end
+        P-->>C: agent_status(composing, message_id)
+        P->>A: chat(session_id, ASR final)
+        A->>A: 读取会话历史<br/>ModelRouter 按 trim 后 Unicode 字符数路由
+        alt 少于 15 字
+            A->>L: fast HttpLlmClient
+        else 大于等于 15 字
+            A->>L: strong HttpLlmClient
+        end
+        opt fast 在可见输出前失败或返回空响应
+            A->>L: 自动升级 strong，重试一次
+        end
+        loop LLM 流式输出与分句合成
+            L-->>A: LLM delta
+            A-->>P: LlmEvent
+            P-->>C: llm_delta(message_id)
+            P->>T: 可播文本分句
+            T-->>P: TTS PCM chunk
+            P-->>C: tts_audio(message_id)
+        end
+        P-->>C: agent_status(speaking / done, message_id)
+        C->>W: playback_started(message_id, delay_ms)
+        W->>S: on_payload_with_trace_id(payload, message_id)
+        S->>S: 按 message_id 去重并记录播放时延
+    end
+
+    Note over C: currentMessageId 建立后，只处理 ID 匹配的<br/>ASR / LLM / TTS / status / pipeline error
+    Note over C: 旧 message_id 事件直接丢弃，匹配事件更新 UI 或播放
+
+    Note over W,T: request_id 只用于服务端取消、重试和并发控制，不下发端侧
+    Note over C: 每个客户端实例独立维护 currentMessageId 和播放状态
+```
+
+控制消息的当前行为：`Interrupt` 取消当前会话的所有 pipeline 并清理端侧播放；
+`Retry` 重放最近一次有效音频并复用原 `message_id`，服务端只生成新的内部
+`request_id`；`SessionEnd` 关闭会话并取消未完成任务。
+
 ## 项目结构
 
 ```
@@ -88,6 +168,8 @@ fast 请求不注册工具，当前 strong 也未实现 `tools` / `tool_calls` �
 curl http://127.0.0.1:8080/health
 ```
 
+语音链路统计页面：`http://127.0.0.1:8080/metrics-dashboard.html`。
+
 ### 3. 浏览器端到端页面
 
 打开：
@@ -122,4 +204,7 @@ npm run package:mac
 
 安装包输出到 `voice_desktop/release/`。
 
-打断：浏览器前端「打断」按钮 = 显式 Interrupt（发 WS Interrupt + 清本地 TTS 队列）。**跨句打断**走自动路径：新问句 ASR `is_final` + 非空文本 → 前端只清本地 TTS 队列 + 停止播放，**不发** WS Interrupt（服务端自有 pipeline cancel 逻辑：非空 ASR → cancel 上一个 LLM/TTS pipeline，见 `crates/voice_server/src/session/pipeline.rs`）。
+打断：浏览器前端「打断」按钮会发送 WS `Interrupt` 并清空本地 TTS 队列。
+跨句自动打断由新问句第一条 `trim()` 后非空的 `asr_partial` 或 `asr_final`
+触发：端侧更新 `currentMessageId` 并停止播放，但不发送 `Interrupt`；服务端在新 pipeline
+获得非空 ASR 文本后，通过 `current_real_cancel` 取消上一条已经进入 LLM/TTS 的 pipeline。

@@ -34,17 +34,21 @@
 | 时间点 | 定义 | 触发位置 |
 |---|---|---|
 | `input_started_at` | 收到本轮第一个音频 chunk | 第一条 `AudioChunk` |
-| `input_ended_at` | 收到本轮最后一个音频 chunk | `AudioChunk.is_last=true` 或结束事件 |
+| `input_ended_at` | 服务端收到触发本轮 pipeline 的最后一个音频 chunk | `AudioChunk.is_last=true`；服务端强制截断时取触发截断的当前 chunk |
 | `asr_started_at` | 开始调用 ASR Provider | ASR 请求发出前 |
 | `asr_final_at` | 收到可用于后续处理的最终 ASR 文本 | ASR final 事件 |
 | `llm_started_at` | 开始调用 LLM Provider | LLM 请求发出前 |
-| `llm_first_token_at` | 收到第一个非空 LLM delta | 第一个有效 delta |
+| `llm_first_text_at` | 收到第一个 `trim()` 后非空的 LLM delta | 第一个有效文本 delta |
 | `llm_completed_at` | LLM 流结束 | LLM stream 完成 |
 | `tts_input_sent_at` | 向 TTS Provider 发送文本 | `input.text` 发送成功 |
 | `tts_input_done_at` | 向 TTS Provider 发送 `input.done` 成功 | TTS 输入结束 |
 | `tts_first_audio_at` | 收到第一个二进制音频 chunk | TTS WebSocket 首个音频帧 |
 | `tts_completed_at` | 收到 `session.done` | TTS WebSocket 会话完成 |
-| `client_audio_started_at` | 客户端开始播放首个音频 chunk | 客户端播放器实际开始播放 |
+| `first_audio_ws_sent_at` | 首个非空 TTS 音频 WS 消息成功进入下行发送队列 | `Recipient::try_send` 成功返回 |
+| `client_input_ended_at` | 端侧检测到本轮用户输入结束 | 端侧收到 `is_last=true` 音频回调 |
+| `client_final_audio_sent_at` | 尾帧被端侧 WebSocket 接受并进入发送队列 | `WebSocket.send()` 无异常返回 |
+| `client_first_audio_received_at` | 端侧收到本轮首个非空 TTS 音频帧 | WebSocket `tts_audio` 首帧 |
+| `client_audio_started_at` | 端侧播放器实际排程首帧播放 | `AudioBufferSource.start()` 对应时间 |
 
 服务端阶段耗时使用 `Instant` 或 OpenTelemetry monotonic duration 计算。跨客户端和服务端的指标优先由客户端上报相对时间，或者只统计服务端可观测的区间，避免受机器时钟偏差影响。
 
@@ -52,17 +56,31 @@
 
 所有延迟指标使用 Histogram，单位为秒，至少展示 p50、p90、p95、p99。
 
-### 5.1 用户体验延迟
+### 5.1 本期链路延迟合同
 
-| 指标 | 计算方式 | 用途 |
-|---|---|---|
-| `voice_e2e_input_to_tts_first_audio_seconds` | `tts_first_audio_at - input_started_at` | 从用户开始说话到系统开始回复，包含用户讲话时长 |
-| `voice_e2e_utterance_end_to_tts_first_audio_seconds` | `tts_first_audio_at - input_ended_at` | 用户说完到听到首包，作为主要响应延迟指标 |
-| `voice_e2e_input_to_tts_complete_seconds` | `tts_completed_at - input_started_at` | 从开始输入到 TTS 全部完成 |
-| `voice_e2e_utterance_end_to_tts_complete_seconds` | `tts_completed_at - input_ended_at` | 用户说完到完整回复结束 |
-| `voice_e2e_tts_first_audio_to_client_playback_seconds` | `client_audio_started_at - tts_first_audio_at` | 服务端首包到客户端真正播放的传输/缓冲延迟 |
+| # | 指标 | 计算方式 | 时钟所有者 |
+|---|---|---|---|
+| 1 | `voice_input_end_to_asr_output_end_seconds` | `asr_final_at - input_ended_at` | Server |
+| 2 | `voice_input_end_to_llm_first_text_seconds` | `llm_first_text_at - input_ended_at` | Server |
+| 3 | `voice_input_end_to_tts_first_frame_seconds` | `tts_first_audio_at - input_ended_at` | Server |
+| 4 | `voice_input_end_to_ws_first_audio_sent_seconds` | `first_audio_ws_sent_at - input_ended_at` | Server |
+| 5 | `voice_asr_input_to_output_end_seconds` | `asr_final_at - asr_started_at` | Server |
+| 6 | `voice_llm_input_to_first_text_seconds` | `llm_first_text_at - llm_started_at` | Server |
+| 7 | `voice_llm_first_text_to_tts_first_frame_seconds` | `tts_first_audio_at - llm_first_text_at` | Server |
+| 8 | `voice_tts_first_frame_to_ws_first_audio_sent_seconds` | `first_audio_ws_sent_at - tts_first_audio_at` | Server |
+| 9 | `voice_client_first_audio_received_to_playback_seconds` | `client_audio_started_at - client_first_audio_received_at` | Client，上报相对时长 |
+| 10 | `voice_client_input_end_to_final_audio_sent_seconds` | `client_final_audio_sent_at - client_input_ended_at` | Client，上报相对时长 |
 
-其中 `voice_e2e_utterance_end_to_tts_first_audio_seconds` 是本系统的主 SLI，因为它最接近用户感知的“我说完后多久得到回应”。
+第 1 至 4 项的“输入结束”统一指服务端收到尾帧音频的时间。第 4、8 项的“WS 发送成功”统一指消息成功进入服务端下行发送队列，不声明客户端已经收到。第 9、10 项全部使用端侧单调时钟；客户端只上报相对时长，服务端不直接相减两台机器的时间戳。
+
+旧指标中与本合同语义相同的指标直接重命名，不双写旧名称：
+
+```text
+voice_e2e_utterance_end_to_tts_first_audio_seconds -> voice_input_end_to_tts_first_frame_seconds
+voice_asr_duration_seconds                         -> voice_asr_input_to_output_end_seconds
+voice_llm_time_to_first_token_seconds              -> voice_llm_input_to_first_text_seconds
+voice_e2e_tts_first_audio_to_client_playback_seconds -> voice_client_first_audio_received_to_playback_seconds
+```
 
 ### 5.2 阶段延迟
 
@@ -70,11 +88,11 @@
 voice_pipeline_queue_duration_seconds
   = asr_started_at - input_ended_at
 
-voice_asr_duration_seconds
+voice_asr_input_to_output_end_seconds
   = asr_final_at - asr_started_at
 
-voice_llm_time_to_first_token_seconds
-  = llm_first_token_at - llm_started_at
+voice_llm_input_to_first_text_seconds
+  = llm_first_text_at - llm_started_at
 
 voice_llm_duration_seconds
   = llm_completed_at - llm_started_at
@@ -196,7 +214,7 @@ wav_name
 input_started
 input_ended
 asr_final
-llm_first_token
+llm_first_text
 tts_input_done
 tts_first_audio
 tts_completed
@@ -216,20 +234,18 @@ TTS WebSocket 事件日志保持 `info` 级别：
 
 第一版仪表盘至少包含：
 
-1. 用户说完到 TTS 首包的 p50/p95/p99。
-2. 用户开始输入到 TTS 首包的 p50/p95/p99。
-3. ASR final 延迟。
-4. LLM 首 token 延迟。
-5. TTS 首包延迟。
-6. TTS 完成耗时。
-7. 端到端成功率、超时率、取消率。
-8. 按 Provider、模型、音色的延迟对比。
-9. TTS WebSocket 建连失败率和连接池等待时间。
+1. 本期 10 个链路 Histogram 的 p50/p90/p95/p99。
+2. ASR、LLM、TTS 和 WS 下行发送各阶段的延迟拆分。
+3. 端侧尾帧发送和首帧播放缓冲延迟。
+4. TTS 完成耗时。
+5. 端到端成功率、超时率、取消率。
+6. 按 Provider、模型、音色的延迟对比。
+7. TTS WebSocket 建连失败率和连接池等待时间。
 
 建议先将以下指标作为 SLI，具体阈值由线上基线确定：
 
 ```text
-voice_e2e_utterance_end_to_tts_first_audio_seconds
+voice_input_end_to_ws_first_audio_sent_seconds
 voice_requests_success_total / voice_requests_total
 voice_tts_ws_connect_failed_total / voice_tts_ws_connect_total
 voice_requests_timeout_total / voice_requests_total
@@ -237,7 +253,9 @@ voice_requests_timeout_total / voice_requests_total
 
 ## 11. 验收标准
 
-- 能分别得到“用户开始输入到 TTS 首包”和“用户说完到 TTS 首包”两个 Histogram。
+- 能在 `/metrics/voice` 得到本期定义的 10 个链路 Histogram，且旧的 4 个同义指标名不再暴露。
+- 第 1 至 8 项只使用服务端 `Instant`；第 9、10 项只接收客户端单调时钟计算出的相对毫秒数。
+- 客户端指标消息只允许固定枚举值，拒绝空 `message_id`、非有限值、负值和超过 30 秒的值，同一 `message_id + metric` 只记录一次。
 - 每个完整请求都能计算 ASR、LLM、TTS 和端到端耗时；异常结束请求记录明确结果。
 - TTS WebSocket `session.done` 日志包含回复耗时，首个音频 chunk 日志包含首包耗时。
 - 指标可按 endpoint、Provider、模型和音色聚合。
@@ -249,10 +267,11 @@ voice_requests_timeout_total / voice_requests_total
 
 - [x] Server pipeline、ASR、LLM、TTS WebSocket 和结果分类指标已通过 `VoiceMetricsSink` 接入。
 - [x] TTS WebSocket 连接池 Gauge、等待/回收/失效 Counter，以及音频时长、chunk 间隔、实时率指标已接入。
-- [x] 客户端使用 `playback_started` 事件上报首个可播放 PCM 到实际排程播放的本地相对毫秒数；Server 做 0-30 秒边界校验、按 `request_id` 去重，不把 ID 作为指标标签。
+- [x] 使用固定枚举的 `client_metric_report` 上报“首帧接收到播放”和“输入结束到尾帧发送”两个端侧相对时长；Server 做 0-30 秒边界校验并按 `message_id + metric` 去重。
+- [x] 将 ASR、LLM、TTS 首帧的旧同义指标重命名，并新增输入结束、LLM 首文本和首个音频 WS 发送之间的组合时延。
 - [x] Prometheus 暴露地址为 `/metrics/voice`；业务逻辑只依赖 `VoiceMetricsSink`，测试和关闭指标使用 `NoopMetricsSink`。
 - [ ] OpenTelemetry exporter 尚未启用，后续可新增 sink adapter，不改业务埋点调用方。
-- 是否将静音检测完成作为 `input_ended_at`，还是继续以 `is_last=true` 作为统一口径。
+- `input_ended_at` 已确定为服务端收到触发 pipeline 的尾帧音频；强制时长/缓冲截断时取触发截断的当前音频帧。
 - 线上 SLO 的目标值和 Histogram bucket 边界，需要根据一段真实流量基线确定。
 
 ## 13. 采集架构与解耦决策

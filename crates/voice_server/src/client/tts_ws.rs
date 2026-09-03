@@ -25,9 +25,9 @@ use tracing::{info, warn};
 
 use super::tts::{BoxStream, TtsClient, TtsInputSession};
 use crate::client::error::ClientError;
-use crate::trace_context::current_trace_id;
 use crate::events::TtsEvent;
 use crate::metrics::{NoopMetricsSink, VoiceMetricsSink};
+use crate::trace_context::current_trace_id;
 
 pub type WsStream = async_tungstenite::WebSocketStream<
     async_tungstenite::tokio::ClientStream<tokio::net::TcpStream>,
@@ -124,11 +124,7 @@ struct SessionConfig {
 }
 
 impl TtsWsConfig {
-    fn session_config_with(
-        &self,
-        voice: Option<&str>,
-        sample_rate_override: Option<u32>,
-    ) -> SessionConfig {
+    fn session_config_with(&self, voice: Option<&str>) -> SessionConfig {
         SessionConfig {
             kind: "session.config",
             voice: voice.map(str::to_string).or_else(|| self.voice.clone()),
@@ -141,7 +137,7 @@ impl TtsWsConfig {
             ref_text: self.ref_text.clone(),
             max_new_tokens: self.max_new_tokens,
             stream_audio: self.stream_audio.then_some(true),
-            sample_rate: sample_rate_override.or(self.sample_rate),
+            sample_rate: self.sample_rate,
         }
     }
 }
@@ -238,13 +234,17 @@ struct PoolWaitGuard {
 impl PoolWaitGuard {
     fn new(metrics: Arc<dyn VoiceMetricsSink>) -> Self {
         metrics.tts_ws_pool_wait_started();
-        Self { metrics, started_at: Instant::now() }
+        Self {
+            metrics,
+            started_at: Instant::now(),
+        }
     }
 }
 
 impl Drop for PoolWaitGuard {
     fn drop(&mut self) {
-        self.metrics.tts_ws_pool_wait_finished(self.started_at.elapsed());
+        self.metrics
+            .tts_ws_pool_wait_finished(self.started_at.elapsed());
     }
 }
 
@@ -266,7 +266,6 @@ struct TtsWsLease {
 pub struct TtsWsInputSession {
     client: Arc<TtsWsClient>,
     session_id: String,
-    sample_rate_override: Option<u32>,
     voice_override: Option<String>,
     lease: Option<TtsWsLease>,
     config_sent: bool,
@@ -307,8 +306,8 @@ impl TtsWsClient {
     }
     async fn connect(
         &self,
+        session_id: &str,
         voice: Option<&str>,
-        sample_rate_override: Option<u32>,
     ) -> Result<WsStream, ClientError> {
         self.metrics.tts_ws_connect();
         info!(
@@ -379,7 +378,13 @@ impl TtsWsClient {
             endpoint = %self.cfg.endpoint,
             "TTS WebSocket 握手成功"
         );
-        let config = self.config_payload(voice, sample_rate_override)?;
+        let config = self.config_payload(voice)?;
+        info!(
+            target: "voice_server.tts.ws",
+            session_id,
+            session_config = %config,
+            "TTS WebSocket 即将发送 session.config"
+        );
         tokio::time::timeout(
             Duration::from_secs(9),
             ws.send(Message::Text(config.into())),
@@ -399,12 +404,8 @@ impl TtsWsClient {
         Ok(ws)
     }
 
-    fn config_payload(
-        &self,
-        voice: Option<&str>,
-        sample_rate_override: Option<u32>,
-    ) -> Result<String, ClientError> {
-        serde_json::to_string(&self.cfg.session_config_with(voice, sample_rate_override))
+    fn config_payload(&self, voice: Option<&str>) -> Result<String, ClientError> {
+        serde_json::to_string(&self.cfg.session_config_with(voice))
             .map_err(|e| ClientError::Decode(format!("serialize session.config: {e}")))
     }
 
@@ -412,11 +413,10 @@ impl TtsWsClient {
         self: &Arc<Self>,
         session_id: &str,
         voice: Option<&str>,
-        sample_rate_override: Option<u32>,
         send_config: bool,
     ) -> Result<TtsWsLease, ClientError> {
         loop {
-            let config = self.config_payload(voice, sample_rate_override)?;
+            let config = self.config_payload(voice)?;
             // Arm the notification before scanning the pool so a release racing with
             // the scan cannot be lost between the capacity check and the await.
             let notified = self.pool.notify.notified();
@@ -472,7 +472,7 @@ impl TtsWsClient {
 
             if needs_connect {
                 info!(target: "voice_server.tts.ws", session_id, pool_size = self.pool.max_connections, "TTS WebSocket 预留连接并开始握手");
-                match self.connect(voice, sample_rate_override).await {
+                match self.connect(session_id, voice).await {
                     Ok(ws) => {
                         *entry.stream.lock().await = Some(ws);
                         let mut meta = entry.meta.lock().await;
@@ -500,6 +500,12 @@ impl TtsWsClient {
                 }
             } else {
                 if send_config {
+                    info!(
+                        target: "voice_server.tts.ws",
+                        session_id,
+                        session_config = %config,
+                        "TTS WebSocket 即将发送 session.config"
+                    );
                     let mut stream = entry.stream.lock().await;
                     let result = stream
                         .as_mut()
@@ -557,7 +563,9 @@ impl TtsWsClient {
             let _ = ws.close(None).await;
         }
         let mut entries = self.pool.entries.lock().await;
-        let removed = entries.iter().any(|candidate| Arc::ptr_eq(candidate, entry));
+        let removed = entries
+            .iter()
+            .any(|candidate| Arc::ptr_eq(candidate, entry));
         entries.retain(|candidate| !Arc::ptr_eq(candidate, entry));
         if removed && was_open {
             self.metrics.tts_ws_pool_connection_closed();
@@ -645,13 +653,11 @@ impl TtsClient for TtsWsClient {
     async fn open_input_session(
         &self,
         session_id: &str,
-        sample_rate_override: Option<u32>,
         voice_override: Option<String>,
     ) -> Result<Option<Box<dyn super::tts::TtsInputSession>>, ClientError> {
         Ok(Some(Box::new(TtsWsInputSession {
             client: Arc::new(self.clone_for_session()),
             session_id: session_id.to_string(),
-            sample_rate_override,
             voice_override,
             lease: None,
             config_sent: false,
@@ -671,13 +677,11 @@ impl TtsClient for TtsWsClient {
         &self,
         session_id: &str,
         text: &str,
-        sample_rate_override: Option<u32>,
         voice_override: Option<String>,
     ) -> Result<BoxStream<Result<TtsEvent, ClientError>>, ClientError> {
         let mut input = TtsWsInputSession {
             client: Arc::new(self.clone_for_session()),
             session_id: session_id.to_string(),
-            sample_rate_override,
             voice_override,
             lease: None,
             config_sent: false,
@@ -791,10 +795,18 @@ impl TtsWsLease {
                 Some(Ok(Message::Text(value))) => {
                     let parsed = parse_control_message(&value);
                     match &parsed {
-                        Ok(ServerMessage::AudioStart) => info!(target: "voice_server.tts.ws", session_id = %self.session_id, event = "audio.start", "TTS WebSocket 收到事件"),
-                        Ok(ServerMessage::AudioDone { error }) => info!(target: "voice_server.tts.ws", session_id = %self.session_id, event = "audio.done", error = *error, "TTS WebSocket 收到事件"),
-                        Ok(ServerMessage::SessionDone) => info!(target: "voice_server.tts.ws", session_id = %self.session_id, event = "session.done", "TTS WebSocket 收到事件"),
-                        Ok(ServerMessage::Error(message)) => warn!(target: "voice_server.tts.ws", session_id = %self.session_id, event = "error", error = %message, "TTS WebSocket 收到错误事件"),
+                        Ok(ServerMessage::AudioStart) => {
+                            info!(target: "voice_server.tts.ws", session_id = %self.session_id, event = "audio.start", "TTS WebSocket 收到事件")
+                        }
+                        Ok(ServerMessage::AudioDone { error }) => {
+                            info!(target: "voice_server.tts.ws", session_id = %self.session_id, event = "audio.done", error = *error, "TTS WebSocket 收到事件")
+                        }
+                        Ok(ServerMessage::SessionDone) => {
+                            info!(target: "voice_server.tts.ws", session_id = %self.session_id, event = "session.done", "TTS WebSocket 收到事件")
+                        }
+                        Ok(ServerMessage::Error(message)) => {
+                            warn!(target: "voice_server.tts.ws", session_id = %self.session_id, event = "error", error = %message, "TTS WebSocket 收到错误事件")
+                        }
                         Ok(ServerMessage::Audio(_)) | Err(_) => {}
                     }
                     return Some(parsed);
@@ -821,14 +833,16 @@ impl TtsWsLease {
         let released = {
             let mut meta = self.entry.meta.lock().await;
             if meta.state == ConnectionState::InUse
-            && meta.generation == self.generation
-            && meta.lease_id == self.lease_id
+                && meta.generation == self.generation
+                && meta.lease_id == self.lease_id
             {
                 meta.state = ConnectionState::Idle;
                 meta.owner_session_id = None;
                 meta.idle_since = Some(Instant::now());
                 true
-            } else { false }
+            } else {
+                false
+            }
         };
         if released {
             self.client.refresh_pool_gauges().await;
@@ -873,7 +887,6 @@ impl super::tts::TtsInputSession for TtsWsInputSession {
                 .acquire(
                     &self.session_id,
                     self.voice_override.as_deref(),
-                    self.sample_rate_override,
                     !self.config_sent,
                 )
                 .await?;
@@ -895,12 +908,7 @@ impl super::tts::TtsInputSession for TtsWsInputSession {
             self.config_sent = false;
             let lease = self
                 .client
-                .acquire(
-                    &self.session_id,
-                    self.voice_override.as_deref(),
-                    self.sample_rate_override,
-                    true,
-                )
+                .acquire(&self.session_id, self.voice_override.as_deref(), true)
                 .await?;
             self.lease = Some(lease);
             self.config_sent = true;
@@ -914,7 +922,9 @@ impl super::tts::TtsInputSession for TtsWsInputSession {
             self.input_started_at = Some(Instant::now());
         }
         self.utterance_text.push_str(text);
-        self.client.metrics.tts_input_chars(text.chars().count() as u64);
+        self.client
+            .metrics
+            .tts_input_chars(text.chars().count() as u64);
         Ok(())
     }
 
@@ -938,12 +948,7 @@ impl super::tts::TtsInputSession for TtsWsInputSession {
             self.config_sent = false;
             let lease = self
                 .client
-                .acquire(
-                    &self.session_id,
-                    self.voice_override.as_deref(),
-                    self.sample_rate_override,
-                    true,
-                )
+                .acquire(&self.session_id, self.voice_override.as_deref(), true)
                 .await?;
             self.lease = Some(lease);
             self.config_sent = true;
@@ -964,7 +969,9 @@ impl super::tts::TtsInputSession for TtsWsInputSession {
         }
         self.utterance_started_at = Some(Instant::now());
         if let Some(started) = self.input_started_at.take() {
-            self.client.metrics.observe_tts_input_wait(started.elapsed());
+            self.client
+                .metrics
+                .observe_tts_input_wait(started.elapsed());
         }
         self.first_audio_logged = false;
         self.audio_bytes = 0;
@@ -1007,7 +1014,9 @@ impl super::tts::TtsInputSession for TtsWsInputSession {
                     self.client.metrics.tts_audio_chunk(bytes.len() as u64);
                     let now = Instant::now();
                     if let Some(previous) = self.last_audio_at {
-                        self.client.metrics.observe_tts_audio_chunk_interval(now.duration_since(previous));
+                        self.client
+                            .metrics
+                            .observe_tts_audio_chunk_interval(now.duration_since(previous));
                     }
                     self.last_audio_at = Some(now);
                     self.audio_bytes = self.audio_bytes.saturating_add(bytes.len() as u64);
@@ -1015,7 +1024,9 @@ impl super::tts::TtsInputSession for TtsWsInputSession {
                     if !self.first_audio_logged {
                         self.first_audio_logged = true;
                         if let Some(started) = self.utterance_started_at {
-                            self.client.metrics.observe_tts_first_audio(started.elapsed());
+                            self.client
+                                .metrics
+                                .observe_tts_first_audio(started.elapsed());
                         }
                         info!(
                             target: "voice_server.tts.ws",
@@ -1045,13 +1056,22 @@ impl super::tts::TtsInputSession for TtsWsInputSession {
                 Ok(ServerMessage::SessionDone) => {
                     if let Some(started) = self.utterance_started_at {
                         let generation_duration = started.elapsed();
-                        self.client.metrics.observe_tts_complete(generation_duration);
-                        let sample_rate = self.sample_rate_override.or(self.client.cfg.sample_rate).unwrap_or(24_000).max(1) as f64;
+                        self.client
+                            .metrics
+                            .observe_tts_complete(generation_duration);
+                        let sample_rate =
+                            self.client.cfg.sample_rate.unwrap_or(24_000).max(1) as f64;
                         let channels = self.client.cfg.channels.max(1) as f64;
-                        let audio_duration = Duration::from_secs_f64(self.audio_bytes as f64 / (sample_rate * channels * 2.0));
-                        self.client.metrics.observe_tts_audio_duration(audio_duration);
+                        let audio_duration = Duration::from_secs_f64(
+                            self.audio_bytes as f64 / (sample_rate * channels * 2.0),
+                        );
+                        self.client
+                            .metrics
+                            .observe_tts_audio_duration(audio_duration);
                         if generation_duration > Duration::ZERO {
-                            self.client.metrics.observe_tts_realtime_factor(audio_duration.as_secs_f64() / generation_duration.as_secs_f64());
+                            self.client.metrics.observe_tts_realtime_factor(
+                                audio_duration.as_secs_f64() / generation_duration.as_secs_f64(),
+                            );
                         }
                     }
                     info!(
@@ -1119,7 +1139,22 @@ mod tests {
     use super::*;
     use async_tungstenite::tokio::accept_async;
     use futures_util::StreamExt;
+    use std::io::Write;
     use tokio::net::TcpListener;
+
+    #[derive(Clone)]
+    struct TestLogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for TestLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn test_entry(state: ConnectionState, generation: u64, lease_id: u64) -> Arc<TtsWsEntry> {
         Arc::new(TtsWsEntry {
@@ -1143,11 +1178,24 @@ mod tests {
             stream_audio: true,
             ..Default::default()
         };
-        let value = serde_json::to_value(cfg.session_config_with(None, None)).unwrap();
+        let value = serde_json::to_value(cfg.session_config_with(None)).unwrap();
         assert_eq!(value["type"], "session.config");
         assert_eq!(value["voice"], "vivian");
         assert_eq!(value["stream_audio"], true);
     }
+
+    #[test]
+    fn session_config_uses_server_sample_rate() {
+        let cfg = TtsWsConfig {
+            sample_rate: Some(24_000),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(cfg.session_config_with(None)).unwrap();
+
+        assert_eq!(value["sample_rate"], 24_000);
+    }
+
     #[test]
     fn builds_input_control_messages() {
         assert_eq!(
@@ -1195,14 +1243,8 @@ mod tests {
             .await
             .extend([Arc::clone(&first), Arc::clone(&second)]);
 
-        let first_lease = client
-            .acquire("session-a", None, None, false)
-            .await
-            .unwrap();
-        let second_lease = client
-            .acquire("session-b", None, None, false)
-            .await
-            .unwrap();
+        let first_lease = client.acquire("session-a", None, false).await.unwrap();
+        let second_lease = client.acquire("session-b", None, false).await.unwrap();
 
         assert!(!Arc::ptr_eq(&first_lease.entry, &second_lease.entry));
         assert_eq!(first.meta.lock().await.state, ConnectionState::InUse);
@@ -1221,11 +1263,10 @@ mod tests {
         let entry = test_entry(ConnectionState::InUse, 1, 1);
         client.pool.entries.lock().await.push(Arc::clone(&entry));
         let waiter_client = Arc::clone(&client);
-        let waiter = tokio::spawn(async move {
-            waiter_client
-                .acquire("waiting-session", None, None, false)
-                .await
-        });
+        let waiter =
+            tokio::spawn(
+                async move { waiter_client.acquire("waiting-session", None, false).await },
+            );
 
         tokio::task::yield_now().await;
         {
@@ -1291,6 +1332,14 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_protocol_keeps_session_config_first_and_reuses_connection() {
+        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log_writer = Arc::clone(&logs);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || TestLogWriter(Arc::clone(&log_writer)))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -1336,7 +1385,7 @@ mod tests {
             ..Default::default()
         });
         let mut session = client
-            .open_input_session("protocol-session", None, None)
+            .open_input_session("protocol-session", None)
             .await
             .unwrap()
             .unwrap();
@@ -1365,5 +1414,9 @@ mod tests {
                 r#"{"type":"input.done"}"#,
             ]
         );
+        let output = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(output.contains(
+            r#"session_config={"type":"session.config","voice":"vivian","response_format":"pcm"}"#
+        ));
     }
 }

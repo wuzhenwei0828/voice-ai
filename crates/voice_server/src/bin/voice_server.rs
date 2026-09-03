@@ -143,11 +143,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::<str>::from(prompts.strong),
     )?;
     let metrics = std::sync::Arc::new(voice_server::VoiceMetrics::new());
-    let tts = voice_server::build_tts_client_with_metrics(
-        &cfg.tts,
-        provider_cfg,
-        metrics.clone(),
-    )?;
+    let tts = voice_server::build_tts_client_with_metrics(&cfg.tts, provider_cfg, metrics.clone())?;
 
     // 5.5 LlmAgent：根据 cfg.agent.memory_backend 选择 in-memory 或 redis store
     //   redis 配置在顶层 cfg.redis（URL / 全局前缀 / 默认 TTL），
@@ -172,7 +168,10 @@ async fn main() -> anyhow::Result<()> {
             // 完整 key 前缀 = REDIS_KEY_PREFIX 常量 + 代码写死的 "memory:"
             // → "voice:memory:{session_id}"
             let full_prefix = format!("{}memory:", voice_server::REDIS_KEY_PREFIX);
-            let ttl = cfg.agent.memory_ttl_secs.unwrap_or(cfg.redis.default_ttl_secs);
+            let ttl = cfg
+                .agent
+                .memory_ttl_secs
+                .unwrap_or(cfg.redis.default_ttl_secs);
             info!(
                 target: "voice_server.factory",
                 backend,
@@ -205,8 +204,8 @@ async fn main() -> anyhow::Result<()> {
         metrics.clone(),
     ));
 
-    let static_dir =
-        resolve_web_static_dir(cli.web_static_dir.as_deref()).unwrap_or_else(|| std::path::PathBuf::from("./static"));
+    let static_dir = resolve_web_static_dir(cli.web_static_dir.as_deref())
+        .unwrap_or_else(|| std::path::PathBuf::from("./static"));
     info!(target: "voice_server.web", static_dir = %static_dir.display(), "web demo 静态目录解析结果");
 
     let service = Arc::new(
@@ -230,6 +229,7 @@ async fn main() -> anyhow::Result<()> {
         web_api = format!("http://127.0.0.1:{}/health", cfg.server.port),
         metrics = format!("http://127.0.0.1:{}/metrics", cfg.server.port),
         voice_metrics = format!("http://127.0.0.1:{}/metrics/voice", cfg.server.port),
+        metrics_dashboard = format!("http://127.0.0.1:{}/metrics-dashboard.html", cfg.server.port),
         static_files = format!("http://127.0.0.1:{}/", cfg.server.port),
         "HTTP 路由"
     );

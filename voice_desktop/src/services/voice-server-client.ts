@@ -19,18 +19,20 @@ export class VoiceServerClient {
   private sessionId?: string;
   private audioSeq = 0;
   private utteranceStartedAt?: number;
-  private invalidatedRequestId = 0;
-  private activeRequestId = 0;
-  private firstAudioReceivedAt = new Map<number, number>();
-  private playbackReported = new Set<number>();
+  private utteranceMessageId?: string;
+  private utteranceComplete = false;
+  private currentMessageId?: string;
+  private firstAudioReceivedAt = new Map<string, number>();
+  private playbackReported = new Map<string, number>();
   constructor(private readonly settings: Settings, private readonly callbacks: VoiceClientCallbacks) {}
 
-  connect(sessionId = crypto.randomUUID()) {
+  connect(sessionId: string = crypto.randomUUID()) {
     this.sessionId = sessionId;
     this.audioSeq = 0;
     this.utteranceStartedAt = undefined;
-    this.invalidatedRequestId = 0;
-    this.activeRequestId = 0;
+    this.utteranceMessageId = undefined;
+    this.utteranceComplete = false;
+    this.currentMessageId = undefined;
     this.firstAudioReceivedAt.clear();
     this.playbackReported.clear();
     this.callbacks.onState('connecting');
@@ -41,7 +43,7 @@ export class VoiceServerClient {
       console.info('[voice-ws] connected', { sessionId });
       this.send({
         type: 'session_start', session_id: sessionId, sample_rate: 16000, channels: 1,
-        codec: 'pcm_s16le', language: 'zh-CN', tts_sample_rate: 24000,
+        codec: 'pcm_s16le', language: 'zh-CN',
         ...(this.settings.voice?.trim() ? { voice: this.settings.voice.trim() } : {}),
       });
     };
@@ -55,34 +57,75 @@ export class VoiceServerClient {
     this.socket.onclose = (event) => {
       console.info('[voice-ws] closed', { sessionId: this.sessionId, code: event.code, reason: event.reason });
       this.clearPlaybackTimings();
+      this.currentMessageId = undefined;
+      this.utteranceMessageId = undefined;
+      this.utteranceComplete = false;
       this.callbacks.onState('closed');
     };
   }
 
   sendAudio(data: ArrayBuffer, isLast = false) {
     if (this.socket?.readyState !== WebSocket.OPEN || !this.sessionId) return;
+    const inputEndedAt = isLast ? this.now() : undefined;
     this.utteranceStartedAt ??= Date.now();
-    this.send({ type: 'audio_chunk', session_id: this.sessionId, seq: this.audioSeq++, timestamp_ms: Date.now() - this.utteranceStartedAt, data: new Uint8Array(data), is_last: isLast });
-    if (isLast) this.utteranceStartedAt = undefined;
+    if (!this.utteranceMessageId || this.utteranceComplete) {
+      this.utteranceMessageId = crypto.randomUUID();
+      this.utteranceComplete = false;
+    }
+    const messageId = this.utteranceMessageId;
+    const sent = this.send({ type: 'audio_chunk', session_id: this.sessionId, seq: this.audioSeq++, timestamp_ms: Date.now() - this.utteranceStartedAt, data: new Uint8Array(data), is_last: isLast, message_id: messageId });
+    if (isLast) {
+      if (sent && inputEndedAt !== undefined) {
+        this.reportClientMetric(messageId, 'input_end_to_final_audio_sent', this.now() - inputEndedAt);
+      }
+      this.utteranceStartedAt = undefined;
+      this.utteranceComplete = true;
+    }
   }
-  interrupt() { this.invalidatedRequestId = Math.max(this.invalidatedRequestId, this.activeRequestId); this.clearPlaybackTimings(); if (this.sessionId) this.send({ type: 'interrupt', session_id: this.sessionId }); }
+  interrupt() {
+    this.clearPlaybackTimings();
+    this.utteranceStartedAt = undefined;
+    this.utteranceMessageId = undefined;
+    this.utteranceComplete = false;
+    this.currentMessageId = undefined;
+    if (this.sessionId) this.send({ type: 'interrupt', session_id: this.sessionId });
+  }
+  acceptAsrMessage(messageId: string, text: string) {
+    if (!text.trim() || !messageId) return false;
+    if (this.utteranceMessageId && messageId !== this.utteranceMessageId) return false;
+    const changed = this.currentMessageId !== messageId;
+    this.currentMessageId = messageId;
+    this.utteranceMessageId = undefined;
+    this.utteranceComplete = false;
+    return changed;
+  }
   retry() { if (this.sessionId) this.send({ type: 'retry', session_id: this.sessionId }); }
-  stop() { this.clearPlaybackTimings(); if (this.sessionId) this.send({ type: 'session_end', session_id: this.sessionId, reason: 'user' }); this.utteranceStartedAt = undefined; this.socket?.close(); }
+  stop() { this.clearPlaybackTimings(); if (this.sessionId) this.send({ type: 'session_end', session_id: this.sessionId, reason: 'user' }); this.utteranceStartedAt = undefined; this.utteranceMessageId = undefined; this.utteranceComplete = false; this.currentMessageId = undefined; this.socket?.close(); }
 
-  reportPlaybackStarted(requestId: number | undefined, playbackStartedAt = this.now()) {
-    if (!requestId || this.playbackReported.has(requestId) || !this.sessionId || this.socket?.readyState !== WebSocket.OPEN) return;
+  reportPlaybackStarted(messageId: string | undefined, playbackStartedAt = this.now()) {
     this.prunePlaybackTimings(playbackStartedAt);
-    const receivedAt = this.firstAudioReceivedAt.get(requestId);
+    if (!messageId || this.playbackReported.has(messageId) || !this.sessionId || this.socket?.readyState !== WebSocket.OPEN) return;
+    const receivedAt = this.firstAudioReceivedAt.get(messageId);
     if (receivedAt === undefined) return;
     const delay = playbackStartedAt - receivedAt;
     if (!Number.isFinite(delay) || delay < 0 || delay > 30_000) return;
-    this.playbackReported.add(requestId);
-    this.send({ type: 'playback_started', session_id: this.sessionId, request_id: requestId, delay_ms: Math.round(delay) });
-    this.firstAudioReceivedAt.delete(requestId);
+    if (!this.reportClientMetric(messageId, 'first_audio_received_to_playback', delay)) return;
+    this.playbackReported.set(messageId, playbackStartedAt);
+    this.firstAudioReceivedAt.delete(messageId);
+  }
+  private reportClientMetric(messageId: string, metric: 'first_audio_received_to_playback' | 'input_end_to_final_audio_sent', durationMs: number) {
+    if (!Number.isFinite(durationMs) || durationMs < 0 || durationMs > 30_000 || !this.sessionId) return false;
+    return this.send({
+      type: 'client_metric_report',
+      session_id: this.sessionId,
+      message_id: messageId,
+      metric,
+      duration_ms: Math.round(durationMs),
+    });
   }
   private send(payload: Record<string, unknown>) {
     if (this.socket?.readyState === WebSocket.OPEN) {
-      const message = { ...payload, message_id: crypto.randomUUID() };
+      const message = { ...payload, message_id: payload.message_id ?? crypto.randomUUID() };
       const bytes = encodeVoiceIndication(message);
       console.info('[voice-ws] send', {
         sessionId: this.sessionId,
@@ -90,8 +133,19 @@ export class VoiceServerClient {
         messageId: message.message_id,
         bytes: bytes.byteLength,
       });
-      this.socket.send(bytes as unknown as ArrayBuffer);
+      try {
+        this.socket.send(bytes as unknown as ArrayBuffer);
+        return true;
+      } catch (error) {
+        console.warn('[voice-ws] send failed', {
+          sessionId: this.sessionId,
+          type: payload['type'],
+          messageId: message.message_id,
+          error: String(error),
+        });
+      }
     }
+    return false;
   }
 
   private handleMessage(data: ArrayBuffer | string) {
@@ -110,29 +164,35 @@ export class VoiceServerClient {
         if (raw.success) this.callbacks.onState('connected');
         else event = { type: 'error', message: String(raw.message ?? '服务端拒绝会话') };
       } else if (type === 'asr_partial') {
-        event = raw.is_final ? { type: 'asr_final', text: String(raw.text ?? '') } : { type: 'asr_partial', text: String(raw.text ?? '') };
+        const messageId = String(raw.message_id ?? '');
+        if (this.currentMessageId && messageId !== this.currentMessageId && messageId !== this.utteranceMessageId) return;
+        event = raw.is_final
+          ? { type: 'asr_final', text: String(raw.text ?? ''), message_id: messageId }
+          : { type: 'asr_partial', text: String(raw.text ?? ''), message_id: messageId };
       } else if (type === 'llm_delta') {
-        event = { type: 'llm_delta', text: String(raw.delta ?? '') };
+        const messageId = String(raw.message_id ?? '');
+        if (this.currentMessageId && messageId !== this.currentMessageId) return;
+        event = { type: 'llm_delta', text: String(raw.delta ?? ''), message_id: messageId };
       } else if (type === 'tts_audio') {
         const audio = raw.data instanceof Uint8Array ? raw.data : new Uint8Array(raw.data ?? []);
-        const requestId = Number(raw.request_id ?? 0) || 0;
-        if (requestId && requestId <= this.invalidatedRequestId) return;
-        if (requestId) this.activeRequestId = Math.max(this.activeRequestId, requestId);
-        if (requestId && !this.firstAudioReceivedAt.has(requestId)) {
+        const messageId = String(raw.message_id ?? '');
+        if (this.currentMessageId && messageId !== this.currentMessageId) return;
+        if (messageId && !this.firstAudioReceivedAt.has(messageId)) {
           const receivedAt = this.now();
-          this.firstAudioReceivedAt.set(requestId, receivedAt);
+          this.firstAudioReceivedAt.set(messageId, receivedAt);
           setTimeout(() => {
-            if (this.firstAudioReceivedAt.get(requestId) === receivedAt) this.firstAudioReceivedAt.delete(requestId);
+            if (this.firstAudioReceivedAt.get(messageId) === receivedAt) this.firstAudioReceivedAt.delete(messageId);
           }, 30_000);
         }
-        event = { type: 'tts_audio', audio, seq: Number(raw.seq ?? 0), is_last: Boolean(raw.is_last), sample_rate: Number(raw.sample_rate ?? 0) || undefined, channels: Number(raw.channels ?? 0) || undefined, request_id: requestId || undefined };
+        event = { type: 'tts_audio', audio, seq: Number(raw.seq ?? 0), is_last: Boolean(raw.is_last), sample_rate: Number(raw.sample_rate ?? 0) || undefined, channels: Number(raw.channels ?? 0) || undefined, message_id: messageId };
       } else if (type === 'agent_status') {
-        const requestId = Number(raw.request_id ?? 0) || 0;
-        if (requestId && requestId <= this.invalidatedRequestId) return;
-        if (requestId) this.activeRequestId = Math.max(this.activeRequestId, requestId);
-        event = { type: 'agent_status', phase: String(raw.phase ?? ''), label: String(raw.label ?? ''), done: Boolean(raw.done), request_id: requestId || undefined };
+        const messageId = String(raw.message_id ?? '');
+        if (this.currentMessageId && messageId !== this.currentMessageId) return;
+        event = { type: 'agent_status', phase: String(raw.phase ?? ''), label: String(raw.label ?? ''), done: Boolean(raw.done), message_id: messageId };
       } else if (type === 'error') {
-        event = { type: 'error', message: String(raw.message ?? '服务端错误') };
+        const messageId = raw.message_id == null ? undefined : String(raw.message_id);
+        if (this.currentMessageId && messageId && messageId !== this.currentMessageId) return;
+        event = { type: 'error', message: String(raw.message ?? '服务端错误'), ...(messageId ? { message_id: messageId } : {}) };
       }
       if (event) this.callbacks.onEvent(event);
     } catch (error) {
@@ -148,8 +208,16 @@ export class VoiceServerClient {
   private now() { return typeof performance !== 'undefined' ? performance.now() : Date.now(); }
   private clearPlaybackTimings() { this.firstAudioReceivedAt.clear(); this.playbackReported.clear(); }
   private prunePlaybackTimings(now: number) {
-    for (const [requestId, receivedAt] of this.firstAudioReceivedAt) {
-      if (now - receivedAt > 30_000) this.firstAudioReceivedAt.delete(requestId);
+    for (const [messageId, receivedAt] of this.firstAudioReceivedAt) {
+      if (now - receivedAt > 30_000) this.firstAudioReceivedAt.delete(messageId);
+    }
+    for (const [messageId, reportedAt] of this.playbackReported) {
+      if (now - reportedAt > 30_000) this.playbackReported.delete(messageId);
+    }
+    while (this.playbackReported.size > 512) {
+      const oldest = this.playbackReported.keys().next().value;
+      if (oldest === undefined) break;
+      this.playbackReported.delete(oldest);
     }
   }
 }

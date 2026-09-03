@@ -24,8 +24,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 
-use crate::client::error::{parse_openai_error, ClientError};
 use crate::client::apply_trace_header;
+use crate::client::error::{parse_openai_error, ClientError};
 use crate::config::{AsrConfig, ProviderConfig};
 use crate::events::AsrEvent;
 

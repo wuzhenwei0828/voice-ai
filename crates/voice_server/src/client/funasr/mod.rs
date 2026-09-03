@@ -217,7 +217,8 @@ impl FunasrClient {
 
         let mut req = self.build_handshake_request()?;
         if let Some(trace_id) = current_trace_id() {
-            if let Ok(value) = async_tungstenite::tungstenite::http::HeaderValue::from_str(&trace_id)
+            if let Ok(value) =
+                async_tungstenite::tungstenite::http::HeaderValue::from_str(&trace_id)
             {
                 req.headers_mut().insert(
                     async_tungstenite::tungstenite::http::HeaderName::from_static("trace_id"),

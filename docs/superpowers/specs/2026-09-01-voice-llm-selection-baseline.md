@@ -259,6 +259,34 @@ ASR final → LlmAgent → 长度路由器 → fast / strong client → 流式 L
 
 标点和输入内部空白也计入字符数，只有首尾空白被移除。首版不根据问候、闲聊、工具意图、风险、复杂度或 ASR 置信度改变初始路由，因此短的复杂请求仍可能走 fast，长的简单请求也可能走 strong；这是有意保留的简单基线，后续用真实流量评估是否升级规则。
 
+### 5.4.1 端侧播报打断与 ASR 事件
+
+端侧正在播放 TTS 时，不因本地 VAD 检测到声音或收到空 ASR 事件而停止播报。收到非空 `asr_partial` 或非空 `asr_final`（文本执行 `trim()` 后非空，包含任意语种文字即可）时，确认用户确实说话，并立即停止当前 TTS 播放队列。
+
+规则如下：
+
+1. 本地 VAD 只负责发送音频，不直接停止 TTS，也不发送 `Interrupt`。
+2. `asr_partial` / `asr_final` 的文本为空或只含首尾空白时，不停止 TTS、不更新用户文本、不改变当前播报请求。
+3. 每轮语音输入只生成一个 `message_id`，该轮所有上行音频和服务端 ASR、LLM、TTS、状态事件复用同一个值。
+4. 收到 trim 后非空的 `asr_partial` 或 `asr_final` 时：如果其 `message_id` 不等于端侧当前有效 ID，则先将当前有效 ID 更新为该值，再停止当前 TTS 播放队列；相同 ID 的后续 partial/final 只更新识别文本，不重复停止。
+5. 端侧设置当前有效 ID 后，只处理 `message_id` 等于该 ID 的 ASR、LLM、TTS 和 pipeline 状态事件；其它 pipeline 事件丢弃。`session_ack` 等连接级事件不受该过滤规则限制。
+6. 本阶段不根据旧事件的文本内容做额外丢弃策略；是否展示旧 ASR 文本由当前有效 `message_id` 过滤规则决定。
+7. 服务端内部可以为每次处理尝试生成 `request_id`，用于取消、重试和并发控制，但 `request_id` 不出现在 WebSocket 下行协议或端侧事件类型中。
+
+典型时序：
+
+```text
+message_id=0 正在播报
+message_id=1 返回空 ASR partial             -> 继续播放 message_id=0
+message_id=1 返回非空 ASR partial            -> 当前有效 ID=1，停止 message_id=0
+message_id=1 后续返回非空 ASR final          -> 继续处理，不重复停止
+message_id=0 的迟到 LLM/TTS/status           -> 丢弃
+```
+
+这里的 `message_id` 表示用户输入的一句话：端侧在一轮语音开始时生成，整轮 `audio_chunk` 复用同一个值；下一轮语音才生成新的值。音频上行帧不携带客户端生成的 `request_id`；`request_id` 仅由服务端内部创建，用于处理尝试的取消、重试和并发控制，不下发给端侧。连接级控制消息可以有自己的 `message_id`，但不参与 pipeline 结果过滤。
+
+服务端为每轮有效音频创建一个 pipeline，并将该轮的 `message_id` 作为 pipeline 属性贯穿处理。下行 `AsrPartial`、`LlmDelta`、`TtsAudio` 和 `AgentStatus` 必须携带该 `message_id`，端侧据此进行结果配对和过滤；按请求产生的错误若能关联 pipeline，也必须携带该 `message_id`。同一句话重试时复用原 `message_id`，服务端内部可以生成新的 `request_id`，但端侧不可见。
+
 ### 5.5 模型路由器：必须自研的实现内容
 
 Provider SDK 只负责模型请求和流式事件，不提供本项目的模型分层策略，因此路由器由项目自己实现。首版单独抽为 `agent/router.rs`，但只包含长度判断，不引入规则引擎或分类 SDK。

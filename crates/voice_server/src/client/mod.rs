@@ -36,7 +36,10 @@ pub use llm::{
     build_llm_client, build_llm_client_with_prompt, ArcLlm, HttpLlmClient, LlmClient, ModelTier,
 };
 pub use prompt::LlmPromptTemplates;
-pub use tts::{build_tts_client, build_tts_client_with_metrics, ArcTts, HttpTtsClient, TtsClient, TtsInputSession};
+pub use tts::{
+    build_tts_client, build_tts_client_with_metrics, ArcTts, HttpTtsClient, TtsClient,
+    TtsInputSession,
+};
 pub use tts_ws::{TtsWsClient, TtsWsConfig};
 
 /// Attach the current inbound trace ID to an outbound HTTP request when one is

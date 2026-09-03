@@ -20,6 +20,10 @@
 
 use serde::{Deserialize, Serialize};
 
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
 /// 服务端向客户端报告的语音智能体处理阶段。
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "snake_case")]
@@ -30,6 +34,13 @@ pub enum AgentPhase {
     Composing,
     Speaking,
     Error,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientMetricKind {
+    FirstAudioReceivedToPlayback,
+    InputEndToFinalAudioSent,
 }
 
 /// 语音链路所有消息的统一业务数据类型。
@@ -44,11 +55,6 @@ pub enum VoicePayload {
         channels: u8,
         codec: String,
         language: String,
-        /// **TTS 输出采样率（Hz）** —— 由端侧（浏览器）按 AudioContext 实际能力上报。
-        /// 服务端 `tts.sample_rate` 配置项只做兜底：端侧没传（None / 0）时使用配置值。
-        /// `#[serde(default)]` 兼容旧客户端 —— 不带这字段的 SessionStart 仍能解码。
-        #[serde(default)]
-        tts_sample_rate: Option<u32>,
         /// **TTS 音色短名**（如 `"alex"`）—— 由端侧（前端 voice 下拉）选好后带过来。
         /// 服务端 `tts.voice` 配置项只做兜底：端侧没传（None / 空字符串）时使用配置值。
         /// `#[serde(default)]` 兼容旧客户端。
@@ -70,9 +76,21 @@ pub enum VoicePayload {
     /// 客户端在实际开始播放首个可播放 PCM chunk 后回传的相对时延。
     PlaybackStarted {
         session_id: String,
+        /// 新客户端使用 `message_id`；旧客户端只发送 `request_id`。
+        #[serde(default)]
+        message_id: String,
+        /// 兼容旧客户端的请求序号；新协议序列化时省略零值。
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
         request_id: u64,
         /// 从服务端首个 TTS 音频到客户端开始播放的毫秒数，服务端限制最大 30 秒。
         delay_ms: u64,
+    },
+    /// 客户端使用本地单调时钟计算并上报的固定低基数时延。
+    ClientMetricReport {
+        session_id: String,
+        message_id: String,
+        metric: ClientMetricKind,
+        duration_ms: f64,
     },
 
     // ---- 下行：服务端 → 客户端（握手 ack）----
@@ -109,17 +127,15 @@ pub enum VoicePayload {
         /// 其它情况为 false。#[serde(default)] 保证旧客户端 / 旧消息可正常解析。
         #[serde(default)]
         replace_last: bool,
-        /// 关联一轮用户请求；旧客户端不带该字段时按 0 处理。
-        #[serde(default)]
-        request_id: u64,
+        /// 关联用户输入的一句话。
+        message_id: String,
     },
     LlmDelta {
         session_id: String,
         delta: String,
         is_final: bool,
-        /// 关联一轮用户请求；旧客户端不带该字段时按 0 处理。
-        #[serde(default)]
-        request_id: u64,
+        /// 关联用户输入的一句话。
+        message_id: String,
     },
     TtsAudio {
         session_id: String,
@@ -133,9 +149,8 @@ pub enum VoicePayload {
         /// 当前音频 chunk 的声道数。旧服务端未提供时为 None。
         #[serde(default)]
         channels: Option<u8>,
-        /// 关联一轮用户请求；旧客户端不带该字段时按 0 处理。
-        #[serde(default)]
-        request_id: u64,
+        /// 关联用户输入的一句话。
+        message_id: String,
     },
 
     // ---- 下行：服务端 → 客户端（智能体阶段状态）----
@@ -145,12 +160,13 @@ pub enum VoicePayload {
         label: String,
         #[serde(default)]
         tool: Option<String>,
-        request_id: u64,
+        message_id: String,
         done: bool,
     },
     Error {
         code: u32,
         message: String,
+        message_id: Option<String>,
     },
 }
 
@@ -163,6 +179,7 @@ impl VoicePayload {
             VoicePayload::Interrupt { .. } => "interrupt",
             VoicePayload::Retry { .. } => "retry",
             VoicePayload::PlaybackStarted { .. } => "playback_started",
+            VoicePayload::ClientMetricReport { .. } => "client_metric_report",
             VoicePayload::SessionAck { .. } => "session_ack",
             VoicePayload::AudioChunk { .. } => "audio_chunk",
             VoicePayload::AsrPartial { .. } => "asr_partial",
@@ -181,6 +198,7 @@ impl VoicePayload {
             | VoicePayload::Interrupt { session_id }
             | VoicePayload::Retry { session_id }
             | VoicePayload::PlaybackStarted { session_id, .. }
+            | VoicePayload::ClientMetricReport { session_id, .. }
             | VoicePayload::AudioChunk { session_id, .. }
             | VoicePayload::AsrPartial { session_id, .. }
             | VoicePayload::LlmDelta { session_id, .. }
@@ -287,7 +305,6 @@ mod tests {
             channels: 1,
             codec: "pcm".into(),
             language: "zh-CN".into(),
-            tts_sample_rate: None,
             voice: None,
         };
         assert_eq!(p.session_id(), Some("x"));
@@ -295,43 +312,33 @@ mod tests {
         let e = VoicePayload::Error {
             code: 1,
             message: "x".into(),
+            message_id: None,
         };
         assert_eq!(e.session_id(), None);
     }
 
-    /// tts_sample_rate 缺省（None / 老客户端不发该字段）应能被 round-trip 解码
     #[test]
-    fn session_start_omits_tts_sample_rate_round_trips() {
-        // 编码端：None（模拟老客户端）
+    fn session_start_round_trips_without_tts_sample_rate() {
         let p = VoicePayload::SessionStart {
             session_id: "s".into(),
             sample_rate: 16000,
             channels: 1,
             codec: "pcm".into(),
             language: "zh".into(),
-            tts_sample_rate: None,
             voice: None,
         };
         let bytes = encode_indication(&p).unwrap();
         let (_, decoded) = decode_payload(&bytes).unwrap();
         match decoded {
-            VoicePayload::SessionStart {
-                tts_sample_rate,
-                voice,
-                ..
-            } => {
-                assert_eq!(tts_sample_rate, None);
-                assert_eq!(voice, None);
-            }
+            VoicePayload::SessionStart { voice, .. } => assert_eq!(voice, None),
             _ => panic!("wrong variant"),
         }
+    }
 
-        // 验证 #[serde(default)] 在缺字段时也能容错 —— 直接用 rmp-serde 编码一份
-        // 不带 tts_sample_rate / voice 字段的 VoicePayload，再解回，看容错是否生效
-        // （注：Msgpack / JSON 在 serde derive 层都遵循同一个 #[serde(default)] 语义，
-        //  所以即便 wire envelope 是 Message::Indication，serde 容错行为等价）
+    #[test]
+    fn session_start_ignores_legacy_tts_sample_rate() {
         #[derive(serde::Serialize)]
-        struct OldWire<'a> {
+        struct LegacyWire<'a> {
             #[serde(rename = "type")]
             t: &'a str,
             session_id: &'a str,
@@ -339,55 +346,23 @@ mod tests {
             channels: u8,
             codec: &'a str,
             language: &'a str,
-            // 注意：故意不带 tts_sample_rate / voice —— 模拟老客户端字节
+            tts_sample_rate: u32,
+            voice: &'a str,
         }
-        let old = OldWire {
+        let old = LegacyWire {
             t: "session_start",
             session_id: "s",
             sample_rate: 16000,
             channels: 1,
             codec: "pcm",
             language: "zh",
+            tts_sample_rate: 16000,
+            voice: "alex",
         };
         let raw = rmp_serde::to_vec_named(&old).unwrap();
         let v: VoicePayload = rmp_serde::from_slice(&raw).unwrap();
         match v {
-            VoicePayload::SessionStart {
-                tts_sample_rate,
-                voice,
-                ..
-            } => {
-                assert_eq!(
-                    tts_sample_rate, None,
-                    "缺省字段应通过 #[serde(default)] 解为 None"
-                );
-                assert_eq!(voice, None, "缺省字段应通过 #[serde(default)] 解为 None");
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    /// tts_sample_rate = Some(N) 应能正常 round-trip
-    #[test]
-    fn session_start_with_tts_sample_rate_round_trips() {
-        let p = VoicePayload::SessionStart {
-            session_id: "s".into(),
-            sample_rate: 16000,
-            channels: 1,
-            codec: "pcm".into(),
-            language: "zh".into(),
-            tts_sample_rate: Some(24000),
-            voice: Some("alex".into()),
-        };
-        let bytes = encode_indication(&p).unwrap();
-        let (_, decoded) = decode_payload(&bytes).unwrap();
-        match decoded {
-            VoicePayload::SessionStart {
-                tts_sample_rate,
-                voice,
-                ..
-            } => {
-                assert_eq!(tts_sample_rate, Some(24000));
+            VoicePayload::SessionStart { voice, .. } => {
                 assert_eq!(voice.as_deref(), Some("alex"));
             }
             _ => panic!("wrong variant"),
@@ -397,11 +372,61 @@ mod tests {
     #[test]
     fn tts_audio_format_fields_round_trip() {
         let payload = VoicePayload::TtsAudio {
-            session_id: "s".into(), seq: 1, data: vec![1, 2], is_last: false,
-            sample_rate: Some(24_000), channels: Some(1), request_id: 2,
+            session_id: "s".into(),
+            seq: 1,
+            data: vec![1, 2],
+            is_last: false,
+            sample_rate: Some(24_000),
+            channels: Some(1),
+            message_id: "message-2".into(),
         };
         let (_, decoded) = decode_payload(&encode_indication(&payload).unwrap()).unwrap();
-        match decoded { VoicePayload::TtsAudio { sample_rate, channels, .. } => { assert_eq!(sample_rate, Some(24_000)); assert_eq!(channels, Some(1)); }, _ => panic!("wrong variant") }
+        match decoded {
+            VoicePayload::TtsAudio {
+                sample_rate,
+                channels,
+                message_id,
+                ..
+            } => {
+                assert_eq!(sample_rate, Some(24_000));
+                assert_eq!(channels, Some(1));
+                assert_eq!(message_id, "message-2");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn asr_partial_carries_message_id() {
+        let payload = VoicePayload::AsrPartial {
+            session_id: "s".into(),
+            text: "你好".into(),
+            is_final: false,
+            replace_last: false,
+            message_id: "message-1".into(),
+        };
+        let (_, decoded) = decode_payload(&encode_indication(&payload).unwrap()).unwrap();
+        match decoded {
+            VoicePayload::AsrPartial {
+                message_id, text, ..
+            } => {
+                assert_eq!(message_id, "message-1");
+                assert_eq!(text, "你好");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn pipeline_downlink_events_do_not_serialize_request_id() {
+        let payload = serde_json::to_value(VoicePayload::LlmDelta {
+            session_id: "s".into(),
+            delta: "你好".into(),
+            is_final: true,
+            message_id: "message-1".into(),
+        })
+        .unwrap();
+        assert!(payload.get("request_id").is_none());
     }
 
     #[test]
@@ -455,7 +480,7 @@ mod tests {
             phase: AgentPhase::Searching,
             label: "正在查资料".into(),
             tool: Some("knowledge_search".into()),
-            request_id: 7,
+            message_id: "message-7".into(),
             done: false,
         };
         let bytes = encode_indication(&payload).unwrap();
@@ -467,14 +492,14 @@ mod tests {
                 phase,
                 label,
                 tool,
-                request_id,
+                message_id,
                 done,
             } => {
                 assert_eq!(session_id, "s");
                 assert!(matches!(phase, AgentPhase::Searching));
                 assert_eq!(label, "正在查资料");
                 assert_eq!(tool.as_deref(), Some("knowledge_search"));
-                assert_eq!(request_id, 7);
+                assert_eq!(message_id, "message-7");
                 assert!(!done);
             }
             other => panic!("unexpected payload: {other:?}"),
@@ -485,18 +510,21 @@ mod tests {
     fn round_trip_playback_started() {
         let payload = VoicePayload::PlaybackStarted {
             session_id: "s".into(),
-            request_id: 7,
+            message_id: "message-7".into(),
+            request_id: 0,
             delay_ms: 125,
         };
         let (_, decoded) = decode_payload(&encode_indication(&payload).unwrap()).unwrap();
         match decoded {
             VoicePayload::PlaybackStarted {
                 session_id,
+                message_id,
                 request_id,
                 delay_ms,
             } => {
                 assert_eq!(session_id, "s");
-                assert_eq!(request_id, 7);
+                assert_eq!(message_id, "message-7");
+                assert_eq!(request_id, 0);
                 assert_eq!(delay_ms, 125);
             }
             other => panic!("unexpected payload: {other:?}"),
@@ -504,26 +532,67 @@ mod tests {
     }
 
     #[test]
-    fn legacy_stream_event_without_request_id_decodes() {
-        #[derive(serde::Serialize)]
-        struct OldWire<'a> {
-            #[serde(rename = "type")]
-            t: &'a str,
-            session_id: &'a str,
-            delta: &'a str,
-            is_final: bool,
+    fn decodes_legacy_playback_started_request_id() {
+        #[derive(Serialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum LegacyPlaybackStarted {
+            PlaybackStarted {
+                session_id: String,
+                request_id: u64,
+                delay_ms: u64,
+            },
         }
-        let raw = rmp_serde::to_vec_named(&OldWire {
-            t: "llm_delta",
-            session_id: "s",
-            delta: "你好",
-            is_final: true,
-        })
+        let bytes = webproto::Indication::<LegacyPlaybackStarted>::encode(
+            LegacyPlaybackStarted::PlaybackStarted {
+                session_id: "s".into(),
+                request_id: 42,
+                delay_ms: 125,
+            },
+        )
         .unwrap();
-        let decoded: VoicePayload = rmp_serde::from_slice(&raw).unwrap();
+        let (_, decoded) = decode_payload(&bytes).unwrap();
         match decoded {
-            VoicePayload::LlmDelta { request_id, .. } => assert_eq!(request_id, 0),
+            VoicePayload::PlaybackStarted {
+                message_id,
+                request_id,
+                delay_ms,
+                ..
+            } => {
+                assert!(message_id.is_empty());
+                assert_eq!(request_id, 42);
+                assert_eq!(delay_ms, 125);
+            }
             other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_fixed_client_metric_reports() {
+        for metric in [
+            ClientMetricKind::FirstAudioReceivedToPlayback,
+            ClientMetricKind::InputEndToFinalAudioSent,
+        ] {
+            let payload = VoicePayload::ClientMetricReport {
+                session_id: "s".into(),
+                message_id: "message-8".into(),
+                metric,
+                duration_ms: 12.5,
+            };
+            let (_, decoded) = decode_payload(&encode_indication(&payload).unwrap()).unwrap();
+            match decoded {
+                VoicePayload::ClientMetricReport {
+                    session_id,
+                    message_id,
+                    metric: decoded_metric,
+                    duration_ms,
+                } => {
+                    assert_eq!(session_id, "s");
+                    assert_eq!(message_id, "message-8");
+                    assert_eq!(decoded_metric, metric);
+                    assert_eq!(duration_ms, 12.5);
+                }
+                other => panic!("unexpected payload: {other:?}"),
+            }
         }
     }
 
@@ -535,7 +604,10 @@ mod tests {
             "message_id": "550e8400-e29b-41d4-a716-446655440000",
         });
         let bytes = webproto::Indication::<serde_json::Value>::encode(payload).unwrap();
-        assert_eq!(decode_message_id(&bytes).as_deref(), Some("550e8400-e29b-41d4-a716-446655440000"));
+        assert_eq!(
+            decode_message_id(&bytes).as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
     }
 
     #[test]
@@ -543,6 +615,7 @@ mod tests {
         let payload = VoicePayload::Error {
             code: 500,
             message: "provider error".into(),
+            message_id: None,
         };
         assert_eq!(payload.type_name(), "error");
     }

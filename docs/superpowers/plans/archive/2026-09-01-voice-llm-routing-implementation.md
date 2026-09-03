@@ -1,5 +1,7 @@
 # Voice LLM Routing Implementation Plan
 
+> 状态：已归档
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 将 LLM 选型基线中的 `fast`/`strong` 双模型、独立完整 System Prompt、首版长度路由和一次安全兜底接入现有 `ASR -> LLM -> TTS` Rust 链路。
@@ -686,6 +688,11 @@ Run: `git diff --check`
 Run: `git status --short`
 
 Expected: 无空白错误；只出现本计划声明的文件和用户原有未提交改动。不要自动提交。
+
+## 前端播报打断专项
+
+前端播报打断、ASR 非空事件和 `message_id` 结果过滤已单独整理到
+`docs/superpowers/plans/archive/2026-09-02-message-id-asr-filtering.md`，后续以该中文计划和对应规范为准。
 
 ## 后续独立计划
 

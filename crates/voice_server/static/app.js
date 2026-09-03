@@ -35,63 +35,56 @@
     return phaseCopy(phase).substatus;
   }
 
-  function normalizeRequestId(requestId) {
-    const value = Number(requestId || 0);
-    return Number.isSafeInteger(value) && value > 0 ? value : 0;
-  }
-
-  function createRequestTracker() {
-    let currentRequestId = 0;
-    let highestRequestId = 0;
-
-    return {
-      considerRequest(requestId) {
-        const id = normalizeRequestId(requestId);
-        if (id === 0) return highestRequestId === 0 ? 'current' : 'stale';
-        if (id < highestRequestId) return 'stale';
-        if (id === highestRequestId) return currentRequestId === id ? 'current' : 'stale';
-        highestRequestId = id;
-        currentRequestId = id;
-        return 'new';
-      },
-      isCurrentRequest(requestId) {
-        const id = normalizeRequestId(requestId);
-        if (id === 0) return highestRequestId === 0 && currentRequestId === 0;
-        return id === currentRequestId;
-      },
-      invalidateCurrent() {
-        currentRequestId = 0;
-      },
-      reset() {
-        currentRequestId = 0;
-        highestRequestId = 0;
-      },
-      currentRequestId() {
-        return currentRequestId;
-      },
-    };
+  function shouldStopPlaybackForAsr(text, messageId, currentMessageId) {
+    return Boolean(String(text || '').trim()) && Boolean(messageId) && messageId !== currentMessageId;
   }
 
   function executeRetry({
     canRetry,
     socketOpen,
     stopPlayback,
-    invalidateRequest,
     sendRetry,
   }) {
     if (!canRetry || !socketOpen) return false;
     stopPlayback();
-    invalidateRequest();
     sendRetry();
     return true;
+  }
+
+  function createClientMetricReport({ sessionId, messageId, metric, startedAt, endedAt }) {
+    const allowedMetrics = new Set([
+      'first_audio_received_to_playback',
+      'input_end_to_final_audio_sent',
+    ]);
+    const durationMs = endedAt - startedAt;
+    if (!sessionId || !messageId || !allowedMetrics.has(metric)
+      || !Number.isFinite(durationMs) || durationMs < 0 || durationMs > 30000) return null;
+    return {
+      type: 'client_metric_report',
+      session_id: sessionId,
+      message_id: messageId,
+      metric,
+      duration_ms: Math.round(durationMs),
+    };
+  }
+
+  function trySendWebSocket(socket, bytes) {
+    try {
+      socket.send(bytes);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   const api = {
     PHASE_COPY,
     agentStatusLabel,
     agentStatusSubstatus,
-    createRequestTracker,
+    shouldStopPlaybackForAsr,
     executeRetry,
+    createClientMetricReport,
+    trySendWebSocket,
   };
   root.VoiceAgentUi = api;
   if (typeof module === 'object' && module.exports) module.exports = api;
@@ -138,7 +131,7 @@
   const sourceDetails = $('source-details');
   const sourceList = $('source-list');
   const agentUi = window.VoiceAgentUi;
-  const requestTracker = agentUi.createRequestTracker();
+  let currentMessageId = null;
   let canRetryLastRequest = false;
 
   // ====== 麦/喇叭手动静音 ======
@@ -256,10 +249,9 @@
     recomputePhoneState();
   }
 
-  function clearAgentPhase({ invalidate = false } = {}) {
+  function clearAgentPhase() {
     activeAgentPhase = null;
     safeErrorShown = false;
-    if (invalidate) requestTracker.invalidateCurrent();
     if (retryAction) retryAction.hidden = true;
     recomputePhoneState();
   }
@@ -384,6 +376,8 @@
   let lastAsrStartMs = null;
   let lastTtsFirstByteMs = null;
   let sendingUtterance = false;
+  let utteranceMessageId = null;
+  let utteranceComplete = false;
 
   // ====== MessagePack 编解码（native，不用 msgpack-lite）======
   // 浏览器版 msgpack-lite（Buffer polyfill）行为不一致，干脆自己写 ~110 行 encoder/decoder
@@ -677,7 +671,7 @@
   window.renderAgentSources = renderSources;
 
   let progressUtterance = null;
-  const progressSpokenFor = new Set();
+  let progressSpokenForMessageId = null;
 
   function stopProgressSpeech() {
     if (!progressUtterance || !('speechSynthesis' in window)) return;
@@ -686,13 +680,13 @@
   }
 
   function maybeSpeakProgress(payload) {
-    const requestId = Number(payload.request_id || 0);
+    const messageId = String(payload.message_id || '');
     if (payload.phase !== 'searching' || payload.speak_progress !== true ||
-        !requestId || progressSpokenFor.has(requestId) ||
+        !messageId || progressSpokenForMessageId === messageId ||
         !('speechSynthesis' in window) || !('SpeechSynthesisUtterance' in window)) {
       return;
     }
-    progressSpokenFor.add(requestId);
+    progressSpokenForMessageId = messageId;
     progressUtterance = new window.SpeechSynthesisUtterance('我查一下');
     progressUtterance.lang = 'zh-CN';
     progressUtterance.onend = () => { progressUtterance = null; };
@@ -707,13 +701,10 @@
     if (currentAssistantBubble) finalizeMessage(currentAssistantBubble);
     currentAssistantBubble = null;
     renderSources([]);
-    stopTtsPlayback();
   }
 
   function handleAgentStatus(payload) {
-    const relation = requestTracker.considerRequest(payload.request_id);
-    if (relation === 'stale') return;
-    if (relation === 'new') prepareForNewRequest();
+    if (!acceptsPipelineMessage(payload)) return;
     setAgentPhase(payload.phase);
     maybeSpeakProgress(payload);
     if (payload.done && payload.phase !== 'error') setAgentPhase('listening');
@@ -728,24 +719,24 @@
   }
 
   function beginLocalUtterance() {
-    requestTracker.invalidateCurrent();
     activeAgentPhase = null;
     safeErrorShown = false;
     if (currentAssistantBubble) finalizeMessage(currentAssistantBubble);
     currentAssistantBubble = null;
     renderSources([]);
-    stopTtsPlayback();
     setAgentPhase('listening');
   }
 
   function resetAgentSessionUi() {
-    requestTracker.reset();
-    progressSpokenFor.clear();
+    currentMessageId = null;
+    progressSpokenForMessageId = null;
     activeAgentPhase = null;
     safeErrorShown = false;
     currentUserBubble = null;
     currentAssistantBubble = null;
     sendingUtterance = false;
+    utteranceMessageId = null;
+    utteranceComplete = false;
     canRetryLastRequest = false;
     renderSources([]);
     if (retryAction) retryAction.hidden = true;
@@ -759,7 +750,7 @@
     },
   });
   const ttsFirstAudioReceivedAt = new Map();
-  const ttsPlaybackReported = new Set();
+  let ttsPlaybackReportedMessageId = null;
 
   function playTtsAudio(dataBytes, _isLast, sampleRate = SAMPLE_RATE, channels = CHANNELS) {
     // 扬声器静音：直接丢掉这段 TTS 音频（不进队列，不消耗 audio 资源）
@@ -767,23 +758,46 @@
     return ttsPlayer.enqueue(dataBytes, sampleRate, channels);
   }
 
-  function reportPlaybackStarted(requestId, playbackStartedAt) {
-    requestId = Number(requestId || 0);
-    if (!requestId || ttsPlaybackReported.has(requestId) || !Number.isFinite(playbackStartedAt)) return;
-    const receivedAt = ttsFirstAudioReceivedAt.get(requestId);
+  function reportPlaybackStarted(messageId, playbackStartedAt) {
+    messageId = String(messageId || '');
+    if (!messageId || ttsPlaybackReportedMessageId === messageId || !Number.isFinite(playbackStartedAt)) return;
+    const receivedAt = ttsFirstAudioReceivedAt.get(messageId);
     if (receivedAt === undefined) return;
-    const delay = playbackStartedAt - receivedAt;
-    if (!Number.isFinite(delay) || delay < 0 || delay > 30000) return;
-    ttsPlaybackReported.add(requestId);
-    sendWsPayload({ type: 'playback_started', session_id: sessionId, request_id: requestId, delay_ms: Math.round(delay) });
-    ttsFirstAudioReceivedAt.delete(requestId);
+    const report = agentUi.createClientMetricReport({
+      sessionId,
+      messageId,
+      metric: 'first_audio_received_to_playback',
+      startedAt: receivedAt,
+      endedAt: playbackStartedAt,
+    });
+    if (!report || !sendWsPayload(report)) return;
+    ttsPlaybackReportedMessageId = messageId;
+    ttsFirstAudioReceivedAt.delete(messageId);
   }
 
   function stopTtsPlayback() {
     stopProgressSpeech();
     ttsPlayer.stop();
     ttsFirstAudioReceivedAt.clear();
-    ttsPlaybackReported.clear();
+    ttsPlaybackReportedMessageId = null;
+  }
+
+  function acceptAsrMessage(payload) {
+    const text = String(payload.text || '');
+    const messageId = String(payload.message_id || '');
+    if (!text.trim() || !messageId) return null;
+    if (utteranceMessageId && messageId !== utteranceMessageId) return null;
+    const shouldStop = agentUi.shouldStopPlaybackForAsr(text, messageId, currentMessageId);
+    const changed = currentMessageId !== messageId;
+    currentMessageId = messageId;
+    utteranceMessageId = null;
+    utteranceComplete = false;
+    return shouldStop && changed;
+  }
+
+  function acceptsPipelineMessage(payload) {
+    const messageId = String(payload.message_id || '');
+    return Boolean(currentMessageId && messageId === currentMessageId);
   }
 
   // ====== WebSocket ======
@@ -797,8 +811,7 @@
       messageId: message.message_id,
       bytes: bytes.byteLength,
     });
-    ws.send(bytes);
-    return true;
+    return agentUi.trySendWebSocket(ws, bytes);
   }
 
   function connect() {
@@ -840,8 +853,11 @@
         setStatus(connStatus, 'WS：断开', 'badge-offline');
         addMessage('system', 'WS 已断开');
         ttsFirstAudioReceivedAt.clear();
-        ttsPlaybackReported.clear();
-        clearAgentPhase({ invalidate: true });
+        ttsPlaybackReportedMessageId = null;
+        currentMessageId = null;
+        utteranceMessageId = null;
+        utteranceComplete = false;
+        clearAgentPhase();
         stopMic();
       };
 
@@ -859,7 +875,11 @@
 
           switch (payload.type) {
             case 'asr_partial':
-              if (!requestTracker.isCurrentRequest(payload.request_id)) break;
+              {
+                const shouldStop = acceptAsrMessage(payload);
+                if (shouldStop === null) break;
+                if (shouldStop) stopTtsPlayback();
+              }
               if (!currentUserBubble) {
                 currentUserBubble = addMessage('user', '', { partial: true });
               }
@@ -870,17 +890,14 @@
                 currentUserBubble = null;
                 lastAsrStartMs = performance.now();
                 // avatar 进入 thinking 状态：等 LLM 首包 + TTS 首字节的最长 1.5s
-                if (lastAsrText.trim()) {
-                  stopTtsPlayback();
-                  bumpThinkingWindow();
-                }
+                bumpThinkingWindow();
               }
               break;
             case 'agent_status':
               handleAgentStatus(payload);
               break;
             case 'llm_delta':
-              if (!requestTracker.isCurrentRequest(payload.request_id)) break;
+              if (!acceptsPipelineMessage(payload)) break;
               if (!currentAssistantBubble) {
                 currentAssistantBubble = addMessage('assistant', '', { partial: true });
               }
@@ -891,20 +908,20 @@
               }
               break;
             case 'tts_audio':
-              if (!requestTracker.isCurrentRequest(payload.request_id)) break;
+              if (!acceptsPipelineMessage(payload)) break;
               if (payload.data && payload.data.length > 0) {
                 // 下行：服务端用 #[serde(with="serde_bytes")] 走 msgpack bin，JS 解码后已是 Uint8Array
-                const requestId = Number(payload.request_id || 0);
-                if (requestId && !ttsFirstAudioReceivedAt.has(requestId)) {
+                const messageId = String(payload.message_id || '');
+                if (!ttsFirstAudioReceivedAt.has(messageId)) {
                   const receivedAt = performance.now();
-                  ttsFirstAudioReceivedAt.set(requestId, receivedAt);
+                  ttsFirstAudioReceivedAt.set(messageId, receivedAt);
                   window.setTimeout(() => {
-                    if (ttsFirstAudioReceivedAt.get(requestId) === receivedAt) ttsFirstAudioReceivedAt.delete(requestId);
+                    if (ttsFirstAudioReceivedAt.get(messageId) === receivedAt) ttsFirstAudioReceivedAt.delete(messageId);
                   }, 30000);
                 }
                 const playbackStartedAt = playTtsAudio(payload.data, payload.is_last, payload.sample_rate || SAMPLE_RATE, payload.channels || CHANNELS);
                 if (!lastTtsFirstByteMs) lastTtsFirstByteMs = performance.now();
-                if (playbackStartedAt !== undefined) reportPlaybackStarted(requestId, playbackStartedAt);
+                if (playbackStartedAt !== undefined) reportPlaybackStarted(messageId, playbackStartedAt);
               }
               if (payload.is_last) {
                 lastTtsFirstByteMs = null;
@@ -912,7 +929,7 @@
               break;
             case 'error':
               console.error(`服务端错误 [${payload.code}]`, payload.message);
-              if (activeAgentPhase === 'error' || requestTracker.currentRequestId() === 0) {
+              if (!payload.message_id || acceptsPipelineMessage(payload)) {
                 showSafeError();
               }
               break;
@@ -936,11 +953,16 @@
       type: 'interrupt',
       session_id: sessionId,
     });
+    sendingUtterance = false;
+    startedAtMs = null;
+    utteranceMessageId = null;
+    utteranceComplete = false;
+    currentMessageId = null;
     console.log(`[发送] Interrupt session_id=${sessionId}`);
     addMessage('system', '已发送 Interrupt');
     // 立即停止正在播放的 TTS，并清空队列里未播的 chunk
     stopTtsPlayback();
-    clearAgentPhase({ invalidate: true });
+    clearAgentPhase();
     setAgentPhase('listening');
   }
 
@@ -1127,9 +1149,12 @@
         if (!sendingUtterance) {
           sendingUtterance = true;
           beginLocalUtterance();
+          if (!utteranceMessageId || utteranceComplete) utteranceMessageId = createTraceId();
+          utteranceComplete = false;
         }
         // timestamp_ms = 本句内时间（isLast 后归零，下一句重新计时）
         if (startedAtMs === null) startedAtMs = Date.now();
+        const inputEndedAt = isLast ? performance.now() : null;
         const payload = {
           type: 'audio_chunk',
           session_id: sessionId,
@@ -1137,12 +1162,24 @@
           timestamp_ms: Date.now() - startedAtMs,
           data: bytes,
           is_last: isLast,
+          message_id: utteranceMessageId,
         };
-        sendWsPayload(payload);
+        const sent = sendWsPayload(payload);
+        if (isLast && sent) {
+          const report = agentUi.createClientMetricReport({
+            sessionId,
+            messageId: utteranceMessageId,
+            metric: 'input_end_to_final_audio_sent',
+            startedAt: inputEndedAt,
+            endedAt: performance.now(),
+          });
+          if (report) sendWsPayload(report);
+        }
         // 与服务端"收到 AudioChunk"日志逐字段对齐，便于两端对比
         console.log(`[发送] AudioChunk session_id=${sessionId} seq=${seq} bytes=${bytes.length} timestamp_ms=${payload.timestamp_ms} is_last=${isLast}`);
         if (isLast) {
           sendingUtterance = false;
+          utteranceComplete = true;
           canRetryLastRequest = true;
           startedAtMs = null;
           // 重置首字延迟
@@ -1220,7 +1257,6 @@
       canRetry: canRetryLastRequest,
       socketOpen: !!ws && ws.readyState === WebSocket.OPEN,
       stopPlayback: stopTtsPlayback,
-      invalidateRequest: () => requestTracker.invalidateCurrent(),
       sendRetry: () => sendWsPayload({
         type: 'retry',
         session_id: sessionId,
@@ -1246,7 +1282,10 @@
     btnStart.disabled = false;
     btnStop.disabled = true;
     btnInterrupt.disabled = true;
-    clearAgentPhase({ invalidate: true });
+    currentMessageId = null;
+    utteranceMessageId = null;
+    utteranceComplete = false;
+    clearAgentPhase();
     addMessage('system', '已结束');
   };
 

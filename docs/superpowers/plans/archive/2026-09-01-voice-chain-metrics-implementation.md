@@ -1,5 +1,7 @@
 # Voice Chain Metrics Implementation Plan
 
+> 状态：已归档
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 将语音客户端到 Server、ASR、LLM、TTS 以及客户端播放相关的可观测时间点和结果，落成低基数指标，并让 Prometheus 作为可替换的默认导出实现。
@@ -14,7 +16,7 @@
 
 - 延迟 Histogram 单位统一为秒，使用服务端 `Instant` 计算，避免跨机器墙钟偏差。
 - 指标标签只允许低基数维度；禁止 `trace_id`、`message_id`、`session_id`、`request_id`、prompt 和文本内容。
-- 主 SLI 为 `voice_e2e_utterance_end_to_tts_first_audio_seconds`。
+- 主 SLI 为 `voice_input_end_to_ws_first_audio_sent_seconds`。
 - 不把“trace 是否完整”等链路完整性指标纳入本期实现。
 - 保留 `webhttp` 自带 `/metrics`，自定义指标使用 `/metrics/voice`。
 - `VoiceSession`、pipeline 和 TTS client 不得直接依赖 Prometheus 类型，只依赖 `VoiceMetricsSink`。
@@ -38,6 +40,162 @@
 - Modify: `docs/superpowers/specs/2026-09-01-voice-chain-metrics-spec.md`：记录已实现项、暂未实现的客户端播放时间点和 TTS 精确时间点来源。
 - Create: `docs/superpowers/specs/2026-09-01-voice-metrics-collection-architecture.md`：记录采集架构、解耦边界和 Prometheus/OpenTelemetry 演进路径。
 - Test: `crates/voice_server/src/metrics.rs` 内单元测试，以及 `session/pipeline.rs` 的 mock pipeline 指标断言。
+
+## 2026-09-02 Latency Contract Revision
+
+本节是当前执行范围；前面的初版任务保留为实现背景。已确认的 10 个指标、边界和重命名规则以本节及 Spec 5.1 为准。
+
+### Current Metric Contract
+
+```text
+voice_input_end_to_asr_output_end_seconds
+voice_input_end_to_llm_first_text_seconds
+voice_input_end_to_tts_first_frame_seconds
+voice_input_end_to_ws_first_audio_sent_seconds
+voice_asr_input_to_output_end_seconds
+voice_llm_input_to_first_text_seconds
+voice_llm_first_text_to_tts_first_frame_seconds
+voice_tts_first_frame_to_ws_first_audio_sent_seconds
+voice_client_first_audio_received_to_playback_seconds
+voice_client_input_end_to_final_audio_sent_seconds
+```
+
+`input_ended_at` 由 `VoiceSession::trigger_pipeline` 在服务端收到尾帧后立即记录。服务端首帧发送时间取首个非空 `TtsAudio` 经 `Recipient::try_send` 成功进入下行队列后的 `Instant`。客户端的“发送成功”取 `WebSocket.send()` 无异常返回；两个客户端指标通过固定枚举的 `ClientMetricReport` 上报，统一校验 `0 <= duration_ms <= 30000` 并按 `(message_id, metric)` 去重。
+
+### Task 7: Rename and extend the server metric contract
+
+**Files:**
+- Modify: `crates/voice_server/src/metrics.rs`
+- Test: `crates/voice_server/src/metrics.rs`
+
+**Interfaces:**
+- Replace the four old equivalent collector names listed in Spec 5.1; do not dual-write them.
+- Add sink methods for all server-owned intervals and the two fixed client-reported intervals.
+- Extend `PipelineMetricsGuard` to retain the first non-empty LLM text and first non-empty TTS frame `Instant` values so compound intervals are observed once.
+
+- [ ] **Step 1: Write failing metric registry tests**
+
+Assert that observing one complete timing sequence produces `_count 1` for all 10 current names, excludes the four retired names, and does not expose `message_id`, `request_id`, or `session_id` labels. Add bounds tests proving invalid client durations are dropped.
+
+- [ ] **Step 2: Run the focused tests and verify RED**
+
+Run: `cargo test -p voice_server --lib metrics::tests::renders_latency_contract_metrics`
+
+Expected: FAIL because the current registry exposes the old ASR/LLM/TTS/playback names and lacks six collectors.
+
+- [ ] **Step 3: Implement the registry and guard changes**
+
+Add the exact collectors from Current Metric Contract, use seconds internally, and make each first-event guard idempotent. Preserve unrelated queue, completion, TTS provider, pool, request result, routing, and escalation metrics.
+
+- [ ] **Step 4: Run focused tests and verify GREEN**
+
+Run: `cargo test -p voice_server --lib metrics::tests`
+
+Expected: PASS.
+
+### Task 8: Capture server pipeline boundaries and successful first-audio send
+
+**Files:**
+- Modify: `crates/voice_server/src/session/pipeline.rs`
+- Test: `crates/voice_server/src/session/pipeline.rs`
+
+**Interfaces:**
+- ASR final records both `input_ended_at -> asr_final_at` and `asr_started_at -> asr_final_at`.
+- The first `delta.trim().is_empty() == false` records both LLM intervals and becomes the start for the LLM-to-TTS interval.
+- `send_down(...) -> bool` reports whether encoding and `Recipient::try_send` succeeded; only the first successfully queued non-empty `TtsAudio` records WS-send intervals.
+
+- [ ] **Step 1: Change the normal pipeline test to require eight server metrics**
+
+Assert `_count 1` for metrics 1 through 8 after the mock ASR/LLM/TTS request. Add a whitespace-only LLM delta before real text and assert the first-text metrics still have one observation.
+
+- [ ] **Step 2: Run the pipeline test and verify RED**
+
+Run: `cargo test -p voice_server --lib session::pipeline::tests::normal_request_emits_safe_phases_with_one_message_id`
+
+Expected: FAIL because the new names and composite intervals are absent.
+
+- [ ] **Step 3: Implement event capture**
+
+Record each event immediately at the existing ASR final, LLM delta, TTS item, and successful downlink send branches. Decode TTS audio before classifying it as non-empty. Keep metric calls behind `VoiceMetricsSink`; do not import Prometheus types into pipeline code.
+
+- [ ] **Step 4: Run focused tests and verify GREEN**
+
+Run: `cargo test -p voice_server --lib session::pipeline::tests`
+
+Expected: PASS.
+
+### Task 9: Add the fixed client metric protocol and both client reporters
+
+**Files:**
+- Modify: `crates/voice-proto/src/lib.rs`
+- Modify: `crates/voice_server/src/session/mod.rs`
+- Modify: `voice_desktop/src/services/voice-server-client.ts`
+- Modify: `crates/voice_server/static/app.js`
+- Test: `crates/voice-proto/src/lib.rs`
+- Test: `voice_desktop/tests/voice-server-client.test.ts`
+- Test: `crates/voice_server/src/session/mod.rs`
+
+**Interfaces:**
+- Add `ClientMetricKind::{FirstAudioReceivedToPlayback, InputEndToFinalAudioSent}` with snake-case wire values.
+- Add `VoicePayload::ClientMetricReport { session_id, message_id, metric, duration_ms: f64 }`.
+- Keep `PlaybackStarted` decode support for old clients and map it to the renamed playback collector; new clients emit only `client_metric_report`.
+
+- [ ] **Step 1: Write failing protocol and client behavior tests**
+
+Assert MessagePack round trips both fixed kinds. In the desktop test, inject monotonic `now()` values and assert the final audio frame is sent before exactly one input-send report; assert first TTS receipt to playback emits exactly one playback report with the same `message_id`.
+
+- [ ] **Step 2: Run tests and verify RED**
+
+Run: `cargo test -p voice-proto` and `npm --prefix voice_desktop test -- --run tests/voice-server-client.test.ts`
+
+Expected: FAIL because `client_metric_report` and the final-audio timing report do not exist.
+
+- [ ] **Step 3: Implement protocol, validation, deduplication, and reporters**
+
+Use `performance.now()`/the existing `now()` wrapper on the clients. Return a boolean from the client send helper so the input-send metric is emitted only after the final audio send was accepted. On Server, accept only finite values in `[0, 30000]`, deduplicate by `(message_id, metric)`, and never use IDs as Prometheus labels.
+
+- [ ] **Step 4: Run focused tests and verify GREEN**
+
+Run the commands from Step 2 plus `cargo test -p voice_server --lib session::tests`.
+
+Expected: PASS.
+
+### Task 10: Update dashboard and complete verification
+
+**Files:**
+- Modify: `crates/voice_server/static/metrics-dashboard.js`
+- Modify: `crates/voice_server/static/metrics-dashboard.test.js`
+- Modify: `docs/superpowers/specs/2026-09-01-voice-chain-metrics-spec.md`
+
+- [ ] **Step 1: Write a failing dashboard test fixture using the current names**
+
+Replace old fixture names with the new contract and assert all 10 metrics can produce displayed percentiles and counts.
+
+- [ ] **Step 2: Run dashboard tests and verify RED**
+
+Run: `node --test crates/voice_server/static/metrics-dashboard.test.js`
+
+Expected: FAIL while the dashboard still queries retired names.
+
+- [ ] **Step 3: Update dashboard configuration and Spec status**
+
+Show readable Chinese labels for all 10 metrics, retain unrelated operational metrics, and mark the implementation status only after complete verification.
+
+- [ ] **Step 4: Run final verification**
+
+Run:
+
+```bash
+cargo fmt --all -- --check
+cargo test -p voice-proto
+cargo test -p voice_server --lib
+npm --prefix voice_desktop run typecheck
+npm --prefix voice_desktop test -- --run tests/voice-server-client.test.ts
+node --test crates/voice_server/static/metrics-dashboard.test.js
+git diff --check
+```
+
+Expected: all commands PASS.
 
 ## Metric Contract
 

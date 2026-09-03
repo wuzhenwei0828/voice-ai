@@ -59,6 +59,7 @@ pub fn handle_message(
     trace_id: String,
 ) {
     actix_rt::spawn(async move {
+        let message_id = trace_id.clone();
         scope(trace_id, async move {
             let (kind, p) = match decode_payload(&payload) {
                 Ok(v) => v,
@@ -72,13 +73,18 @@ pub fn handle_message(
                 debug!(target: "voice_server.live_asr", session_id, ?kind, "忽略非 Indication 消息");
                 return;
             }
-            dispatch(&addr, session_id, p).await;
+            dispatch(&addr, session_id, p, message_id).await;
         })
         .await;
     });
 }
 
-async fn dispatch(addr: &Recipient<OutMessage>, session_id: String, p: VoicePayload) {
+async fn dispatch(
+    addr: &Recipient<OutMessage>,
+    session_id: String,
+    p: VoicePayload,
+    message_id: String,
+) {
     match p {
         VoicePayload::SessionStart {
             sample_rate,
@@ -88,7 +94,7 @@ async fn dispatch(addr: &Recipient<OutMessage>, session_id: String, p: VoicePayl
             on_session_start(addr, session_id, sample_rate, channels as u16).await;
         }
         VoicePayload::AudioChunk { data, is_last, .. } => {
-            on_audio_chunk(addr, session_id, data, is_last).await;
+            on_audio_chunk(addr, session_id, data, is_last, message_id).await;
         }
         VoicePayload::SessionEnd { .. } => {
             on_session_end(addr, session_id).await;
@@ -230,11 +236,12 @@ async fn run_setup(
     );
 
     // 启动独立 recv task（**关键修复**：让服务端 transcript 实时下行，不再被卡到结束）
+    let recv_state = state_arc.clone();
     let recv_task = actix_rt::spawn({
         let addr = addr.clone();
         let session_id = session_id.clone();
         async move {
-            drive_recv_loop(addr, session_id, receiver).await;
+            drive_recv_loop(addr, session_id, receiver, recv_state).await;
         }
     });
 
@@ -311,6 +318,7 @@ async fn on_audio_chunk(
     session_id: String,
     data: Vec<u8>,
     is_last: bool,
+    message_id: String,
 ) {
     let bytes = data.len();
     debug!(
@@ -335,6 +343,7 @@ async fn on_audio_chunk(
     };
 
     let mut g = state_arc.lock().await;
+    g.current_message_id = Some(message_id);
 
     if g.failed || g.finished {
         // start_session 失败 / 已进入收尾阶段 → 静默丢弃（避免重复报错）
@@ -605,6 +614,7 @@ async fn drive_recv_loop(
     addr: Recipient<OutMessage>,
     session_id: String,
     mut receiver: FunasrReceiver,
+    state_arc: Arc<Mutex<LiveAsrState>>,
 ) {
     info!(
         target: "voice_server.live_asr",
@@ -691,7 +701,12 @@ async fn drive_recv_loop(
                     text,
                     is_final,
                     replace_last,
-                    request_id: 0,
+                    message_id: state_arc
+                        .lock()
+                        .await
+                        .current_message_id
+                        .clone()
+                        .unwrap_or_default(),
                 };
                 send_down(&addr, payload);
             }
@@ -729,7 +744,7 @@ fn send_error<E: std::fmt::Display>(addr: &Recipient<OutMessage>, session_id: &s
         text: format!("[error] {}", message),
         is_final: true,
         replace_last: false,
-        request_id: 0,
+        message_id: current_trace_id().unwrap_or_default(),
     };
     send_down(addr, payload);
 }

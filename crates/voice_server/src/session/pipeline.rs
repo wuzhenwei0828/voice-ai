@@ -52,12 +52,11 @@ impl Drop for CurrentCancelGuard {
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_pipeline(
     session_id: String,
-    request_id: u64,
+    _request_id: u64,
+    message_id: String,
     audio: Vec<u8>,
     sample_rate: u32,
     channels: u16,
-    // 端侧 SessionStart 上报的 TTS 输出采样率。`None` 让 HttpTtsClient 走 `TtsConfig.sample_rate` 兜底。
-    client_tts_sample_rate: Option<u32>,
     // 端侧 SessionStart 上报的 TTS 音色短名。`None` 让 HttpTtsClient 走 `TtsConfig.voice` 兜底。
     client_voice: Option<String>,
     asr: Arc<dyn AsrClient>,
@@ -72,9 +71,10 @@ pub(super) async fn run_pipeline(
 ) {
     // 这是一次 utterance（用户一段语音）的完整生命周期。函数本身不返回业务数据，
     // 所有结果都通过 `down_addr` 发送 VoicePayload；因此每个 return 都代表该请求结束。
-    // request_id 会被原样带到所有下行事件，供客户端把并发/打断后的消息归属到正确请求。
+    // request_id 仅用于服务端内部取消和指标，不进入任何下行事件。
     info!(target: "voice_server.session", session_id = %session_id, "pipeline 开始");
-    let mut metric_guard = PipelineMetricsGuard::start(metrics.clone(), input_started_at, input_ended_at);
+    let mut metric_guard =
+        PipelineMetricsGuard::start(metrics.clone(), input_started_at, input_ended_at);
 
     // ===== 阶段 1：ASR —— 先识别，再决定是否进入后续链路 =====
     // 先通知前端进入“正在理解”，后续 ASR partial 会在拿到最终文本后一次性 flush。
@@ -82,7 +82,7 @@ pub(super) async fn run_pipeline(
     if !send_agent_status(
         &down_addr,
         &session_id,
-        request_id,
+        &message_id,
         &cancel,
         AgentPhase::Transcribing,
         false,
@@ -129,7 +129,7 @@ pub(super) async fn run_pipeline(
                     if !send_agent_status(
                         &down_addr,
                         &session_id,
-                        request_id,
+                        &message_id,
                         &cancel,
                         AgentPhase::Error,
                         true,
@@ -139,6 +139,7 @@ pub(super) async fn run_pipeline(
                     send_down(&down_addr, VoicePayload::Error {
                         code: 1001,
                         message: SAFE_PIPELINE_ERROR_MESSAGE.to_string(),
+                        message_id: Some(message_id.clone()),
                     });
                     return;
                 }
@@ -152,7 +153,7 @@ pub(super) async fn run_pipeline(
             if !send_agent_status(
                 &down_addr,
                 &session_id,
-                request_id,
+                &message_id,
                 &cancel,
                 AgentPhase::Error,
                 true,
@@ -164,6 +165,7 @@ pub(super) async fn run_pipeline(
                 VoicePayload::Error {
                     code: 1001,
                     message: SAFE_PIPELINE_ERROR_MESSAGE.to_string(),
+                    message_id: Some(message_id.clone()),
                 },
             );
             return;
@@ -194,7 +196,7 @@ pub(super) async fn run_pipeline(
                         asr_events.push(AsrEvent { text: cleaned, ..e });
                         if let Some(last) = asr_events.last() {
                             if last.is_final {
-                                metrics.observe_asr(asr_started_at.elapsed());
+                                metric_guard.record_asr_output_end(asr_started_at, Instant::now());
                                 break;
                             }
                         }
@@ -205,7 +207,7 @@ pub(super) async fn run_pipeline(
                         if !send_agent_status(
                             &down_addr,
                             &session_id,
-                            request_id,
+                            &message_id,
                             &cancel,
                             AgentPhase::Error,
                             true,
@@ -215,6 +217,7 @@ pub(super) async fn run_pipeline(
                         send_down(&down_addr, VoicePayload::Error {
                             code: 1001,
                             message: SAFE_PIPELINE_ERROR_MESSAGE.to_string(),
+                            message_id: Some(message_id.clone()),
                         });
                         return;
                     }
@@ -283,7 +286,7 @@ pub(super) async fn run_pipeline(
                 text: e.text,
                 is_final: e.is_final,
                 replace_last: false,
-                request_id,
+                message_id: message_id.clone(),
             },
         );
     }
@@ -312,7 +315,7 @@ pub(super) async fn run_pipeline(
     if !send_agent_status(
         &down_addr,
         &session_id,
-        request_id,
+        &message_id,
         &cancel,
         AgentPhase::Composing,
         false,
@@ -325,8 +328,6 @@ pub(super) async fn run_pipeline(
     // ===== 阶段 2+3：LLM → 切句 → TTS =====
     // 这里复用共享的 llm_tts_items：它负责网络流、切句、crossfade、base64 和 seq；
     // 本函数只负责把抽象事件映射成 WS 的 VoicePayload，并在每个 await 上响应取消。
-    // sample_rate_override：把端侧 SessionStart 上报的值原样透传 —— HttpTtsClient 内部决定
-    // 用 override 还是配置兜底（sample_rate_override.or(self.sample_rate)）。
     // voice_override：同理，原样透传 → HttpTtsClient 拼 model 前缀后发给 provider。
     let tts_format = tts.output_format();
     let llm_started_at = Instant::now();
@@ -336,7 +337,6 @@ pub(super) async fn run_pipeline(
         session_id.clone(),
         llm,
         tts,
-        client_tts_sample_rate,
         client_voice,
     ));
     let mut speaking_sent = false;
@@ -358,9 +358,9 @@ pub(super) async fn run_pipeline(
             LlmTtsItem::Llm { delta, is_final } => {
                 // 空 delta 只在 is_final=true 时有意义：它是“文本流结束”的协议通知。
                 if !delta.is_empty() || is_final {
-                    if !delta.is_empty() && !llm_first_token_recorded {
+                    if !delta.trim().is_empty() && !llm_first_token_recorded {
                         llm_first_token_recorded = true;
-                        metrics.observe_llm_first_token(llm_started_at.elapsed());
+                        metric_guard.record_llm_first_text(llm_started_at, Instant::now());
                     }
                     if is_final && !llm_completed_recorded {
                         llm_completed_recorded = true;
@@ -376,7 +376,7 @@ pub(super) async fn run_pipeline(
                             session_id: session_id.clone(),
                             delta,
                             is_final,
-                            request_id,
+                            message_id: message_id.clone(),
                         },
                     );
                 }
@@ -386,16 +386,20 @@ pub(super) async fn run_pipeline(
                 audio,
                 is_last,
             } => {
-                if !audio.is_empty() && !metric_guard.has_first_audio() {
+                let audio =
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &audio)
+                        .unwrap_or_default();
+                let is_first_audio = !audio.is_empty() && !metric_guard.has_first_audio();
+                if is_first_audio {
                     let first_audio_at = Instant::now();
-                    metric_guard.record_first_audio(first_audio_at);
+                    metric_guard.record_tts_first_frame(first_audio_at);
                 }
                 // 第一块音频到达才切换到 Speaking，避免 TTS 尚未产出时提前显示“正在回答”。
                 if !speaking_sent {
                     if !send_agent_status(
                         &down_addr,
                         &session_id,
-                        request_id,
+                        &message_id,
                         &cancel,
                         AgentPhase::Speaking,
                         false,
@@ -408,22 +412,25 @@ pub(super) async fn run_pipeline(
                 if !send_tts_audio(
                     &down_addr,
                     &session_id,
-                    request_id,
+                    &message_id,
                     &cancel,
                     seq,
                     audio,
                     is_last,
-                    tts_format.0.or(client_tts_sample_rate),
+                    tts_format.0,
                     Some(tts_format.1),
                 ) {
                     metric_guard.set_result(PipelineResult::Cancelled);
                     return;
                 }
+                if is_first_audio {
+                    metric_guard.record_first_audio_ws_sent(Instant::now());
+                }
                 if is_last
                     && !send_agent_status(
                         &down_addr,
                         &session_id,
-                        request_id,
+                        &message_id,
                         &cancel,
                         AgentPhase::Speaking,
                         true,
@@ -440,7 +447,7 @@ pub(super) async fn run_pipeline(
                 if !send_agent_status(
                     &down_addr,
                     &session_id,
-                    request_id,
+                    &message_id,
                     &cancel,
                     AgentPhase::Error,
                     true,
@@ -452,6 +459,7 @@ pub(super) async fn run_pipeline(
                     VoicePayload::Error {
                         code: code as u32,
                         message: SAFE_PIPELINE_ERROR_MESSAGE.to_string(),
+                        message_id: Some(message_id.clone()),
                     },
                 );
                 return;
@@ -476,7 +484,7 @@ fn agent_label(phase: AgentPhase) -> &'static str {
 fn send_agent_status(
     addr: &Recipient<OutMessage>,
     session_id: &str,
-    request_id: u64,
+    message_id: &str,
     cancel: &CancellationToken,
     phase: AgentPhase,
     done: bool,
@@ -492,7 +500,7 @@ fn send_agent_status(
             phase,
             label,
             tool: None,
-            request_id,
+            message_id: message_id.to_string(),
             done,
         },
     );
@@ -502,10 +510,10 @@ fn send_agent_status(
 fn send_tts_audio(
     addr: &Recipient<OutMessage>,
     session_id: &str,
-    request_id: u64,
+    message_id: &str,
     cancel: &CancellationToken,
     seq: u32,
-    audio: String,
+    audio: Vec<u8>,
     is_last: bool,
     sample_rate: Option<u32>,
     channels: Option<u8>,
@@ -519,19 +527,17 @@ fn send_tts_audio(
             session_id: session_id.to_string(),
             seq,
             // admin_api 侧是 base64 字符串（SSE 需要），WS 侧还原为原始字节
-            data: base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &audio)
-                .unwrap_or_default(),
+            data: audio,
             is_last,
             sample_rate,
             channels,
-            request_id,
+            message_id: message_id.to_string(),
         },
-    );
-    true
+    )
 }
 
 /// 下行推送：msgpack 编码后用 Recipient::try_send；弱网/客户端断连时吞错。
-pub(super) fn send_down(addr: &Recipient<OutMessage>, p: VoicePayload) {
+pub(super) fn send_down(addr: &Recipient<OutMessage>, p: VoicePayload) -> bool {
     match voice_proto::encode_indication(&p) {
         Ok(bytes) => {
             let kind = p.type_name();
@@ -541,31 +547,40 @@ pub(super) fn send_down(addr: &Recipient<OutMessage>, p: VoicePayload) {
             // （SendError 的 Display 只输出变体名 "receiver is full" / "receiver is gone"），
             // 弱网下能定位"客户端没收到 TTS"这类问题
             match addr.try_send(OutMessage { data: bytes }) {
-                Ok(()) => info!(
-                    target: "voice_server.session",
-                    direction = "outbound",
-                    session_id = ?session_id,
-                    kind,
-                    bytes = bytes_len,
-                    "WS 发送消息"
-                ),
-                Err(e) => warn!(
-                    target: "voice_server.session",
-                    direction = "outbound",
-                    session_id = ?session_id,
-                    kind,
-                    bytes = bytes_len,
-                    "WS 发送消息失败（客户端可能已断开）: {}", e
-                ),
+                Ok(()) => {
+                    info!(
+                        target: "voice_server.session",
+                        direction = "outbound",
+                        session_id = ?session_id,
+                        kind,
+                        bytes = bytes_len,
+                        "WS 发送消息"
+                    );
+                    true
+                }
+                Err(e) => {
+                    warn!(
+                        target: "voice_server.session",
+                        direction = "outbound",
+                        session_id = ?session_id,
+                        kind,
+                        bytes = bytes_len,
+                        "WS 发送消息失败（客户端可能已断开）: {}", e
+                    );
+                    false
+                }
             }
         }
-        Err(e) => warn!(
-            target: "voice_server.session",
-            direction = "outbound",
-            session_id = ?p.session_id(),
-            kind = p.type_name(),
-            "WS 发送消息编码失败: {}", e
-        ),
+        Err(e) => {
+            warn!(
+                target: "voice_server.session",
+                direction = "outbound",
+                session_id = ?p.session_id(),
+                kind = p.type_name(),
+                "WS 发送消息编码失败: {}", e
+            );
+            false
+        }
     }
 }
 
@@ -627,10 +642,16 @@ mod tests {
 
     impl MockLlm {
         fn response() -> LlmStream<Result<LlmEvent, ClientError>> {
-            Box::pin(stream::iter([Ok(LlmEvent {
-                delta: "你好。".to_string(),
-                is_final: true,
-            })]))
+            Box::pin(stream::iter([
+                Ok(LlmEvent {
+                    delta: " \n ".to_string(),
+                    is_final: false,
+                }),
+                Ok(LlmEvent {
+                    delta: "你好。".to_string(),
+                    is_final: true,
+                }),
+            ]))
         }
     }
 
@@ -659,11 +680,14 @@ mod tests {
 
     #[async_trait]
     impl TtsClient for MockTts {
+        fn output_format(&self) -> (Option<u32>, u8) {
+            (Some(24_000), 1)
+        }
+
         async fn synthesize(
             &self,
             _session_id: &str,
             _text: &str,
-            _sample_rate_override: Option<u32>,
             _voice_override: Option<String>,
         ) -> Result<Pin<Box<dyn Stream<Item = Result<TtsEvent, ClientError>> + Send>>, ClientError>
         {
@@ -705,7 +729,7 @@ mod tests {
     }
 
     #[actix::test]
-    async fn normal_request_emits_safe_phases_and_one_request_id() {
+    async fn normal_request_emits_safe_phases_with_one_message_id() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let down_addr = CaptureActor { tx }.start().recipient();
         let request_id = 42;
@@ -714,10 +738,10 @@ mod tests {
         run_pipeline(
             "session-1".to_string(),
             request_id,
+            "message-1".to_string(),
             vec![0; 6400],
             16_000,
             1,
-            None,
             None,
             Arc::new(MockAsr),
             Arc::new(MockLlm),
@@ -770,18 +794,21 @@ mod tests {
             ["transcribing", "composing", "speaking", "speaking"]
         );
 
-        let ids: Vec<u64> = payloads
-            .iter()
-            .filter_map(|payload| match payload {
-                VoicePayload::AgentStatus { request_id, .. }
-                | VoicePayload::AsrPartial { request_id, .. }
-                | VoicePayload::LlmDelta { request_id, .. }
-                | VoicePayload::TtsAudio { request_id, .. } => Some(*request_id),
-                _ => None,
-            })
-            .collect();
-        assert!(!ids.is_empty());
-        assert!(ids.iter().all(|id| *id == request_id && *id != 0));
+        assert!(payloads.iter().all(|payload| match payload {
+            VoicePayload::AgentStatus { message_id, .. }
+            | VoicePayload::AsrPartial { message_id, .. }
+            | VoicePayload::LlmDelta { message_id, .. }
+            | VoicePayload::TtsAudio { message_id, .. } => message_id == "message-1",
+            _ => true,
+        }));
+        assert!(payloads.iter().all(|payload| match payload {
+            VoicePayload::TtsAudio {
+                sample_rate,
+                channels,
+                ..
+            } => *sample_rate == Some(24_000) && *channels == Some(1),
+            _ => true,
+        }));
 
         let speaking_index = payloads
             .iter()
@@ -810,15 +837,27 @@ mod tests {
             Some(VoicePayload::AgentStatus {
                 phase: AgentPhase::Speaking,
                 done: true,
-                request_id: 42,
+                message_id,
                 ..
-            })
+            }) if message_id == "message-1"
         ));
 
         let metric_text = metrics.render();
-        assert!(metric_text.contains("voice_e2e_input_to_tts_first_audio_seconds_count 1"));
-        assert!(metric_text.contains("voice_asr_duration_seconds_count 1"));
-        assert!(metric_text.contains("voice_llm_time_to_first_token_seconds_count 1"));
+        for name in [
+            "voice_input_end_to_asr_output_end_seconds",
+            "voice_input_end_to_llm_first_text_seconds",
+            "voice_input_end_to_tts_first_frame_seconds",
+            "voice_input_end_to_ws_first_audio_sent_seconds",
+            "voice_asr_input_to_output_end_seconds",
+            "voice_llm_input_to_first_text_seconds",
+            "voice_llm_first_text_to_tts_first_frame_seconds",
+            "voice_tts_first_frame_to_ws_first_audio_sent_seconds",
+        ] {
+            assert!(
+                metric_text.contains(&format!("{name}_count 1")),
+                "missing {name}"
+            );
+        }
         assert!(metric_text.contains("voice_requests_success_total 1"));
     }
 
@@ -830,10 +869,10 @@ mod tests {
         run_pipeline(
             "session-1".to_string(),
             9,
+            "message-9".to_string(),
             vec![0; 6400],
             16_000,
             1,
-            None,
             None,
             Arc::new(FailingAsr),
             Arc::new(MockLlm),
@@ -860,6 +899,7 @@ mod tests {
                 VoicePayload::Error {
                     code: 1001,
                     message,
+                    ..
                 } => Some(message.as_str()),
                 _ => None,
             })
@@ -878,7 +918,7 @@ mod tests {
         assert!(send_agent_status(
             &down_addr,
             "session-1",
-            7,
+            "message-7",
             &cancel,
             AgentPhase::Speaking,
             false,
@@ -887,10 +927,10 @@ mod tests {
         assert!(!send_tts_audio(
             &down_addr,
             "session-1",
-            7,
+            "message-7",
             &cancel,
             1,
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [1_u8, 0, 2, 0],),
+            vec![1_u8, 0, 2, 0],
             false,
             Some(24_000),
             Some(1),

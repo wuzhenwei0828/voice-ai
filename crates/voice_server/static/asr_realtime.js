@@ -47,6 +47,7 @@
   let running = false;
   let finishing = false;
   let finalCount = 0;
+  let utteranceMessageId = null;
 
   // ====== MessagePack 编解码（从 app.js 复制以保证 wire format 一致） ======
   // 与 server-side voice-proto + rmp_serde 兼容：bin 走 bin8/0xc4 等，
@@ -467,6 +468,7 @@
       if (e.data.type !== 'audio') return;
       if (ws && ws.readyState === WebSocket.OPEN && running && !finishing) {
         const seq = ++seqCounter;
+        utteranceMessageId ??= createTraceId();
         sendPayload({
           type: 'audio_chunk',
           session_id: sessionId,
@@ -474,6 +476,7 @@
           timestamp_ms: Date.now(),
           data: e.data.bytes,
           is_last: false,
+          message_id: utteranceMessageId,
         });
         // 关键证据：running=true 后第一帧推出去 = ack-gating 生效
         // 之后每 50 帧 (~5s) 打一条，防刷屏
@@ -593,6 +596,7 @@
   function cleanup(statusText) {
     running = false;
     finishing = false;
+    utteranceMessageId = null;
     stopMic();
     if (ws) {
       try { ws.close(); } catch (_) {}
@@ -611,6 +615,7 @@
     clearTranscript();
     sessionId = 'live-' + Date.now().toString(36);
     seqCounter = 0;
+    utteranceMessageId = null;
     setStatus('连接 WS …');
     setBadge(el.wsStatus, 'WS：连接中…', 'badge-busy');
 

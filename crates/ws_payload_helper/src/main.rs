@@ -35,9 +35,6 @@ enum Cmd {
         codec: String,
         #[arg(long, default_value = "zh-CN")]
         language: String,
-        /// TTS 输出采样率（Hz）—— 由端侧上报；缺省 = 不带该字段（走服务端配置兜底）
-        #[arg(long)]
-        tts_sample_rate: Option<u32>,
         /// TTS 音色短名（端侧从下拉选的）；缺省 = 不带该字段（走服务端配置兜底）
         #[arg(long)]
         voice: Option<String>,
@@ -91,7 +88,6 @@ fn main() -> anyhow::Result<()> {
             channels,
             codec,
             language,
-            tts_sample_rate,
             voice,
         } => VoicePayload::SessionStart {
             session_id,
@@ -99,7 +95,6 @@ fn main() -> anyhow::Result<()> {
             channels,
             codec,
             language,
-            tts_sample_rate,
             voice,
         },
         Cmd::AudioChunk {
@@ -119,10 +114,12 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Interrupt { session_id } => VoicePayload::Interrupt { session_id },
-        Cmd::SessionEnd { session_id, reason } => {
-            VoicePayload::SessionEnd { session_id, reason }
-        }
-        Cmd::Error { code, message } => VoicePayload::Error { code, message },
+        Cmd::SessionEnd { session_id, reason } => VoicePayload::SessionEnd { session_id, reason },
+        Cmd::Error { code, message } => VoicePayload::Error {
+            code,
+            message,
+            message_id: None,
+        },
         Cmd::All { session_id } => return print_all(&session_id),
     };
 
@@ -133,14 +130,16 @@ fn main() -> anyhow::Result<()> {
     println!();
     println!("base64 ({} bytes):", bytes.len());
     use base64::Engine;
-    println!("{}", base64::engine::general_purpose::STANDARD.encode(&bytes));
+    println!(
+        "{}",
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    );
     Ok(())
 }
 
 fn parse_data_arg(arg: &str) -> anyhow::Result<Vec<u8>> {
     if let Some(path) = arg.strip_prefix('@') {
-        std::fs::read(PathBuf::from(path))
-            .map_err(|e| anyhow::anyhow!("read {}: {}", path, e))
+        std::fs::read(PathBuf::from(path)).map_err(|e| anyhow::anyhow!("read {}: {}", path, e))
     } else {
         // hex 字符串
         hex::decode(arg).map_err(|e| anyhow::anyhow!("hex decode {}: {}", arg, e))
@@ -156,12 +155,14 @@ fn print_all(session_id: &str) -> anyhow::Result<()> {
         channels: 1,
         codec: "pcm_s16le".to_string(),
         language: "zh-CN".to_string(),
-        tts_sample_rate: None,
         voice: None,
     };
     let b = webproto::Indication::<VoicePayload>::encode(p)?;
     println!("hex ({} bytes): {}", b.len(), hex::encode(&b));
-    println!("base64: {}\n", base64::engine::general_purpose::STANDARD.encode(&b));
+    println!(
+        "base64: {}\n",
+        base64::engine::general_purpose::STANDARD.encode(&b)
+    );
 
     println!("=== AudioChunk (空 data, is_last=true) ===");
     let p = VoicePayload::AudioChunk {
@@ -173,7 +174,10 @@ fn print_all(session_id: &str) -> anyhow::Result<()> {
     };
     let b = webproto::Indication::<VoicePayload>::encode(p)?;
     println!("hex ({} bytes): {}", b.len(), hex::encode(&b));
-    println!("base64: {}\n", base64::engine::general_purpose::STANDARD.encode(&b));
+    println!(
+        "base64: {}\n",
+        base64::engine::general_purpose::STANDARD.encode(&b)
+    );
 
     println!("=== Interrupt ===");
     let p = VoicePayload::Interrupt {
@@ -181,7 +185,10 @@ fn print_all(session_id: &str) -> anyhow::Result<()> {
     };
     let b = webproto::Indication::<VoicePayload>::encode(p)?;
     println!("hex ({} bytes): {}", b.len(), hex::encode(&b));
-    println!("base64: {}\n", base64::engine::general_purpose::STANDARD.encode(&b));
+    println!(
+        "base64: {}\n",
+        base64::engine::general_purpose::STANDARD.encode(&b)
+    );
 
     println!("=== SessionEnd ===");
     let p = VoicePayload::SessionEnd {
@@ -190,7 +197,10 @@ fn print_all(session_id: &str) -> anyhow::Result<()> {
     };
     let b = webproto::Indication::<VoicePayload>::encode(p)?;
     println!("hex ({} bytes): {}", b.len(), hex::encode(&b));
-    println!("base64: {}\n", base64::engine::general_purpose::STANDARD.encode(&b));
+    println!(
+        "base64: {}\n",
+        base64::engine::general_purpose::STANDARD.encode(&b)
+    );
 
     Ok(())
 }

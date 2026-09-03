@@ -65,9 +65,15 @@ export function ConversationPage() {
           else if (event.type === 'tts_audio') {
             if (!speakerMutedRef.current) {
               const playbackStartedAt = player.current.enqueue(event.audio, event.sample_rate, event.channels, event.is_last);
-              if (playbackStartedAt !== undefined) nextClient.reportPlaybackStarted(event.request_id, playbackStartedAt);
+              if (playbackStartedAt !== undefined) nextClient.reportPlaybackStarted(event.message_id, playbackStartedAt);
             }
-          } else if (event.type === 'asr_partial' || event.type === 'asr_final' || event.type === 'llm_delta') dispatch({ type: event.type, text: event.text });
+          } else if (event.type === 'asr_partial' || event.type === 'asr_final') {
+            if (!event.text.trim()) return;
+            if (nextClient.acceptAsrMessage(event.message_id, event.text)) {
+              player.current.stop();
+            }
+            dispatch({ type: event.type, text: event.text });
+          } else if (event.type === 'llm_delta') dispatch({ type: event.type, text: event.text });
         },
       });
       client.current = nextClient;

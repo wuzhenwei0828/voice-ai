@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Voice AI 指标</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+  <link rel="stylesheet" href="metrics-dashboard.css" />
+</head>
+<body data-state="loading">
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">VOICE SERVER</p>
+      <h1>语音链路指标</h1>
+    </div>
+    <div class="topbar-actions">
+      <span class="status"><i></i><span id="dashboard-status">正在连接</span></span>
+      <button id="refresh-button" type="button" title="立即刷新" aria-label="立即刷新">↻</button>
+    </div>
+  </header>
+
+  <main>
+    <div class="meta-row">
+      <span>进程启动以来</span>
+      <span>每 5 秒刷新 · <time id="last-updated">--:--:--</time></span>
+    </div>
+
+    <section class="kpi-grid" aria-label="请求概览">
+      <article class="kpi"><span>请求总量</span><strong id="request-total">0</strong></article>
+      <article class="kpi success"><span>成功率</span><strong id="success-rate">0.0%</strong></article>
+      <article class="kpi"><span>成功</span><strong id="request-success">0</strong></article>
+      <article class="kpi danger"><span>失败</span><strong id="request-failed">0</strong></article>
+      <article class="kpi warning"><span>超时</span><strong id="request-timeout">0</strong></article>
+      <article class="kpi"><span>取消</span><strong id="request-cancelled">0</strong></article>
+    </section>
+
+    <section class="section-band">
+      <div class="section-heading">
+        <div><p class="eyebrow">LATENCY</p><h2>链路延迟</h2></div>
+        <span>Histogram bucket 估算</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>阶段</th><th>P50</th><th>P90</th><th>P95</th><th>P99</th><th>样本</th></tr></thead>
+          <tbody id="latency-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="split-grid">
+      <div class="section-band compact">
+        <div class="section-heading"><div><p class="eyebrow">TTS WEBSOCKET</p><h2>连接池</h2></div></div>
+        <dl class="stats-list">
+          <div><dt>连接数</dt><dd id="pool-connections">0</dd></div>
+          <div><dt>使用中</dt><dd id="pool-active">0</dd></div>
+          <div><dt>空闲</dt><dd id="pool-idle">0</dd></div>
+          <div><dt>等待中</dt><dd id="pool-waiting">0</dd></div>
+        </dl>
+      </div>
+
+      <div class="section-band compact">
+        <div class="section-heading"><div><p class="eyebrow">LLM ROUTING</p><h2>模型路由</h2></div></div>
+        <div class="route-grid">
+          <div><span>Fast</span><strong id="route-fast">0</strong></div>
+          <div><span>Strong</span><strong id="route-strong">0</strong></div>
+        </div>
+      </div>
+    </section>
+
+    <details class="raw-section">
+      <summary>原始 Prometheus 指标</summary>
+      <pre id="raw-metrics">正在读取...</pre>
+    </details>
+  </main>
+
+  <script src="metrics-dashboard.js"></script>
+</body>
+</html>

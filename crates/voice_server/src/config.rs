@@ -460,26 +460,34 @@ pub struct TtsModelFormat {
     pub channels: u8,
 }
 
-fn default_tts_channels() -> u8 { 1 }
+fn default_tts_channels() -> u8 {
+    1
+}
 
-fn default_tts_max_connections() -> usize { 4 }
+fn default_tts_max_connections() -> usize {
+    4
+}
 
 /// 模型专属的音频输出格式。
 ///
 /// 新增或调整模型时，只改这里的对应条目；不需要在 YAML 配置中重复填写。
-const TTS_MODEL_FORMATS: &[(&str, TtsModelFormat)] = &[
-    (
-        "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-        TtsModelFormat { sample_rate: Some(24000), channels: 1 },
-    ),
-];
+const TTS_MODEL_FORMATS: &[(&str, TtsModelFormat)] = &[(
+    "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    TtsModelFormat {
+        sample_rate: Some(24000),
+        channels: 1,
+    },
+)];
 
 impl TtsConfig {
     pub fn model_format(&self) -> TtsModelFormat {
         TTS_MODEL_FORMATS
             .iter()
             .find_map(|(model, format)| (*model == self.model).then_some(*format))
-            .unwrap_or(TtsModelFormat { sample_rate: self.sample_rate, channels: self.channels })
+            .unwrap_or(TtsModelFormat {
+                sample_rate: self.sample_rate,
+                channels: self.channels,
+            })
     }
 }
 
@@ -1056,7 +1064,13 @@ mod tests {
               channels: 1
         "#;
         let cfg: VoiceConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(cfg.tts.model_format(), TtsModelFormat { sample_rate: Some(24000), channels: 1 });
+        assert_eq!(
+            cfg.tts.model_format(),
+            TtsModelFormat {
+                sample_rate: Some(24000),
+                channels: 1
+            }
+        );
     }
 
     #[test]
@@ -1069,7 +1083,13 @@ mod tests {
               channels: 2
         "#;
         let cfg: VoiceConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(cfg.tts.model_format(), TtsModelFormat { sample_rate: Some(16000), channels: 2 });
+        assert_eq!(
+            cfg.tts.model_format(),
+            TtsModelFormat {
+                sample_rate: Some(16000),
+                channels: 2
+            }
+        );
     }
 
     #[test]

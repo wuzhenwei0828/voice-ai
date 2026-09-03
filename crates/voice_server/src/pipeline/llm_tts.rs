@@ -150,11 +150,6 @@ async fn flush_incremental_sentence(
 /// `crate::utils::postprocess_utils::parse_asr_text`），作为 system message 传给 LLM。
 /// `None` 表示没有 ASR 参考信号（如 `/admin/llm_tts` 直接调用的场景）。
 ///
-/// `sample_rate_override`：端侧 SessionStart 上报的 TTS 输出采样率。
-///   - `Some(n)` —— 覆盖 `TtsConfig.sample_rate`
-///   - `None` —— 走配置兜底
-///   - /admin/llm_tts 与 /admin/asr_llm_tts 没有 SessionStart，传 `None`。
-///
 /// `voice_override`：端侧（前端的 voice 下拉）选中的音色短名（如 `"alex"`）。
 ///   - `Some("alex")` —— 覆盖 `TtsConfig.voice`
 ///   - `None` —— 走配置兜底
@@ -165,7 +160,6 @@ pub fn llm_tts_items(
     sid: String,
     llm: ArcLlm,
     tts: ArcTts,
-    sample_rate_override: Option<u32>,
     voice_override: Option<String>,
 ) -> impl Stream<Item = LlmTtsItem> + 'static {
     stream! {
@@ -183,7 +177,7 @@ pub fn llm_tts_items(
         let mut fader = SentenceCrossfader::default();
         let mut short_sentence_buf = TtsSentenceBuffer::default();
         let mut ws_session = match tts
-            .open_input_session(&sid, sample_rate_override, voice_override.clone())
+            .open_input_session(&sid, voice_override.clone())
             .await
         {
             Ok(session) => session,
@@ -301,7 +295,7 @@ pub fn llm_tts_items(
                 };
                 info!(target: "voice_server.pipeline", stage = "tts_call", session_id = %sid, sentence = %sent, "切出句子送 TTS");
 
-                let mut tts_stream = match tts.synthesize(&sid, &sent, sample_rate_override, voice_override.clone()).await {
+                let mut tts_stream = match tts.synthesize(&sid, &sent, voice_override.clone()).await {
                     Ok(s) => s,
                     Err(e) => {
                         warn!(target: "voice_server.pipeline", stage = "tts_call", session_id = %sid, "TTS 调用失败: {}", e);
@@ -311,7 +305,7 @@ pub fn llm_tts_items(
                 };
 
                 // 阶段 3：为当前句建立 TTS 流。句子级调用可以让前端尽早收到第一句
-                // 音频；`sample_rate_override` 和 `voice_override` 只影响本句的 provider 请求。
+                // 音频；`voice_override` 只影响本句的 provider 请求。
                 fader.begin_sentence();
                 while let Some(tts_item) = tts_stream.next().await {
                     let t = match tts_item {
@@ -369,7 +363,7 @@ pub fn llm_tts_items(
                         return;
                     }
                 }
-            } else if let Ok(mut tts_stream) = tts.synthesize(&sid, &tail, sample_rate_override, voice_override.clone()).await {
+            } else if let Ok(mut tts_stream) = tts.synthesize(&sid, &tail, voice_override.clone()).await {
                 fader.begin_sentence();
                 while let Some(tts_item) = tts_stream.next().await {
                     if let Ok(t) = tts_item {
@@ -582,7 +576,6 @@ mod tests {
         async fn open_input_session(
             &self,
             _session_id: &str,
-            _sample_rate_override: Option<u32>,
             _voice_override: Option<String>,
         ) -> Result<Option<Box<dyn TtsInputSession>>, ClientError> {
             Ok(Some(Box::new(RecordingIncrementalSession {
@@ -597,7 +590,6 @@ mod tests {
             &self,
             _session_id: &str,
             _text: &str,
-            _sample_rate_override: Option<u32>,
             _voice_override: Option<String>,
         ) -> Result<TtsStream<Result<TtsEvent, ClientError>>, ClientError> {
             panic!("incremental path should not call synthesize")
@@ -614,7 +606,6 @@ mod tests {
             &self,
             _session_id: &str,
             text: &str,
-            _sample_rate_override: Option<u32>,
             _voice_override: Option<String>,
         ) -> Result<TtsStream<Result<TtsEvent, ClientError>>, ClientError> {
             self.requests.lock().unwrap().push(text.to_string());
@@ -642,7 +633,6 @@ mod tests {
             Arc::new(RecordingTts {
                 requests: Arc::clone(&requests),
             }),
-            None,
             None,
         ));
         while items.next().await.is_some() {}
@@ -679,7 +669,6 @@ mod tests {
                 finish_count: Arc::clone(&finish_count),
             }),
             None,
-            None,
         ));
         while items.next().await.is_some() {}
 
@@ -714,7 +703,6 @@ mod tests {
                 finish_count: Arc::clone(&finish_count),
             }),
             None,
-            None,
         ));
         while items.next().await.is_some() {}
 
@@ -737,7 +725,6 @@ mod tests {
             &self,
             _session_id: &str,
             _text: &str,
-            _sample_rate_override: Option<u32>,
             _voice_override: Option<String>,
         ) -> Result<TtsStream<Result<TtsEvent, ClientError>>, ClientError> {
             self.started.notify_one();
@@ -771,7 +758,6 @@ mod tests {
                 started: Arc::clone(&started),
                 release: Arc::clone(&release),
             }),
-            None,
             None,
         ));
 
